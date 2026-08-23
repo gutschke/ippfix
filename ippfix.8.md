@@ -76,6 +76,23 @@ halftoning, and inflate a small job into tens of megabytes.
   Address that clients should use to reach this server. Autodetected by default,
   which is wrong on hosts with several addresses.
 
+* `--archive` *DIR*:
+  Diagnostic only. Keep a copy of every job exactly as it arrived, before
+  conversion, together with a short text file recording the queue, job name,
+  document format and what conversion did.
+
+  This writes the documents users print to disk. It is off by default. The
+  directory is created mode 0700 and the files 0600, owned by the service
+  account, but anyone who can read them can read everything printed while it
+  was enabled. It exists because the failure this proxy works around is silent
+  and depends on document content, so without the document that provoked it
+  there is almost nothing to go on. Enable it while chasing a specific problem,
+  and turn it off again afterwards.
+
+* `--archive-max` *N*:
+  Keep at most *N* archived jobs, deleting the oldest first. Default 50. Bounds
+  the disk cost of a flag left on by accident.
+
 * `--cert` *FILE*:
   TLS certificate. Default `/etc/ippfix/ippfix.crt`.
 

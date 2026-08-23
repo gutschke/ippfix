@@ -183,6 +183,28 @@ count before and after is a more reliable signal than `job-state`.
 To compare directly, run a second instance with `--no-convert` on another port
 and print the same document to both.
 
+### Capturing a document that failed
+
+Because the failure is silent and depends on what is in the document, the one
+thing worth having is the document itself. `--archive DIR` keeps a copy of
+every job exactly as it arrived, before conversion, with a sidecar noting the
+queue, job name, format and what conversion did.
+
+```
+--archive /var/lib/ippfix/archive --archive-max 50
+```
+
+**This stores the documents people print.** It is off by default, the directory
+is created mode 0700 and the files 0600 owned by the service account, and the
+daemon logs a warning for as long as it is enabled. Anyone able to read those
+files can read everything printed while it was on, so treat it as a diagnostic
+that gets switched on to answer a question and switched off again — not as a
+standing configuration.
+
+Nothing a user can do triggers it; it is an administrator's flag, and an
+administrator could capture the same traffic by other means. That is the reason
+it is acceptable at all, not a reason to leave it running.
+
 ## Troubleshooting
 
 **Jobs still vanish.** Check the log for `relayed`. If conversion is declining

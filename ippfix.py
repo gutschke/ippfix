@@ -123,6 +123,8 @@ class Config:
         self.convert = not args.no_convert
         self.converter = args.converter
         self.timeout = args.timeout
+        self.archive = args.archive
+        self.archive_max = args.archive_max
 
     def base_http(self):
         return f'http://{self.advertise}:{self.port}'
@@ -154,6 +156,60 @@ def local_ip():
 # ---------------------------------------------------------------------------
 def looks_like_pdf(data):
     return data[:1024].find(b'%PDF-') >= 0
+
+
+def archive_document(cfg, queue, job_name, fmt, data, note):
+    """Keep a copy of a job as it arrived, for diagnosing a failure.
+
+    This writes users' documents to disk, so it is off by default and the
+    directory is created private to the service account. It exists because
+    the failure being worked around is silent and content-dependent: without
+    the document that provoked it there is very little to go on.
+
+    Turn it off again once the question is answered.
+    """
+    if not cfg.archive:
+        return
+    try:
+        os.makedirs(cfg.archive, mode=0o700, exist_ok=True)
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        safe = re.sub(r'[^A-Za-z0-9._-]', '_', (job_name or 'job'))[:48]
+        ext = 'pdf' if looks_like_pdf(data) else 'bin'
+        base = os.path.join(cfg.archive, f'{stamp}-{queue.name}-{safe}')
+        path = f'{base}.{ext}'
+        n = 1
+        while os.path.exists(path):
+            path = f'{base}.{n}.{ext}'
+            n += 1
+        with open(path, 'wb') as handle:
+            handle.write(data)
+        os.chmod(path, 0o600)
+        with open(f'{path}.txt', 'w', encoding='utf-8') as handle:
+            handle.write(f'queue: {queue.name}\nprinter: {queue.host}\n'
+                         f'job-name: {job_name}\ndocument-format: {fmt}\n'
+                         f'bytes: {len(data)}\nconversion: {note}\n')
+        os.chmod(f'{path}.txt', 0o600)
+        prune_archive(cfg)
+        log.debug('archived %s', path)
+    except OSError as exc:
+        log.warning('could not archive job: %s', exc)
+
+
+def prune_archive(cfg):
+    """Keep the archive bounded so a forgotten flag cannot fill the disk."""
+    try:
+        entries = [os.path.join(cfg.archive, name)
+                   for name in os.listdir(cfg.archive)
+                   if not name.endswith('.txt')]
+        entries.sort(key=os.path.getmtime)
+        for path in entries[:max(0, len(entries) - cfg.archive_max)]:
+            for victim in (path, path + '.txt'):
+                try:
+                    os.remove(victim)
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def convert(cfg, data, fmt):
@@ -470,8 +526,12 @@ class Handler(socketserver.BaseRequestHandler):
             # One job at a time: these printers report
             # multiple-document-jobs-supported = false, and a second job
             # arriving mid-transfer confuses them.
+            original = msg.data
             with self.server.job_lock:
                 msg.data, note = convert(cfg, msg.data, fmt)
+                archive_document(cfg, queue,
+                                 group.get_str('job-name') if group else None,
+                                 fmt, original, note)
                 rewrite_request(queue, msg)
                 status, raw = upstream_ipp(queue, ipp.serialize(msg),
                                            cfg.timeout)
@@ -604,6 +664,13 @@ def main(argv=None):
                              'request (default: 300)')
     parser.add_argument('--no-convert', action='store_true',
                         help='relay jobs untouched, for comparison')
+    parser.add_argument('--archive', metavar='DIR', default=None,
+                        help='DIAGNOSTIC ONLY: keep a copy of every job as it '
+                             'arrived, before conversion. This stores users\' '
+                             'documents on disk; see the manual page before '
+                             'enabling it, and turn it off afterwards')
+    parser.add_argument('--archive-max', type=int, default=50, metavar='N',
+                        help='keep at most N archived jobs (default: 50)')
     parser.add_argument('--no-advertise', action='store_true',
                         help='do not publish over DNS-SD')
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -632,6 +699,10 @@ def main(argv=None):
         log.info('    published as %s', cfg.our_uri(queue))
     log.info('  conversion: %s',
              f'outline text via {cfg.converter}' if cfg.convert else 'DISABLED')
+    if cfg.archive:
+        log.warning('  ARCHIVING every job to %s (keeping %d) -- this stores '
+                    'users\' documents; disable when done diagnosing',
+                    cfg.archive, cfg.archive_max)
 
     withdraw = None if args.no_advertise else advertise(cfg)
     server = Server(('::', cfg.port), Handler, cfg)
