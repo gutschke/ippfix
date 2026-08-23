@@ -14,20 +14,20 @@ none appears on the panel. Where a device records it at all, it shows up in
     Task: POSTSCRIPT
     File: fontcache.c  Line: 2494
 
-The budget covers both the glyphs drawn and the embedded font programs they
-come from, and the two trade against each other. Measured on a Color LaserJet
-Pro MFP M283fdw: with one fully embedded font, 527 distinct glyphs render and
-534 do not; add a second fully embedded font and the page fails at 300. A
-font's cost scales with how many glyphs its embedded program declares rather
-than being a flat per-font constant, so a heavily subsetted face is far cheaper
-than a complete one.
+The budget is measured per page, and what it counts is the glyphs a page
+draws plus the size of the font programs it embeds. What a font *declares* --
+its maxp.numGlyphs -- turns out not to matter: a font declaring 65535 glyphs
+while drawing 27 printed without trouble.
 
-Those figures come from probes embedding complete, unsubsetted fonts. Jobs from
-a browser subset aggressively and sit well below them: sampled from real Chrome
-output, two subsets declaring 93 and 668 glyphs, with 451 distinct glyphs drawn
-between them, printed without trouble. So no fixed threshold is safe to design
-against -- whether a document crosses the line depends on its typefaces, how
-they were subsetted, and how many distinct characters appear on the page.
+Fitting every measured outcome gives cost = glyphs drawn + (font bytes /
+4096). On a Color LaserJet Pro MFP M283fdw that separates thirteen observed
+jobs cleanly: everything scoring 562 or below printed, everything scoring 586
+or above did not. Real browser jobs score between 434 and 471, so they are
+relayed untouched; the documents observed to fail score 638 and up.
+
+The figures are empirical and from one printer. They are not a specification,
+and the margin between "printed" and "failed" is narrow, so the default
+threshold sits well below the boundary rather than on it.
 
 The defect has been present across firmware builds years apart, so waiting for
 a fix is not a strategy. Client-side changes affect how often it is reached:
@@ -146,6 +146,19 @@ GREY_ORDER = ('W8', 'DEVW8')
 
 MAX_BODY = 64 * 1024 * 1024        # a print job larger than this is not real
 MAX_PAGES_INSPECTED = 2000         # beyond this, decline to estimate
+
+# Cost of a page = glyphs drawn + (embedded font bytes / FONT_BYTE_UNIT).
+#
+# Derived by fitting every measured outcome, not assumed. What a font DECLARES
+# turns out to be irrelevant: a font declaring 65535 glyphs while drawing 27
+# printed without trouble, which falsified an earlier model built on that
+# number. Drawn glyphs dominate, and the font program itself carries a cost
+# too -- two large fonts fail at 300 drawn glyphs where one small font survives
+# 523.
+#
+# Against thirteen observed jobs this separates cleanly: everything scoring 562
+# or less printed, everything scoring 586 or more did not.
+FONT_BYTE_UNIT = 4096
 MAX_HEADERS = 100
 MAX_KEEPALIVE = 100
 
@@ -487,18 +500,13 @@ def _resolve(data, index, ref, depth=0):
                     depth + 1)
 
 
-def _declared_glyphs(sfnt):
-    count = struct.unpack_from('>H', sfnt, 4)[0]
-    for i in range(count):
-        off = 12 + i * 16
-        if sfnt[off:off + 4] == b'maxp':
-            table = struct.unpack_from('>I', sfnt, off + 8)[0]
-            return struct.unpack_from('>H', sfnt, table + 4)[0]
-    return 0
-
-
 def _font_program_size(data, index, font_body):
-    """Glyphs declared by the program behind a /Font object, or 0."""
+    """Size in bytes of the font program behind a /Font object, or 0.
+
+    Not the declared glyph count. A font declaring 65535 glyphs while drawing
+    27 printed without trouble, so what a font DECLARES turns out not to matter;
+    what it costs is the program itself plus the glyphs actually rendered.
+    """
     body = font_body
     m = re.search(rb'/DescendantFonts\s*\[?\s*(\d+\s+\d+\s+R)', body)
     if m:
@@ -524,7 +532,7 @@ def _font_program_size(data, index, font_body):
     raw = data[body_start:body_end]
     if b'/FlateDecode' in head:
         raw = _inflate(raw)
-    return _declared_glyphs(raw)
+    return len(raw)
 
 
 MAX_INFLATE = 32 * 1024 * 1024      # enough for any real content stream
@@ -608,7 +616,8 @@ def _stream_payload(data, index, ref):
     return raw
 
 
-def _walk_resources(data, index, resources, cache, seen, depth=0):
+def _walk_resources(data, index, resources, cache, seen, seen_fonts,
+                    depth=0):
     """Fonts declared and glyphs drawn by a resource dictionary.
 
     Follows form XObjects. This is not a nicety: a PDF printed through a
@@ -617,7 +626,7 @@ def _walk_resources(data, index, resources, cache, seen, depth=0):
     level down. Missing that scores such a job as free, which is exactly
     backwards -- those are the jobs that fail.
     """
-    declared = 0
+    font_bytes = 0
     drawn = set()
     if depth > MAX_XOBJECT_DEPTH:
         raise Unreadable('form XObjects nested too deeply')
@@ -625,10 +634,13 @@ def _walk_resources(data, index, resources, cache, seen, depth=0):
     fonts = _sub_dict(data, index, resources, b'Font')
     for rm in re.finditer(rb'/[^\s/<>\[\]]+\s+(\d+)\s+\d+\s+R', fonts):
         num = int(rm.group(1))
+        if num in seen_fonts:
+            continue
+        seen_fonts.add(num)
         if num not in cache:
             cache[num] = _font_program_size(data, index,
                                             _resolve(data, index, b'%d 0 R' % num))
-        declared += cache[num]
+        font_bytes += cache[num]
 
     xobjects = _sub_dict(data, index, resources, b'XObject')
     for rm in re.finditer(rb'/[^\s/<>\[\]]+\s+(\d+)\s+\d+\s+R', xobjects):
@@ -642,11 +654,11 @@ def _walk_resources(data, index, resources, cache, seen, depth=0):
         drawn |= _glyphs_in(_stream_payload(data, index, num))
         inner = _sub_dict(data, index, body, b'Resources')
         if inner:
-            sub_declared, sub_drawn = _walk_resources(data, index, inner, cache,
-                                                      seen, depth + 1)
-            declared += sub_declared
+            sub_bytes, sub_drawn = _walk_resources(data, index, inner, cache,
+                                                   seen, seen_fonts, depth + 1)
+            font_bytes += sub_bytes
             drawn |= sub_drawn
-    return declared, drawn
+    return font_bytes, drawn
 
 
 def _glyphs_in(blob):
@@ -704,8 +716,9 @@ def estimate_font_cost(data):
                          else page)
             resources = _sub_dict(data, index, page_dict, b'Resources')
 
-            seen = set()
-            declared, drawn = _walk_resources(data, index, resources, cache, seen)
+            seen, seen_fonts = set(), set()
+            font_bytes, drawn = _walk_resources(data, index, resources, cache,
+                                                seen, seen_fonts)
 
             refs = []
             cm = re.search(rb'/Contents\s+(?:(\d+)\s+\d+\s+R|\[([^\]]*)\])',
@@ -719,7 +732,7 @@ def estimate_font_cost(data):
             for ref in refs:
                 drawn |= _glyphs_in(_stream_payload(data, index, ref))
 
-            worst = max(worst, declared + len(drawn))
+            worst = max(worst, len(drawn) + font_bytes // FONT_BYTE_UNIT)
 
         return worst
     except Unreadable as exc:
@@ -1698,13 +1711,13 @@ def build_parser():
                              'long (default: 30)')
     parser.add_argument('--require-tls', action='store_true',
                         help='refuse plaintext IPP and accept only ipps')
-    parser.add_argument('--convert-threshold', type=int, default=2500,
+    parser.add_argument('--convert-threshold', type=int, default=500,
                         metavar='N',
                         help='leave a job untouched when its estimated font '
                              'cost is at or below N, since outlining is '
                              'expensive and most jobs are nowhere near the '
-                             'printer limit. 0 converts everything (default: '
-                             '2500)')
+                             'printer limit. 0 converts everything '
+                             '(default: 500)')
     parser.add_argument('--max-pdf-bytes', type=int, default=60,
                         metavar='MB',
                         help='rasterise rather than send an outlined PDF larger '

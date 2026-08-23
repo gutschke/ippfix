@@ -295,27 +295,33 @@ exists so you can tell whether they fit yours, and change them if not.
 
 ### What the numbers are, and where they came from
 
-`ippfix` estimates what a job will cost the printer's font cache from two
-things it can read without rendering: what each embedded font program declares,
-and how many distinct glyphs the page draws. On the reference printer, bisection
-found:
+`ippfix` estimates what a job costs the printer from two things it can read
+without rendering: **how many distinct glyphs a page draws**, and **how large
+the font programs it embeds are**.
 
-| estimate | result |
+```
+cost = glyphs drawn + (embedded font bytes / 4096)
+```
+
+What a font *declares* — its `maxp.numGlyphs` — is deliberately **not** counted.
+An earlier version of this tool did count it, and testing disproved that: a
+document embedding a font declaring 65535 glyphs while drawing 27 printed
+perfectly. Meanwhile a document with a tightly subsetted font drawing 700 glyphs
+failed. Drawn glyphs dominate; the font program carries a smaller cost of its
+own, which is why two large fonts fail at 300 glyphs where one small font
+survives 523.
+
+Fitted against thirteen measured outcomes on a Color LaserJet Pro MFP M283fdw:
+
+| cost | outcome |
 |---|---|
-| 3011 | printed |
-| 3558 | printed |
-| 3697 | **failed** |
-| 3844 | **failed** |
+| 35 – 471 | printed (includes all real browser jobs) |
+| 562 | printed |
+| **586 – 1156** | **failed** |
 
-So the boundary sits near 3600. The default `--convert-threshold` is **2500**,
-about thirty per cent below it. That margin is not arbitrary: the limit moves
-with the typeface. One face failed at 520 drawn glyphs where another survived
-527, so a threshold sitting just under a single measured boundary would be
-wrong for the next font.
-
-For contrast, ordinary browser jobs captured from a real Chromebook estimated
-1205, 1291 and 1820 — comfortably below the threshold, so they are relayed
-untouched and cost nothing.
+The default `--convert-threshold` is **500**, below the boundary rather than on
+it. The margin is deliberate: the limit shifts with the typeface, and the gap
+between the highest success and the lowest failure is only about four per cent.
 
 ### Deciding whether it fits your printer
 

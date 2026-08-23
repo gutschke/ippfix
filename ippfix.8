@@ -272,17 +272,22 @@ set:
 composite\-black fringing on text).
 
 .SH CALIBRATION
-.B The default threshold of 2500 is calibrated against one printer.
-It was measured on a Color LaserJet Pro MFP M283fdw by bisection: estimates up
-to 3558 printed, 3697 and above did not. 2500 leaves roughly a thirty per cent
-margin, chosen because the limit shifts with the typeface -- one face failed at
-520 drawn glyphs where another survived 527.
+.B The cost model and its threshold come from measuring one printer.
+Cost is estimated as the glyphs a page draws plus the size of the font
+programs it embeds, divided by 4096. What a font declares is deliberately not
+counted: a font declaring 65535 glyphs while drawing 27 printed without
+trouble, which disproved an earlier model built on that number.
 .PP
-Another model will have a different limit, and this one is not new. If jobs
-still vanish, lower the threshold; if jobs are being converted that need not
-be, raise it.
+On a Color LaserJet Pro MFP M283fdw this separates thirteen measured jobs
+cleanly \(em everything scoring 562 or below printed, everything scoring 586 or
+above did not. Browser jobs score between 434 and 471. The default threshold of
+500 therefore sits below the boundary rather than on it, because the margin is
+narrow and the limit shifts with the typeface.
+.PP
+Another model will differ, and this one is not new. If jobs still vanish, lower
+the threshold; if jobs are converted that need not be, raise it.
 .B \-\-convert\-threshold 0
-converts everything, which is the safe setting when the limit is unknown, at
+converts everything, which is the honest setting when the limit is unknown, at
 the cost of doing expensive work on every job.
 .PP
 To measure a printer directly, note that a job which exceeds the budget marks
@@ -300,16 +305,10 @@ snmpget \-v2c \-c public PRINTER 1.3.6.1.2.1.43.10.2.1.4.1.1
 .RE
 .PP
 Manufacturers usually expose more than the standard MIB, sometimes including
-the interpreter's own error log \(em on the printer this was developed against,
-an assertion naming
-.B fontcache.c
-is what identified the defect. Those paths are vendor specific and this program
-neither uses nor depends on them; look for an event log or diagnostics page in
-the printer's web interface, or a printable event\-log report on its panel.
-.PP
-Print documents of increasing font cost, read the counter before and after
-each, and bisect between the largest that printed and the smallest that did
-not. Set the threshold comfortably below the boundary found.
+the interpreter's own error log. Those paths are vendor specific and this
+program neither uses nor depends on them; look for an event log or diagnostics
+page in the printer's web interface, or a printable event\-log report on its
+panel.
 
 .SH BEHAVIOUR
 Both plaintext IPP and implicit TLS are accepted on the same port, and both

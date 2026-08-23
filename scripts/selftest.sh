@@ -293,47 +293,51 @@ PY2
 python3 - <<'PY2' && ok 'font-cost estimate ranks known outcomes correctly' || bad 'cost estimate'
 import struct
 import sys
-import zlib
 sys.path.insert(0, '.')
 from ippfix import estimate_font_cost
 
 
-def sfnt(declared):
-    """A minimal font program declaring `declared` glyphs."""
-    maxp = struct.pack('>IH', 0x00005000, declared)
-    off = 12 + 16
-    return (struct.pack('>IHHHH', 0x00010000, 1, 0, 0, 0)
-            + b'maxp' + struct.pack('>III', 0, off, len(maxp)) + maxp)
+def sfnt(padding):
+    """A font program of a chosen size. Its declared glyph count is set high
+    deliberately: measurement showed that number does not affect cost, and a
+    test that rewarded it would re-introduce the model it disproved."""
+    maxp = struct.pack('>IH', 0x00005000, 65535)
+    off = 12 + 32
+    head = (struct.pack('>IHHHH', 0x00010000, 2, 0, 0, 0)
+            + b'maxp' + struct.pack('>III', 0, off, len(maxp))
+            + b'glyf' + struct.pack('>III', 0, off + len(maxp), padding))
+    return head + maxp + bytes(padding)
 
 
-def pdf(declared, drawn):
-    """One page naming one font and drawing `drawn` distinct glyphs."""
-    prog = sfnt(declared)
+def pdf(font_bytes, drawn):
+    prog = sfnt(font_bytes)
     text = b'BT ' + b' '.join(b'<%04X> Tj' % g for g in range(1, drawn + 1)) + b' ET'
     out = bytearray(b'%PDF-1.4\n')
     out += b'1 0 obj\n<< /Length1 %d /Length %d >>\nstream\n' % (len(prog), len(prog))
     out += prog + b'\nendstream\nendobj\n'
     out += b'2 0 obj\n<< /Type /FontDescriptor /FontFile2 1 0 R >>\nendobj\n'
-    out += (b'3 0 obj\n<< /Type /Font /Subtype /Type0 '
-            b'/DescendantFonts [4 0 R] >>\nendobj\n')
-    out += (b'4 0 obj\n<< /Type /Font /Subtype /CIDFontType2 '
-            b'/FontDescriptor 2 0 R >>\nendobj\n')
-    out += b'5 0 obj\n<< /Length %d >>\nstream\n' % len(text) + text
-    out += b'\nendstream\nendobj\n'
+    out += b'3 0 obj\n<< /Type /Font /Subtype /Type0 /DescendantFonts [4 0 R] >>\nendobj\n'
+    out += b'4 0 obj\n<< /Type /Font /Subtype /CIDFontType2 /FontDescriptor 2 0 R >>\nendobj\n'
+    out += b'5 0 obj\n<< /Length %d >>\nstream\n' % len(text) + text + b'\nendstream\nendobj\n'
     out += (b'6 0 obj\n<< /Type /Page /Resources << /Font << /F1 3 0 R >> >> '
             b'/Contents 5 0 R >>\nendobj\n')
     return bytes(out)
 
 
-low = estimate_font_cost(pdf(40, 30))
-high = estimate_font_cost(pdf(3000, 400))
-assert low is not None and high is not None, (low, high)
-assert low < 200, low
-assert high > 3000, high
-assert high > low * 10
+# A huge declared count with few glyphs drawn must stay cheap: a font declaring
+# 65535 glyphs and drawing 27 printed on real hardware.
+assert estimate_font_cost(pdf(4096, 20)) < 100
 
-# An unreadable file must NOT be reported as cheap: the caller treats None as
-# "convert", and a wrong low number would silently skip conversion.
+# Glyphs drawn dominate.
+few, many = estimate_font_cost(pdf(4096, 20)), estimate_font_cost(pdf(4096, 700))
+assert many - few > 600, (few, many)
+
+# The font program itself costs something too: two large fonts failed at 300
+# glyphs where one small font survived 523.
+small, large = estimate_font_cost(pdf(4096, 100)), estimate_font_cost(pdf(2_000_000, 100))
+assert large > small + 400, (small, large)
+
+# Unreadable input must never be reported as cheap.
 assert estimate_font_cost(b'%PDF-1.4\n/FontFile2 7 0 R\n') is None
 PY2
 
