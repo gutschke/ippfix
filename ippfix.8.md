@@ -9,7 +9,7 @@ font cache.
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--fail-closed] [--archive-max-bytes MB] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--fail-closed] [--archive-max-bytes MB] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -142,6 +142,21 @@ halftoning, and inflate a small job into tens of megabytes.
   Refuse plaintext IPP and accept only implicit TLS. Off by default, because
   clients that discover a printer over DNS-SD commonly choose plaintext and
   would otherwise simply fail to print.
+
+* `--convert-threshold` *N*:
+  Leave a job untouched when its estimated font cost is at or below *N*.
+  Default 2500; 0 converts everything.
+
+  Outlining is expensive. It replaces every drawn glyph with an inline path and
+  Ghostscript emits no reusable form for them, so a fifty-page document grows
+  from half a megabyte to thirty-three and takes about half a second per page.
+  Most jobs are nowhere near the printer's limit, so the cost of each embedded
+  font program and the glyphs drawn from it are estimated first and cheap jobs
+  are relayed untouched, which is both free and perfectly faithful. Measured on
+  a Color LaserJet Pro MFP M283fdw, ordinary browser jobs estimate between 1200
+  and 1900 and print, while the lowest observed failure estimates about 4000. A
+  file whose cost cannot be determined is always converted, never assumed
+  cheap.
 
 * `--fail-closed`:
   Reject a PDF that cannot be converted, instead of forwarding it unchanged. By

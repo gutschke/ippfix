@@ -66,6 +66,7 @@ import signal
 import struct
 import subprocess
 import sys
+import zlib
 import threading
 import time
 import urllib.parse
@@ -196,6 +197,7 @@ class Config:
         self.require_tls = args.require_tls
         self.fail_closed = args.fail_closed
         self.archive_max_bytes = args.archive_max_bytes * 1024 * 1024
+        self.convert_threshold = args.convert_threshold
 
     def base_http(self):
         host = (f'[{self.advertise}]' if ':' in self.advertise
@@ -311,6 +313,68 @@ def global_ipv6(device=None):
 # ---------------------------------------------------------------------------
 # document conversion
 # ---------------------------------------------------------------------------
+def estimate_font_cost(data):
+    """Estimate what this PDF will cost the printer's font cache.
+
+    The measured budget has two components, both readable without rendering:
+    the glyph count each embedded font program declares, and the distinct
+    glyphs actually drawn. Calibration against known outcomes on a Color
+    LaserJet Pro MFP M283fdw:
+
+        printed  : real browser jobs        1212, 1298, 1827
+        failed   : one full font, 528 drawn        4056
+        failed   : one full font, 908 drawn        7161
+        failed   : three full fonts                19367
+
+    Returns None when the file cannot be read confidently, which the caller
+    must treat as "convert", never as "safe".
+    """
+    try:
+        declared = 0
+        for m in re.finditer(rb'/FontFile2\s+(\d+)\s+0\s+R', data):
+            num = int(m.group(1))
+            om = re.search(rb'[^0-9]%d\s+0\s+obj(.{0,600}?)stream[\r\n]+'
+                           % num, data, re.S)
+            if not om:
+                return None
+            start = om.end()
+            end = data.find(b'endstream', start)
+            if end < 0:
+                return None
+            raw = data[start:end]
+            if b'/FlateDecode' in om.group(1):
+                raw = zlib.decompress(raw)
+            count = struct.unpack_from('>H', raw, 4)[0]
+            for i in range(count):
+                off = 12 + i * 16
+                if raw[off:off + 4] == b'maxp':
+                    table = struct.unpack_from('>I', raw, off + 8)[0]
+                    declared += struct.unpack_from('>H', raw, table + 4)[0]
+                    break
+
+        drawn = set()
+        for m in re.finditer(rb'stream[\r\n]+', data):
+            start = m.end()
+            end = data.find(b'endstream', start)
+            if end < 0 or end - start > 8 * 1024 * 1024:
+                continue
+            blob = data[start:end]
+            try:
+                blob = zlib.decompress(blob)
+            except zlib.error:
+                pass
+            if b'Tj' not in blob and b'TJ' not in blob:
+                continue
+            for hm in re.finditer(rb'<([0-9A-Fa-f]{4,})>', blob):
+                h = hm.group(1)
+                if len(h) % 4 == 0:
+                    for i in range(0, len(h), 4):
+                        drawn.add(h[i:i + 4])
+        return declared + len(drawn)
+    except Exception:
+        return None
+
+
 def normalise_pdf(data):
     """Return the document positioned so Ghostscript must read it as PDF.
 
@@ -478,6 +542,17 @@ def convert(cfg, data, fmt):
     payload = normalise_pdf(data)
     if payload is None:
         return data, f'relayed ({fmt or "not PDF"})'
+
+    # Outlining is expensive: it replaces every drawn glyph with an inline
+    # path, and Ghostscript emits no reusable form for them, so a fifty-page
+    # document grows from half a megabyte to thirty-three and takes half a
+    # second per page. Most jobs are nowhere near the printer's limit, so
+    # estimate first and leave those alone entirely -- that is both free and
+    # perfectly faithful. An unreadable estimate means convert, never skip.
+    if cfg.convert_threshold:
+        cost = estimate_font_cost(payload)
+        if cost is not None and cost <= cfg.convert_threshold:
+            return data, f'relayed (font cost {cost}, under threshold)'
 
     started = time.time()
     try:
@@ -1201,6 +1276,13 @@ def build_parser():
                              'long (default: 30)')
     parser.add_argument('--require-tls', action='store_true',
                         help='refuse plaintext IPP and accept only ipps')
+    parser.add_argument('--convert-threshold', type=int, default=2500,
+                        metavar='N',
+                        help='leave a job untouched when its estimated font '
+                             'cost is at or below N, since outlining is '
+                             'expensive and most jobs are nowhere near the '
+                             'printer limit. 0 converts everything (default: '
+                             '2500)')
     parser.add_argument('--fail-closed', action='store_true',
                         help='reject a PDF that cannot be converted instead of '
                              'forwarding it unchanged. Safer, because the '

@@ -276,6 +276,45 @@ assert normalise_pdf(b'no marker here') is None
 assert normalise_pdf(b'junk\n%PDF-1.4\nx').startswith(b'%PDF-')
 PY2
 
+python3 - <<'PY2' && ok 'font-cost estimate ranks known outcomes correctly' || bad 'cost estimate'
+import sys
+sys.path.insert(0, '.')
+from ippfix import estimate_font_cost
+
+# Two embedded font programs declaring 300 glyphs each, drawing four.
+def font(declared):
+    import struct
+    tables = 1
+    head = struct.pack('>IHHHH', 0x00010000, tables, 0, 0, 0)
+    maxp = struct.pack('>IH', 0x00005000, declared)
+    off = 12 + 16 * tables
+    rec = b'maxp' + struct.pack('>III', 0, off, len(maxp))
+    return head + rec + maxp
+
+import zlib
+def pdf(fonts, drawn):
+    out = bytearray(b'%PDF-1.4\n')
+    for i, f in enumerate(fonts, start=1):
+        out += b'%d 0 obj\n<< /Length %d /Length1 %d >>\nstream\n' % (i, len(f), len(f))
+        out += f + b'\nendstream\nendobj\n'
+    body = b'BT ' + b' '.join(b'<%04X> Tj' % g for g in drawn) + b' ET'
+    out += b'9 0 obj\n<< /Length %d >>\nstream\n' % len(body) + body + b'\nendstream\nendobj\n'
+    for i in range(1, len(fonts) + 1):
+        out += b'/FontFile2 %d 0 R\n' % i
+    return bytes(out)
+
+low = estimate_font_cost(pdf([font(40)], range(30)))
+high = estimate_font_cost(pdf([font(3000), font(3000)], range(400)))
+assert low is not None and high is not None
+assert low < 200, low
+assert high > 6000, high
+assert high > low * 10
+
+# An unreadable file must NOT be reported as cheap: the caller treats None as
+# "convert", and a wrong low number would silently skip conversion.
+assert estimate_font_cost(b'%PDF-1.4\n/FontFile2 7 0 R\n') is None
+PY2
+
 echo 'systemd units'
 if command -v systemd-analyze >/dev/null 2>&1; then
   for u in ippfix.service ippfix.socket ippfix-convert.socket 'ippfix-convert@.service'; do

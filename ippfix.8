@@ -11,6 +11,7 @@ cache.
 [\fB\-\-max\-connections\fR \fIN\fR]
 [\fB\-\-idle\-timeout\fR \fISECONDS\fR]
 [\fB\-\-require\-tls\fR]
+[\fB\-\-convert\-threshold\fR \fIN\fR]
 [\fB\-\-fail\-closed\fR]
 [\fB\-\-archive\-max\-bytes\fR \fIMB\fR]
 [\fB\-\-no\-ipv6\fR]
@@ -170,6 +171,21 @@ header and waiting.
 Refuse plaintext IPP and accept only implicit TLS. Off by default, because
 clients that discover a printer over DNS-SD commonly choose plaintext and would
 otherwise simply fail to print.
+.TP
+.B \-\-convert\-threshold " \fIN\fR"
+Leave a job untouched when its estimated font cost is at or below
+.IR N .
+Default 2500; 0 converts everything.
+.IP
+Outlining is expensive. It replaces every drawn glyph with an inline path and
+Ghostscript emits no reusable form for them, so a fifty-page document grows
+from half a megabyte to thirty-three and takes about half a second per page.
+Most jobs are nowhere near the printer's limit, so the cost of each embedded
+font program and the glyphs drawn from it are estimated first and cheap jobs
+are relayed untouched, which is both free and perfectly faithful. Measured on a
+Color LaserJet Pro MFP M283fdw, ordinary browser jobs estimate between 1200 and
+1900 and print, while the lowest observed failure estimates about 4000. A file
+whose cost cannot be determined is always converted, never assumed cheap.
 .TP
 .B \-\-fail\-closed
 Reject a PDF that cannot be converted, instead of forwarding it unchanged.
