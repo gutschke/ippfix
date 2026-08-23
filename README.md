@@ -95,6 +95,11 @@ The installer copies everything into its own directory (by default
 `/usr/local/lib/ippfix`), builds the virtual environment, installs the man
 page, creates an unprivileged `ippfix` user, and enables the systemd unit.
 
+Installing the daemon is the easy part; making clients use it rather than the
+printer is where deployments go wrong. See **[DEPLOYMENT.md](DEPLOYMENT.md)**
+for that, including the cheap options for networks with no special
+infrastructure.
+
 If another mDNS responder is already running on the machine, it must be told to
 release UDP port 5353. With `systemd-resolved` that means setting
 `MulticastDNS=no` in `/etc/systemd/resolved.conf` and restarting it.
@@ -123,11 +128,18 @@ too, so clients treat this no differently.
 
 ### Discovery
 
-If the printers are also reachable directly, clients will see both them and
-the proxy queues and users will pick whichever comes first. Suppress the
-printers' own advertisements — on the printer itself, on the network, or in
-whatever reflects mDNS between segments — leaving only the proxy queues
-visible. Take care to suppress only `_ipp`, `_ipps` and `_pdl-datastream`;
+If the printers are also reachable directly, clients will see both them and the
+proxy queues, and users will pick whichever comes first — so half the jobs
+still vanish. Suppressing the printers' own advertisements is the step people
+most often skip, and skipping it is the usual reason for concluding that
+`ippfix` does not work.
+
+There are several ways to do it, ranging from one setting on the printer to
+full network isolation, with different trade-offs around scanning, fallback
+printing and effort. **[DEPLOYMENT.md](DEPLOYMENT.md) walks through all of
+them** and explains how to verify the result.
+
+Whichever you choose: suppress only `_ipp`, `_ipps` and `_pdl-datastream`.
 `_uscan` and `_uscans` must keep working or scanning breaks.
 
 ## Usage
