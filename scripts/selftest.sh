@@ -83,13 +83,33 @@ q = parse_queue('upstairs=ipps://printer.example:1234/queue')
 assert (q.name, q.host, q.port, q.tls, q.path) == \
        ('upstairs', 'printer.example', 1234, True, '/queue')
 assert q.local_path == '/ipp/upstairs'
-for bad_spec in ('http://printer.example/x', 'a b=ipp://h/p', 'ipp:///nohost'):
+# Display names may contain spaces; only the derived slug must be URL-safe.
+q = parse_queue('Apartment Color Printer=ipp://printer.example/ipp/print')
+assert q.name == 'Apartment Color Printer', q.name
+assert q.slug == 'apartment-color-printer', q.slug
+assert q.local_path == '/ipp/apartment-color-printer'
+assert parse_queue('  Odd//Name!! =ipp://h/p').slug == 'odd-name'
+for bad_spec in ('http://printer.example/x', '   =ipp://h/p', 'ipp:///nohost'):
     try:
         parse_queue(bad_spec)
     except ValueError:
         continue
     raise AssertionError(f'should have rejected {bad_spec!r}')
 PY
+
+python3 - <<'PY2' && ok 'every option Config reads exists on the CLI' || bad 'CLI/Config agreement'
+import sys
+sys.path.insert(0, '.')
+import ippfix
+# Building Config from hand-made Namespace hides options added to one side
+# only, which is exactly how a startup crash slipped through once.
+args = ippfix.build_parser().parse_args(['x=ipp://printer.example/ipp/print'])
+cfg = ippfix.Config(args, [ippfix.parse_queue('x=ipp://printer.example/ipp/print')])
+for attr in ('port', 'advertise', 'cert', 'key', 'convert', 'converter',
+             'timeout', 'archive', 'archive_max', 'max_connections',
+             'idle_timeout', 'require_tls', 'extra_addresses'):
+    assert hasattr(cfg, attr), attr
+PY2
 
 echo 'addressing'
 python3 - <<'PY2' && ok 'URLs stay short and paths stay forgiving' || bad 'URL handling'
@@ -100,7 +120,8 @@ import ippfix
 def cfg(port=631, queues=('office=ipp://printer.example/ipp/print',)):
     a = argparse.Namespace(port=port, advertise='192.0.2.10', also_advertise=None,
                            no_ipv6=True, cert='c', key='k', no_convert=True,
-                           converter='x', timeout=1, archive=None, archive_max=5)
+                           converter='x', timeout=1, archive=None, archive_max=5,
+                           max_connections=64, idle_timeout=30, require_tls=False)
     qs = [ippfix.parse_queue(q) for q in queues]
     return ippfix.Config(a, qs), qs
 
@@ -114,7 +135,8 @@ assert c2.our_uri(qs2[0]) == 'ipp://192.0.2.10:8631/ipp/office'
 # IPv6 literals must be bracketed or the port cannot be told from the address.
 a = argparse.Namespace(port=631, advertise='2001:db8::1', also_advertise=[],
                        no_ipv6=True, cert='c', key='k', no_convert=True,
-                       converter='x', timeout=1, archive=None, archive_max=5)
+                       converter='x', timeout=1, archive=None, archive_max=5,
+                       max_connections=64, idle_timeout=30, require_tls=False)
 c3 = ippfix.Config(a, qs)
 assert c3.our_uri(qs[0]) == 'ipp://[2001:db8::1]/ipp/office', c3.our_uri(qs[0])
 assert c3.base_http() == 'http://[2001:db8::1]:631'
@@ -190,6 +212,48 @@ PS
 else
   echo '  skip  defont (ghostscript not installed)'
 fi
+
+echo 'hardening'
+python3 - <<'PY2' && ok 'refuses hostile IPP and oversized input' || bad 'hardening'
+import sys, struct
+sys.path.insert(0, '.')
+import ippcodec as ipp
+import ippfix
+
+# A run of delimiter bytes used to allocate one object per byte: 2MB of input
+# became ~250MB of heap and OOM-killed the daemon.
+try:
+    ipp.parse(bytes([2, 0, 0, 0x0b, 0, 0, 0, 1]) + b'\x00' * 2_000_000)
+    raise AssertionError('unbounded group allocation still accepted')
+except ValueError:
+    pass
+
+# Tags that are not valid delimiters must be refused outright.
+try:
+    ipp.parse(bytes([2, 0, 0, 0x0b, 0, 0, 0, 1]) + b'\x09')
+    raise AssertionError('invalid delimiter accepted')
+except ValueError:
+    pass
+
+# Operations a print client never needs must not reach the printer. The
+# printer may be reachable only through this proxy, so relaying these would
+# hand every LAN host administrative control of it.
+for op in (0x0013, 0x0003, 0x0007, 0x0012, 0x000D):
+    assert op not in ippfix.ALLOWED_OPS, hex(op)
+for op in (0x0002, 0x0004, 0x0005, 0x0006, 0x0009, 0x000B):
+    assert op in ippfix.ALLOWED_OPS, hex(op)
+
+# Attributes naming a resource the printer would fetch must be stripped.
+q = ippfix.parse_queue('t=ipp://printer.example/ipp/print')
+m = ipp.new_request(0x0002, 1, 'ipp://attacker/x')
+g = m.operation()
+g.replace('document-uri', ipp.TAG_URI, ['http://attacker.example/payload'])
+g.replace('job-name', ipp.TAG_NAME, ['x'])
+ippfix.rewrite_request(q, m)
+assert g.index_of('document-uri') < 0, 'document-uri survived'
+assert g.get_str('printer-uri') == 'ipp://printer.example/ipp/print'
+assert g.index_of('job-name') >= 0, 'stripped too much'
+PY2
 
 echo 'systemd units'
 if command -v systemd-analyze >/dev/null 2>&1; then

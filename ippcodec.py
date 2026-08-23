@@ -14,6 +14,13 @@ codec needing to model any of it.
 """
 import struct
 
+# A hostile message must not be able to make us allocate without bound. Every
+# byte below 0x10 starts a new group, so an unbroken run of them would otherwise
+# allocate one object per byte.
+MAX_GROUPS = 64
+MAX_ITEMS = 10000
+VALID_DELIMITERS = frozenset(range(0x00, 0x08))
+
 # delimiter tags
 OPERATION_ATTRS = 0x01
 JOB_ATTRS = 0x02
@@ -134,12 +141,17 @@ def parse(buf):
     i = 8
     groups = []
     cur = None
+    items = 0
     while i < len(buf):
         tag = buf[i]
         if tag == END_OF_ATTRS:
             i += 1
             break
         if tag < 0x10:                      # delimiter
+            if tag not in VALID_DELIMITERS:
+                raise ValueError(f'invalid delimiter tag 0x{tag:02x}')
+            if len(groups) >= MAX_GROUPS:
+                raise ValueError('too many attribute groups')
             cur = Group(tag)
             groups.append(cur)
             i += 1
@@ -155,6 +167,9 @@ def parse(buf):
         if cur is None:                     # malformed but be forgiving
             cur = Group(OPERATION_ATTRS)
             groups.append(cur)
+        items += 1
+        if items > MAX_ITEMS:
+            raise ValueError('too many attributes')
         cur.items.append((tag, bytes(name), bytes(value)))
     return Message((major, minor), code, request_id, groups, bytes(buf[i:]))
 

@@ -9,7 +9,7 @@ font cache.
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -127,6 +127,21 @@ halftoning, and inflate a small job into tens of megabytes.
   silently point users somewhere else. Defaults to the instance on this host.
   The same listing is served as JSON at `/queues.json` and as a table at the
   daemon's HTTP root.
+
+* `--max-connections` *N*:
+  Refuse connections beyond *N* concurrent ones. Default 64. Without a bound,
+  connections that open and then say nothing accumulate until the service hits
+  its task limit, after which it can accept nothing further until restarted.
+
+* `--idle-timeout` *SECONDS*:
+  Drop a connection that stops speaking for this long. Default 30. Applies to
+  every stage of a request, so a client cannot hold a thread by sending a
+  partial header and waiting.
+
+* `--require-tls`:
+  Refuse plaintext IPP and accept only implicit TLS. Off by default, because
+  clients that discover a printer over DNS-SD commonly choose plaintext and
+  would otherwise simply fail to print.
 
 * `--no-advertise`:
   Do not publish the queues over DNS-SD. Useful when discovery is handled

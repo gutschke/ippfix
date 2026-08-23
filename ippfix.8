@@ -8,6 +8,9 @@ cache.
 [\fB\-\-also\-advertise\fR \fIADDRESS\fR]
 [\fB\-\-archive\fR \fIDIR\fR]
 [\fB\-\-list\fR [\fIURL\fR]]
+[\fB\-\-max\-connections\fR \fIN\fR]
+[\fB\-\-idle\-timeout\fR \fISECONDS\fR]
+[\fB\-\-require\-tls\fR]
 [\fB\-\-no\-ipv6\fR]
 [\fB\-\-cert\fR \fIFILE\fR]
 [\fB\-\-converter\fR \fIPATH\fR]
@@ -148,6 +151,23 @@ cannot silently point users somewhere else. Defaults to the instance on this
 host. The same listing is served as JSON at
 .I /queues.json
 and as a table at the daemon's HTTP root.
+.TP
+.B \-\-max\-connections " \fIN\fR"
+Refuse connections beyond
+.I N
+concurrent ones. Default 64. Without a bound, connections that open and then
+say nothing accumulate until the service hits its task limit, after which it
+can accept nothing further until restarted.
+.TP
+.B \-\-idle\-timeout " \fISECONDS\fR"
+Drop a connection that stops speaking for this long. Default 30. Applies to
+every stage of a request, so a client cannot hold a thread by sending a partial
+header and waiting.
+.TP
+.B \-\-require\-tls
+Refuse plaintext IPP and accept only implicit TLS. Off by default, because
+clients that discover a printer over DNS-SD commonly choose plaintext and would
+otherwise simply fail to print.
 .TP
 .B \-\-no\-advertise
 Do not publish the queues over DNS\-SD. Useful when discovery is handled

@@ -85,32 +85,83 @@ OP_NAMES = {0x0002: 'Print-Job', 0x0004: 'Validate-Job', 0x0005: 'Create-Job',
 
 DEFAULT_QUEUE = 'print'
 
+# Only these are relayed. The printer may sit on a segment that clients cannot
+# reach, which makes this proxy the sole path to it; forwarding whatever
+# arrives would hand every LAN host administrative operations such as
+# Set-Printer-Attributes, Purge-Jobs, or Print-URI with a URL of their
+# choosing. A print client needs none of those.
+ALLOWED_OPS = frozenset({
+    0x0002,   # Print-Job
+    0x0004,   # Validate-Job
+    0x0005,   # Create-Job
+    0x0006,   # Send-Document
+    0x0008,   # Cancel-Job
+    0x0009,   # Get-Job-Attributes
+    0x000A,   # Get-Jobs
+    0x000B,   # Get-Printer-Attributes
+    0x003B,   # Close-Job
+    0x003C,   # Identify-Printer
+})
+
+# Attributes naming a resource the printer would fetch itself. Never relayed:
+# they turn the printer into a fetcher for whoever sent the job.
+FORBIDDEN_ATTRS = ('document-uri', 'job-uri', 'job-authorization-uri',
+                   'notify-recipient-uri', 'job-mandatory-attributes')
+
+MAX_BODY = 64 * 1024 * 1024        # a print job larger than this is not real
+MAX_HEADERS = 100
+MAX_KEEPALIVE = 100
+
 
 # ---------------------------------------------------------------------------
 # configuration
 # ---------------------------------------------------------------------------
+def slugify(name):
+    """Turn a display name into something short and safe to type in a URL.
+
+    Users see the display name in their printer list; they type the slug. So
+    "Apartment Color Printer" is shown as written and addressed as
+    /ipp/apartment-color-printer.
+    """
+    slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+    return slug or 'printer'
+
+
 class Queue:
-    """One proxied printer, reachable at /ipp/<name> on this server."""
+    """One proxied printer.
+
+    `name` is what people see; `slug` is what they type. Keeping them separate
+    means a queue can be called "Multifunction Laserjet" without putting spaces
+    or capitals into an address anyone has to read aloud.
+    """
 
     def __init__(self, name, uri):
         parts = urllib.parse.urlsplit(uri)
         if parts.scheme not in ('ipp', 'ipps'):
             raise ValueError(f'{name}: expected an ipp:// or ipps:// URI')
         self.name = name
+        self.slug = slugify(name)
         self.tls = parts.scheme == 'ipps'
         self.host = parts.hostname
         self.port = parts.port or 631
         self.path = parts.path or '/ipp/print'
         self.preferred = None        # address that last connected
+        # Affected printers report multiple-document-jobs-supported=false, so
+        # jobs are serialised -- but per printer, not globally, and only around
+        # the upstream exchange. Conversion happens outside the lock so one
+        # expensive document cannot stall every other queue.
+        self.lock = threading.Lock()
         if not self.host:
             raise ValueError(f'{name}: no host in {uri!r}')
 
     @property
     def local_path(self):
-        return f'/ipp/{self.name}'
+        return f'/ipp/{self.slug}'
 
     def upstream_uri(self):
-        return f'ipp://{self.host}{self.path}'
+        host = f'[{self.host}]' if ':' in self.host else self.host
+        port = '' if self.port == 631 else f':{self.port}'
+        return f'ipp://{host}{port}{self.path}'
 
     def __str__(self):
         return (f'{self.name} -> {"ipps" if self.tls else "ipp"}://'
@@ -139,6 +190,9 @@ class Config:
         self.timeout = args.timeout
         self.archive = args.archive
         self.archive_max = args.archive_max
+        self.max_connections = args.max_connections
+        self.idle_timeout = args.idle_timeout
+        self.require_tls = args.require_tls
 
     def base_http(self):
         host = (f'[{self.advertise}]' if ':' in self.advertise
@@ -170,7 +224,7 @@ class Config:
     def our_uuid(self, queue):
         """Stable, and deliberately different from the printer's own: a client
         that sees one printer-uuid on two queues collapses them into one."""
-        seed = f'ippfix:{self.advertise}:{queue.name}:{queue.host}'
+        seed = f'ippfix:{self.advertise}:{queue.slug}:{queue.host}'
         h = hashlib.sha1(seed.encode()).digest()
         return 'urn:uuid:' + str(uuid.UUID(bytes=h[:16]))
 
@@ -281,14 +335,17 @@ def archive_document(cfg, queue, job_name, fmt, data, note):
         while os.path.exists(path):
             path = f'{base}.{n}.{ext}'
             n += 1
-        with open(path, 'wb') as handle:
+        os.chmod(cfg.archive, 0o700)      # exist_ok= does not fix an old mode
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'wb') as handle:
             handle.write(data)
-        os.chmod(path, 0o600)
-        with open(f'{path}.txt', 'w', encoding='utf-8') as handle:
+        fd = os.open(f'{path}.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as handle:
+            # job-name is attacker controlled; repr() keeps a newline in it
+            # from forging further lines in this file.
             handle.write(f'queue: {queue.name}\nprinter: {queue.host}\n'
-                         f'job-name: {job_name}\ndocument-format: {fmt}\n'
+                         f'job-name: {job_name!r}\ndocument-format: {fmt!r}\n'
                          f'bytes: {len(data)}\nconversion: {note}\n')
-        os.chmod(f'{path}.txt', 0o600)
         prune_archive(cfg)
         log.debug('archived %s', path)
     except OSError as exc:
@@ -449,13 +506,19 @@ def upstream_http(queue, path, timeout=30):
 # attribute rewriting
 # ---------------------------------------------------------------------------
 def rewrite_request(queue, msg):
-    """Address the request to the real printer before forwarding."""
+    """Address the request to the real printer, and strip what must not pass.
+
+    Only the operation is validated elsewhere; here we make sure no attribute
+    can point the printer at a resource of the sender's choosing.
+    """
     group = msg.operation()
     if group is None:
         return
     for attr in ('printer-uri', 'job-printer-uri'):
         if group.index_of(attr) >= 0:
             group.replace(attr, ipp.TAG_URI, [queue.upstream_uri()])
+    for attr in FORBIDDEN_ATTRS:
+        group.remove(attr)
 
 
 def rewrite_response(cfg, queue, msg):
@@ -508,15 +571,37 @@ class BadRequest(Exception):
 
 
 def read_headers(rfile):
+    """Parse request headers strictly.
+
+    Leniency here is not kindness: a header this parser reads differently from
+    an intermediary in front of it is a request-smuggling primitive. Folded
+    continuation lines and repeated Content-Length are therefore refused rather
+    than guessed at.
+    """
     headers = {}
+    count = 0
     while True:
         line = rfile.readline(8192)
-        if not line or line in (b'\r\n', b'\n'):
+        if not line:
+            raise BadRequest('truncated headers')
+        if line in (b'\r\n', b'\n'):
             break
-        if b':' in line:
-            key, value = line.split(b':', 1)
-            headers[key.strip().lower().decode('latin-1')] = \
-                value.strip().decode('latin-1')
+        if len(line) >= 8192:
+            raise BadRequest('header too long')
+        count += 1
+        if count > MAX_HEADERS:
+            raise BadRequest('too many headers')
+        if line[:1] in (b' ', b'\t'):
+            raise BadRequest('obsolete line folding')
+        if b':' not in line:
+            raise BadRequest('malformed header')
+        key, value = line.split(b':', 1)
+        name = key.strip().lower().decode('latin-1')
+        if name in headers and name in ('content-length', 'transfer-encoding'):
+            raise BadRequest(f'duplicate {name}')
+        headers[name] = value.strip().decode('latin-1')
+    if 'content-length' in headers and 'transfer-encoding' in headers:
+        raise BadRequest('both content-length and transfer-encoding')
     return headers
 
 
@@ -531,9 +616,13 @@ def read_body(rfile, headers):
                 size = int(line.split(b';')[0], 16)
             except ValueError:
                 raise BadRequest('bad chunk size')
+            if size < 0:
+                raise BadRequest('negative chunk size')
             if size == 0:
                 rfile.readline(8192)
                 break
+            if len(body) + size > MAX_BODY:
+                raise BadRequest('body too large')
             while size > 0:
                 chunk = rfile.read(min(size, 65536))
                 if not chunk:
@@ -543,12 +632,19 @@ def read_body(rfile, headers):
             rfile.readline(8192)
         return bytes(body)
 
-    remaining = int(headers.get('content-length', 0) or 0)
+    try:
+        remaining = int(headers.get('content-length', 0) or 0)
+    except ValueError:
+        raise BadRequest('bad content-length')
+    if remaining < 0:
+        raise BadRequest('negative content-length')
+    if remaining > MAX_BODY:
+        raise BadRequest('body too large')
     body = bytearray()
     while len(body) < remaining:
         chunk = rfile.read(min(remaining - len(body), 65536))
         if not chunk:
-            break
+            raise BadRequest('truncated body')
         body += chunk
     return bytes(body)
 
@@ -582,28 +678,47 @@ The same list is available as <a href="/queues.json">/queues.json</a>.</p>
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         cfg = self.server.cfg
+        # A connection that never speaks must not hold a thread. Without this
+        # a handful of silent connections exhaust the task limit and printing
+        # stops until the service is restarted by hand.
+        if not self.server.slots.acquire(blocking=False):
+            log.warning('connection limit reached; dropping %s',
+                        self.client_address[0])
+            return
+        try:
+            self.serve(cfg)
+        finally:
+            self.server.slots.release()
+
+    def serve(self, cfg):
         sock = self.request
+        sock.settimeout(cfg.idle_timeout)
         try:
             first = sock.recv(1, socket.MSG_PEEK)
-        except OSError:
+        except (OSError, socket.timeout):
             return
         if not first:
             return
         if first[0] == 0x16:                       # TLS ClientHello
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             try:
-                context.load_cert_chain(cfg.cert, cfg.key)
-                sock = context.wrap_socket(sock, server_side=True)
+                sock = self.server.tls_context.wrap_socket(sock,
+                                                           server_side=True)
             except (ssl.SSLError, OSError) as exc:
                 log.debug('TLS handshake failed: %s', exc)
                 return
+        elif cfg.require_tls:
+            log.debug('refused plaintext from %s', self.client_address[0])
+            return
 
         rfile = sock.makefile('rb')
         wfile = sock.makefile('wb')
         try:
+            served = 0
             while self.one_request(cfg, rfile, wfile):
-                pass
-        except (BadRequest, OSError, ssl.SSLError):
+                served += 1
+                if served >= MAX_KEEPALIVE:
+                    break
+        except (BadRequest, OSError, ssl.SSLError, socket.timeout):
             pass
         finally:
             for handle in (rfile, wfile, sock):
@@ -621,7 +736,10 @@ class Handler(socketserver.BaseRequestHandler):
             return False
         method = parts[0].decode('latin-1')
         path = parts[1].decode('latin-1')
+        version = parts[2].decode('latin-1') if len(parts) > 2 else 'HTTP/1.0'
         headers = read_headers(rfile)
+        keep = (version.endswith('1.1') and
+                'close' not in headers.get('connection', '').lower())
 
         # CUPS-derived clients send this routinely and stall without it.
         if headers.get('expect', '').lower() == '100-continue':
@@ -637,7 +755,8 @@ class Handler(socketserver.BaseRequestHandler):
         else:
             respond(wfile, '405 Method Not Allowed', 'text/plain',
                     b'method not allowed\n')
-        return True
+            return False
+        return keep
 
     def resolve(self, cfg, path):
         """Map a request path to a queue.
@@ -669,6 +788,7 @@ class Handler(socketserver.BaseRequestHandler):
             body = json.dumps(
                 {'queues': [
                     {'name': q.name,
+                     'slug': q.slug,
                      'ipp': cfg.our_uri(q, 'ipp'),
                      'ipps': cfg.our_uri(q, 'ipps'),
                      'resource': q.local_path,
@@ -693,6 +813,9 @@ class Handler(socketserver.BaseRequestHandler):
                         'strings': '/ipp/strings/en-us'}[match.group(2)]
             try:
                 status, ctype, data = upstream_http(queue, upstream)
+                # getheader() preserves folded continuations verbatim, so a
+                # hostile printer could otherwise inject header lines here.
+                ctype = re.sub(r'[^\x20-\x7e]', ' ', ctype)[:128]
                 respond(wfile, '200 OK' if status == 200 else f'{status} Error',
                         ctype, data)
             except OSError:
@@ -722,6 +845,12 @@ class Handler(socketserver.BaseRequestHandler):
             return
 
         name = OP_NAMES.get(msg.code, f'0x{msg.code:04x}')
+        if msg.code not in ALLOWED_OPS:
+            log.warning('refused operation %s from %s', name,
+                        self.client_address[0])
+            respond(wfile, '400 Bad Request', 'text/plain',
+                    b'operation not permitted\n')
+            return
         note = ''
 
         if msg.code in (OP_PRINT_JOB, OP_SEND_DOCUMENT) and msg.data:
@@ -731,14 +860,21 @@ class Handler(socketserver.BaseRequestHandler):
             # multiple-document-jobs-supported = false, and a second job
             # arriving mid-transfer confuses them.
             original = msg.data
-            with self.server.job_lock:
-                msg.data, note = convert(cfg, msg.data, fmt)
-                archive_document(cfg, queue,
-                                 group.get_str('job-name') if group else None,
-                                 fmt, original, note)
-                rewrite_request(queue, msg)
-                status, raw = upstream_ipp(queue, ipp.serialize(msg),
-                                           cfg.timeout)
+            msg.data, note = convert(cfg, msg.data, fmt)
+            archive_document(cfg, queue,
+                             group.get_str('job-name') if group else None,
+                             fmt, original, note)
+            rewrite_request(queue, msg)
+            payload = ipp.serialize(msg)
+            if not queue.lock.acquire(timeout=cfg.timeout):
+                log.warning('%s: busy, refusing job', queue.name)
+                respond(wfile, '503 Service Unavailable', 'text/plain',
+                        b'printer busy\n')
+                return
+            try:
+                status, raw = upstream_ipp(queue, payload, cfg.timeout)
+            finally:
+                queue.lock.release()
         else:
             rewrite_request(queue, msg)
             status, raw = upstream_ipp(queue, ipp.serialize(msg), cfg.timeout)
@@ -781,6 +917,9 @@ def inherited_socket():
         log.warning('systemd passed %d sockets; using the first', count)
     sock = socket.socket(fileno=SD_LISTEN_FDS_START)
     sock.setblocking(True)
+    os.set_inheritable(sock.fileno(), False)
+    for name in ('LISTEN_PID', 'LISTEN_FDS', 'LISTEN_FDNAMES'):
+        os.environ.pop(name, None)
     return sock
 
 
@@ -792,7 +931,11 @@ class Server(socketserver.ThreadingTCPServer):
 
     def __init__(self, addr, handler, cfg, listen_fd=None):
         self.cfg = cfg
-        self.job_lock = threading.Lock()
+        self.slots = threading.Semaphore(cfg.max_connections)
+        # Built once: a fresh context per connection means a disk read and a
+        # key parse for every TCP connect, which is its own amplifier.
+        self.tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.tls_context.load_cert_chain(cfg.cert, cfg.key)
         self._inherited = listen_fd
         if listen_fd is not None:
             self.address_family = listen_fd.family
@@ -874,7 +1017,7 @@ def parse_queue(spec):
     else:
         name, uri = DEFAULT_QUEUE, spec
     name = name.strip()
-    if not re.fullmatch(r'[A-Za-z0-9._-]+', name):
+    if not name or not slugify(name):
         raise ValueError(f'invalid queue name {name!r}')
     return Queue(name, uri.strip())
 
@@ -912,7 +1055,7 @@ def list_queues(url):
     return 0
 
 
-def main(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(
         prog='ippfix',
         description='IPP proxy that outlines text so no font program reaches '
@@ -954,6 +1097,14 @@ def main(argv=None):
                              'enabling it, and turn it off afterwards')
     parser.add_argument('--archive-max', type=int, default=50, metavar='N',
                         help='keep at most N archived jobs (default: 50)')
+    parser.add_argument('--max-connections', type=int, default=64, metavar='N',
+                        help='refuse connections beyond N, so that idle ones '
+                             'cannot exhaust the task limit (default: 64)')
+    parser.add_argument('--idle-timeout', type=int, default=30, metavar='SEC',
+                        help='drop a connection that stops speaking for this '
+                             'long (default: 30)')
+    parser.add_argument('--require-tls', action='store_true',
+                        help='refuse plaintext IPP and accept only ipps')
     parser.add_argument('--no-advertise', action='store_true',
                         help='do not publish over DNS-SD')
     parser.add_argument('--list', nargs='?', const='http://localhost:631/',
@@ -962,6 +1113,11 @@ def main(argv=None):
                              'configuring clients by address instead of by '
                              'discovery. Defaults to the local instance')
     parser.add_argument('-v', '--verbose', action='store_true')
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.list:
