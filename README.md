@@ -25,18 +25,27 @@ Task: POSTSCRIPT
 File: fontcache.c  Line: 2494
 ```
 
-The budget covers both fonts and glyphs. Measured on a Color LaserJet Pro MFP
-M283fdw, roughly 527 distinct glyphs from one embedded font is fine and 534 is
-not, while each *additional* embedded font on the page costs about 300
-glyph-equivalents of the same allowance. The exact figures differ between
-typefaces, so there is no safe threshold to design against.
+The budget covers both the glyphs drawn and the embedded font programs they are
+drawn from, and the two trade against each other. Measured on a Color LaserJet
+Pro MFP M283fdw: with one fully embedded font, 527 distinct glyphs render and
+534 do not; add a second fully embedded font and the page fails at 300. The
+cost of a font scales with how many glyphs its embedded program declares, not
+with a flat per-font constant, so a heavily subsetted font is much cheaper than
+a complete one.
 
-This is not a new defect — it is present in firmware builds years apart, and it
-is not going to be fixed. What changed is the client side. Chrome 130 and later
-emit a separate embedded font program for each *strike* of a typeface: each
-distinct size, and until Chrome 145 each distinct colour. A page mixing
-headings and body text in a couple of shades can therefore embed many copies of
-one font and exhaust a limit that has not moved in years.
+That means **there is no safe threshold to design against**. The figures above
+come from probes embedding complete, unsubsetted fonts; ordinary jobs from a
+browser subset aggressively and sit far below them. Whether a given document
+crosses the line depends on the typefaces, how they were subsetted, and how
+many distinct characters the page uses.
+
+The defect is not new — it is present in firmware builds years apart, and it is
+not going to be fixed. Client-side changes affect how often it is reached:
+Chrome 130 through 144 emitted a separate embedded font program for each
+*strike* of a typeface, including one per text colour, which multiplied the
+cost of an ordinary page considerably. Chrome 145 removed the colour component
+and normalises text size out of the key, so current versions embed far fewer
+font programs than that era did.
 
 Printing "as an image" avoids the problem, because a bitmap contains no fonts.
 It is also lossy, produces very large jobs, and on ChromeOS the setting resets

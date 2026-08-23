@@ -29,17 +29,26 @@ pages emerge and the job then stops. No error reaches the client and none is
 shown on the panel. Where the device records it at all, its event log reports an
 assertion failure in `fontcache.c`.
 
-The budget covers fonts as well as glyphs. On a Color LaserJet Pro MFP M283fdw,
-roughly 527 distinct glyphs from a single embedded font succeed where 534 fail,
-and each additional embedded font on the page consumes about 300
-glyph-equivalents of the same allowance. The figures vary between typefaces, so
-no fixed threshold is safe.
+The budget covers both the glyphs drawn and the embedded font programs they come
+from, and the two trade against each other. On a Color LaserJet Pro MFP M283fdw,
+one fully embedded font renders 527 distinct glyphs but not 534; add a second
+fully embedded font and the page fails at 300. A font's cost scales with how
+many glyphs its embedded program declares rather than being a flat per-font
+constant, so a heavily subsetted face is far cheaper than a complete one.
+
+Those figures come from probes embedding complete, unsubsetted fonts. Jobs from
+a browser subset aggressively and sit well below them: sampled from real Chrome
+output, two subsets declaring 93 and 668 glyphs, with 451 distinct glyphs drawn
+between them, printed without trouble. No fixed threshold is therefore safe to
+design against — whether a document crosses the line depends on its typefaces,
+how they were subsetted, and how many distinct characters appear.
 
 The defect appears in firmware builds years apart and is unlikely to be fixed.
-What changed is the client: Chrome 130 and later embed a separate font program
-for every *strike* of a typeface — each distinct size, and until Chrome 145 each
-distinct colour — so an ordinary page can embed many copies of one font and
-exhaust a limit that has not moved in years.
+Client-side changes affect how often it is reached: Chrome 130 through 144
+embedded a separate font program for every *strike* of a typeface, including one
+per text colour, which multiplied the cost of an ordinary page. Chrome 145
+removed the colour component and normalises text size out of the key, so current
+versions embed far fewer font programs than that era did.
 
 **ippfix**
 converts glyphs to filled paths using Ghostscript's `-dNoOutputFonts` option. No

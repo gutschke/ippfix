@@ -14,19 +14,28 @@ none appears on the panel. Where a device records it at all, it shows up in
     Task: POSTSCRIPT
     File: fontcache.c  Line: 2494
 
-Measured on a Color LaserJet Pro MFP M283fdw, the budget covers both the
-glyphs drawn and the fonts they come from: roughly 527 distinct glyphs from a
-single embedded font is fine and 534 is not, while each additional embedded
-font on the page costs about 300 glyph-equivalents of the same allowance. The
-exact numbers vary between typefaces, so no fixed threshold is safe to design
-against.
+The budget covers both the glyphs drawn and the embedded font programs they
+come from, and the two trade against each other. Measured on a Color LaserJet
+Pro MFP M283fdw: with one fully embedded font, 527 distinct glyphs render and
+534 do not; add a second fully embedded font and the page fails at 300. A
+font's cost scales with how many glyphs its embedded program declares rather
+than being a flat per-font constant, so a heavily subsetted face is far cheaper
+than a complete one.
+
+Those figures come from probes embedding complete, unsubsetted fonts. Jobs from
+a browser subset aggressively and sit well below them: sampled from real Chrome
+output, two subsets declaring 93 and 668 glyphs, with 451 distinct glyphs drawn
+between them, printed without trouble. So no fixed threshold is safe to design
+against -- whether a document crosses the line depends on its typefaces, how
+they were subsetted, and how many distinct characters appear on the page.
 
 The defect has been present across firmware builds years apart, so waiting for
-a fix is not a strategy. It has become much easier to hit because Chrome 130
-and later emit a separate embedded font program for each *strike* of a
-typeface -- each distinct size, and until Chrome 145 each distinct colour -- so
-an ordinary page mixing headings and body text can embed many copies of one
-font and exhaust a limit that has not moved in years.
+a fix is not a strategy. Client-side changes affect how often it is reached:
+Chrome 130 through 144 emitted a separate embedded font program per *strike* of
+a typeface, including one per text colour, which multiplied the cost of an
+ordinary page considerably. Chrome 145 removed the colour component and
+normalises text size out of the key, so current versions embed far fewer font
+programs than that era did.
 
 What this does
 --------------
