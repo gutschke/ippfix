@@ -1,0 +1,25 @@
+[Unit]
+Description=IPP font-repair print proxy
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ExecStart=/usr/local/lib/ippfix/venv/bin/ippfix /usr/local/lib/ippfix/ippfix.py printer=ipp://printer.example/ipp/print
+Group=ippfix
+NoNewPrivileges=true
+PrivateTmp=yes
+ProtectHome=true
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/ippfix
+RuntimeDirectory=ippfix
+Restart=always
+RestartSec=5
+Type=exec
+User=ippfix
+WorkingDirectory=/run/ippfix
+
+[Install]
+WantedBy=multi-user.target

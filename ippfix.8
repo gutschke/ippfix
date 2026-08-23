@@ -1,0 +1,224 @@
+.TH IPPFIX 8 "August 2026" "1.0" "System Administration Utilities"
+.SH NAME
+ippfix \- IPP proxy that repairs print jobs for printers with a limited font
+cache.
+.SH SYNOPSIS
+.B ippfix
+[\fB\-a\fR|\fB\-\-advertise\fR \fIADDRESS\fR]
+[\fB\-\-cert\fR \fIFILE\fR]
+[\fB\-\-converter\fR \fIPATH\fR]
+[\fB\-\-key\fR \fIFILE\fR]
+[\fB\-\-no\-advertise\fR]
+[\fB\-\-no\-convert\fR]
+[\fB\-p\fR|\fB\-\-port\fR \fIPORT\fR]
+[\fB\-\-timeout\fR \fISECONDS\fR]
+[\fB\-v\fR|\fB\-\-verbose\fR]
+\fI[NAME=]URI\fR...
+
+.SH DESCRIPTION
+.B ippfix
+accepts print jobs over IPP, rewrites each PDF so that it contains no embedded
+font programs, and forwards it to a real printer. Everything else is relayed
+untouched.
+.PP
+It exists because HP LaserJet Pro printers run a combined PostScript/PDF
+interpreter with a fixed per\-page budget for embedded fonts and the glyphs
+drawn from them. Exceeding that budget aborts the interpreter: the printer
+warms up, reports the job
+.BR completed ,
+and marks nothing. Sometimes the first few pages emerge and the job then stops.
+No error reaches the client and none is shown on the panel. Where the device
+records it at all, its event log reports an assertion failure in
+.BR fontcache.c .
+.PP
+The budget covers fonts as well as glyphs. On a Color LaserJet Pro MFP M283fdw,
+roughly 527 distinct glyphs from a single embedded font succeed where 534 fail,
+and each additional embedded font on the page consumes about 300
+glyph\-equivalents of the same allowance. The figures vary between typefaces,
+so no fixed threshold is safe.
+.PP
+The defect appears in firmware builds years apart and is unlikely to be fixed.
+What changed is the client: Chrome 130 and later embed a separate font program
+for every
+.I strike
+of a typeface \(em each distinct size, and until Chrome 145 each distinct
+colour \(em so an ordinary page can embed many copies of one font and exhaust a
+limit that has not moved in years.
+.PP
+.B ippfix
+converts glyphs to filled paths using Ghostscript's
+.B \-dNoOutputFonts
+option. No font program reaches the printer, which makes the failure
+structurally impossible rather than merely less likely. Text remains vector, so
+the printer's own rasteriser still renders it at full device precision and its
+edge enhancement still applies. Rasterising the page instead would commit its
+geometry to the device grid before the printer saw it, forfeit the printer's
+halftoning, and inflate a small job into tens of megabytes.
+
+.SH ARGUMENTS
+.TP
+.I [NAME=]URI
+A printer to proxy, given as an
+.B ipp://
+or
+.B ipps://
+URI. The optional
+.I NAME
+becomes the queue name, published at
+.BI /ipp/ NAME\fR.
+Without one, the queue is named
+.BR print .
+May be repeated to serve several printers from one daemon.
+
+.SH OPTIONS
+.TP
+.BR \-a ", " \-\-advertise " \fIADDRESS\fR"
+Address that clients should use to reach this server. Autodetected by default,
+which is wrong on hosts with several addresses.
+.TP
+.B \-\-cert " \fIFILE\fR"
+TLS certificate. Default
+.IR /etc/ippfix/ippfix.crt .
+.TP
+.B \-\-converter " \fIPATH\fR"
+Helper that rewrites a PDF read on standard input and writes the result to
+standard output. Default
+.IR /usr/local/lib/ippfix/defont .
+.TP
+.B \-\-key " \fIFILE\fR"
+TLS private key. Default
+.IR /etc/ippfix/ippfix.key .
+.TP
+.B \-\-no\-advertise
+Do not publish the queues over DNS\-SD. Useful when discovery is handled
+elsewhere.
+.TP
+.B \-\-no\-convert
+Relay jobs untouched. Intended for comparison against a converting instance,
+to confirm that conversion is what makes the difference.
+.TP
+.BR \-p ", " \-\-port " \fIPORT\fR"
+Port to listen on. Default 631, which requires
+.B CAP_NET_BIND_SERVICE
+or an adjusted
+.IR net.ipv4.ip_unprivileged_port_start .
+.TP
+.B \-\-timeout " \fISECONDS\fR"
+Time allowed for each conversion and each request to the printer. Default 300.
+.TP
+.BR \-v ", " \-\-verbose
+Log protocol detail.
+
+.SH BEHAVIOUR
+Both plaintext IPP and implicit TLS are accepted on the same port, and both
+IPv4 and IPv6 are served.
+.PP
+Printer attributes are mirrored from the real device on every request. Only
+identity and URIs are rewritten \(em the queue name, its UUID, the URIs clients
+should use, and the locations of the printer's icons and localised strings,
+which are re\-served by this daemon because clients may have no route to the
+printer's own web server. Capabilities and status pass through unchanged, so
+duplex, trays, media, colour modes and live supply and error state are always
+correct without configuration.
+.PP
+Documents that are not PDF are relayed untouched, as are PDFs whose conversion
+fails or leaves any font program behind. A job that might not print is
+preferable to one that prints something wrong.
+.PP
+Jobs are forwarded one at a time, because affected printers report
+.B multiple\-document\-jobs\-supported
+as false and mishandle a second job arriving mid\-transfer.
+
+.SH FILES
+.TP
+.I /usr/local/lib/ippfix/
+Installation directory.
+.TP
+.I /usr/local/lib/ippfix/defont
+PDF conversion helper. May be run by hand for diagnosis.
+.TP
+.I /etc/ippfix/ippfix.crt\fR, \fI/etc/ippfix/ippfix.key
+Self\-signed TLS credentials created by the installer.
+.TP
+.I /etc/systemd/system/ippfix.service
+Service unit; edit
+.B ExecStart
+to configure the printers.
+
+.SH EXAMPLES
+Serve one printer:
+.PP
+.RS
+.nf
+ippfix ipp://printer.example/ipp/print
+.fi
+.RE
+.PP
+Serve two, under explicit names:
+.PP
+.RS
+.nf
+ippfix upstairs=ipp://printer1.example/ipp/print \\
+       downstairs=ipp://printer2.example/ipp/print
+.fi
+.RE
+.PP
+Run a second, non\-converting instance for comparison:
+.PP
+.RS
+.nf
+ippfix \-\-port 6310 \-\-no\-advertise \-\-no\-convert \\
+       ipp://printer.example/ipp/print
+.fi
+.RE
+
+.SH DIAGNOSTICS
+Each job is logged with its queue, operation, and the result of conversion:
+.PP
+.RS
+.nf
+upstairs   Print\-Job   HTTP 200  [outlined 393836 \-> 76789 bytes in 0.2s]
+.fi
+.RE
+.PP
+.B relayed
+indicates the job was passed through unchanged.
+.PP
+Because an affected printer reports success whether or not it printed, the
+reliable check is the device's own total impression count, which does not
+advance for a job that died. On HP devices both that counter and the assertion
+log are readable over HTTP from
+.I /DevMgmt/ProductUsageDyn.xml
+and
+.IR /DevMgmt/ProductLogsDyn.xml .
+
+.SH NOTES
+If clients can also reach the printers directly, they will see both those and
+the proxy queues, and users will choose arbitrarily between them. Suppress the
+printers' own
+.BR _ipp ,
+.B _ipps
+and
+.B _pdl\-datastream
+advertisements, but leave
+.B _uscan
+and
+.B _uscans
+alone or scanning will stop working.
+.PP
+Only one mDNS responder may hold UDP port 5353. With
+.B systemd\-resolved
+present, set
+.B MulticastDNS=no
+in
+.I /etc/systemd/resolved.conf
+and restart it, or run with
+.BR \-\-no\-advertise .
+
+.SH SEE ALSO
+.BR gs (1),
+.BR cups (1),
+.BR systemd.service (5)
+
+.SH LICENSE
+MIT.

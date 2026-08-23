@@ -1,0 +1,74 @@
+#!/bin/bash -e
+#
+# defont: rewrite a PDF so that it contains no embedded font programs.
+#
+# Ghostscript's -dNoOutputFonts converts every glyph to a filled path. The text
+# stays vector, so the printer's own rasteriser still renders it at full device
+# precision and edge enhancement still applies; only the font programs, and the
+# interpreter's need to cache them, go away.
+#
+# Reads a PDF on stdin and writes one on stdout. Input that is not a PDF is
+# passed through untouched, so raster and PCL jobs are unaffected.
+#
+export LC_ALL=C
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+GS="${GS:-gs}"
+
+infile="$(mktemp -t defont-in-XXXXXX)"
+outfile="$(mktemp -t defont-out-XXXXXX)"
+trap 'rm -f "$infile" "$outfile"' EXIT INT TERM QUIT HUP
+
+if [ $# -ge 1 ] && [ "$1" != "-" ]; then
+  cp -- "$1" "$infile"
+else
+  cat > "$infile"
+fi
+
+emit() {
+  if [ $# -ge 2 ] && [ "$2" != "-" ]; then
+    cp -- "$1" "$2"
+  else
+    cat -- "$1"
+  fi
+}
+
+# Only PDF is rewritten; anything else is already free of font programs as far
+# as this tool is concerned.
+if ! head -c 1024 "$infile" | grep -qa '%PDF-'; then
+  emit "$infile" "${2:--}"
+  exit 0
+fi
+
+# -dNoOutputFonts does the work. The remaining options exist to make sure
+# nothing else is quietly degraded on the way through: image downsampling in
+# particular is on by default in Ghostscript's named presets, which would throw
+# away half the usable resolution on a 600 dpi engine.
+"$GS" -q -dNOPAUSE -dBATCH -dSAFER \
+      -dNoOutputFonts \
+      -sDEVICE=pdfwrite \
+      -dCompatibilityLevel=1.4 \
+      -dAutoRotatePages=/None \
+      -dDownsampleColorImages=false \
+      -dDownsampleGrayImages=false \
+      -dDownsampleMonoImages=false \
+      -dAutoFilterColorImages=false \
+      -dAutoFilterGrayImages=false \
+      -dPassThroughJPEGImages=true \
+      -dColorConversionStrategy=/LeaveColorUnchanged \
+      -sOutputFile="$outfile" "$infile" >&2
+
+# Fail safe. A job that might not print is better than one that prints wrongly,
+# so anything unexpected falls back to the original bytes.
+if [ ! -s "$outfile" ]; then
+  echo "defont: empty output, passing input through" >&2
+  emit "$infile" "${2:--}"
+  exit 0
+fi
+if grep -qa '/FontFile' "$outfile"; then
+  echo "defont: font programs survived, passing input through" >&2
+  emit "$infile" "${2:--}"
+  exit 0
+fi
+
+emit "$outfile" "${2:--}"
