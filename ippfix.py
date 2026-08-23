@@ -528,6 +528,7 @@ def _font_program_size(data, index, font_body):
 
 
 MAX_INFLATE = 32 * 1024 * 1024      # enough for any real content stream
+MAX_XOBJECT_DEPTH = 8               # form XObjects nest; cycles must not loop
 
 
 def _inflate(raw):
@@ -537,6 +538,47 @@ def _inflate(raw):
     if obj.unconsumed_tail:
         raise ValueError('stream expands beyond the inspection limit')
     return out
+
+
+def _balanced_dict(data, start):
+    """The << ... >> beginning at `start`, respecting nesting.
+
+    A non-greedy regex stops at the first '>>', which is wrong the moment a
+    dictionary contains another -- and resource dictionaries always do.
+    """
+    if data[start:start + 2] != b'<<':
+        return b''
+    depth, i = 0, start
+    while i < len(data) - 1:
+        pair = data[i:i + 2]
+        if pair == b'<<':
+            depth += 1
+            i += 2
+            continue
+        if pair == b'>>':
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return data[start:i]
+            continue
+        i += 1
+    return b''
+
+
+def _sub_dict(data, index, body, key):
+    """Value of `key` in `body`, whether written inline or as a reference."""
+    m = re.search(rb'/' + key + rb'\s*', body)
+    if not m:
+        return b''
+    rest = body[m.end():]
+    if rest[:2] == b'<<':
+        return _balanced_dict(body, m.end())
+    rm = re.match(rb'(\d+)\s+\d+\s+R', rest)
+    if not rm:
+        return b''
+    resolved = _resolve(data, index, rm.group(0))
+    start = resolved.find(b'<<')
+    return _balanced_dict(resolved, start) if start >= 0 else resolved
 
 
 class Unreadable(Exception):
@@ -566,26 +608,78 @@ def _stream_payload(data, index, ref):
     return raw
 
 
+def _walk_resources(data, index, resources, cache, seen, depth=0):
+    """Fonts declared and glyphs drawn by a resource dictionary.
+
+    Follows form XObjects. This is not a nicety: a PDF printed through a
+    viewer typically arrives with the whole page wrapped in one, so the page's
+    own resources name no fonts at all and everything that matters lives one
+    level down. Missing that scores such a job as free, which is exactly
+    backwards -- those are the jobs that fail.
+    """
+    declared = 0
+    drawn = set()
+    if depth > MAX_XOBJECT_DEPTH:
+        raise Unreadable('form XObjects nested too deeply')
+
+    fonts = _sub_dict(data, index, resources, b'Font')
+    for rm in re.finditer(rb'/[^\s/<>\[\]]+\s+(\d+)\s+\d+\s+R', fonts):
+        num = int(rm.group(1))
+        if num not in cache:
+            cache[num] = _font_program_size(data, index,
+                                            _resolve(data, index, b'%d 0 R' % num))
+        declared += cache[num]
+
+    xobjects = _sub_dict(data, index, resources, b'XObject')
+    for rm in re.finditer(rb'/[^\s/<>\[\]]+\s+(\d+)\s+\d+\s+R', xobjects):
+        num = int(rm.group(1))
+        if num in seen:
+            continue
+        seen.add(num)
+        body = _resolve(data, index, b'%d 0 R' % num)
+        if b'/Subtype' in body and b'/Form' not in body:
+            continue                       # an image carries no fonts
+        drawn |= _glyphs_in(_stream_payload(data, index, num))
+        inner = _sub_dict(data, index, body, b'Resources')
+        if inner:
+            sub_declared, sub_drawn = _walk_resources(data, index, inner, cache,
+                                                      seen, depth + 1)
+            declared += sub_declared
+            drawn |= sub_drawn
+    return declared, drawn
+
+
+def _glyphs_in(blob):
+    """Distinct glyphs a content stream draws."""
+    drawn = set()
+    for hm in re.finditer(rb'<([0-9A-Fa-f]{4,})>', blob):
+        h = hm.group(1)
+        if len(h) % 4 == 0:
+            for i in range(0, len(h), 4):
+                drawn.add(h[i:i + 4])
+    # Simple fonts show text as bytes rather than glyph ids. Counting distinct
+    # bytes is coarse, but stops such a page being scored as drawing nothing.
+    for sm in re.finditer(rb'\((?:\\.|[^\\()])*\)\s*Tj', blob):
+        drawn.update(bytes([b]) for b in sm.group(0))
+    return drawn
+
+
 def estimate_font_cost(data):
     """Estimate the worst page's cost to the printer's font cache.
 
-    The budget is measured PER PAGE, so the estimate has to be too. Summing the
-    whole document over-states long ones badly -- a fifty-page report using one
-    font is no more expensive per page than a one-page one -- and over-stating
-    is not harmless here: it sends jobs down the conversion path, which inflates
-    them, which is how a long document ends up too large for the printer to
-    accept at all.
+    The budget is measured PER PAGE, so the estimate is too. Summing a whole
+    document over-states long ones badly, and over-stating is not harmless: it
+    sends jobs down the conversion path, which inflates them, which is how a
+    long document ends up too large for the printer to accept at all.
 
-    Both terms are readable without rendering: what each font program on the
-    page declares, and how many distinct glyphs that page draws. Calibration
-    against known outcomes on a Color LaserJet Pro MFP M283fdw:
+    Both terms are readable without rendering: what each font program reachable
+    from the page declares, and how many distinct glyphs are drawn. Calibrated
+    against known outcomes on a Color LaserJet Pro MFP M283fdw -- browser jobs
+    at 1205, 1291 and 1820 printed; bisection put the limit between 3558 and
+    3697.
 
-        printed  : real browser jobs        1205, 1291, 1820
-        failed   : bisection boundary       between 3558 and 3697
-
-    Returns None when the file cannot be read confidently -- object streams,
-    an unusual structure, anything unexpected. The caller must treat that as
-    "convert", never as "safe".
+    Returns None when the file cannot be read confidently. The caller must
+    treat that as "convert", never as "safe".
     """
     try:
         index = _object_index(data)
@@ -596,57 +690,34 @@ def estimate_font_cost(data):
         if not pages:
             return None
         if len(pages) > MAX_PAGES_INSPECTED:
-            # Rather than spend unbounded time on a file that may be crafted,
-            # decline to estimate. The caller converts, which is the safe answer.
             return None
 
-        declared_cache = {}
+        cache = {}
         worst = 0
         for pos in pages:
+            obj_start = data.rfind(b'obj', 0, pos)
             end = data.find(b'endobj', pos)
-            page = data[max(0, pos - 400):end if end > 0 else pos + 4096]
+            page = data[obj_start:end if end > 0 else pos + 8192]
 
-            # Fonts this page names, via its resource dictionary.
-            resources = page
-            m = re.search(rb'/Resources\s+(\d+\s+\d+\s+R)', page)
-            if m:
-                resources = _resolve(data, index, m.group(1))
+            dict_start = page.find(b'<<')
+            page_dict = (_balanced_dict(page, dict_start) if dict_start >= 0
+                         else page)
+            resources = _sub_dict(data, index, page_dict, b'Resources')
 
-            declared = 0
             seen = set()
-            for fm in re.finditer(rb'/Font\s*<<(.*?)>>', resources, re.S):
-                for rm in re.finditer(rb'/\w+\s+(\d+)\s+\d+\s+R', fm.group(1)):
-                    num = int(rm.group(1))
-                    if num in seen:
-                        continue
-                    seen.add(num)
-                    if num not in declared_cache:
-                        body = _resolve(data, index, b'%d 0 R' % num)
-                        declared_cache[num] = _font_program_size(data, index,
-                                                                 body)
-                    declared += declared_cache[num]
+            declared, drawn = _walk_resources(data, index, resources, cache, seen)
 
-            # Glyphs this page draws.
-            drawn = set()
-            for cm in re.finditer(rb'/Contents\s+(?:(\d+)\s+\d+\s+R|\[([^\]]*)\])',
-                                  page):
+            refs = []
+            cm = re.search(rb'/Contents\s+(?:(\d+)\s+\d+\s+R|\[([^\]]*)\])',
+                           page_dict)
+            if cm:
                 refs = ([int(cm.group(1))] if cm.group(1) else
                         [int(x) for x in re.findall(rb'(\d+)\s+\d+\s+R',
                                                     cm.group(2) or b'')])
-                if not refs:
-                    raise Unreadable('page contents not resolvable')
-                for ref in refs:
-                    blob = _stream_payload(data, index, ref)
-                    for hm in re.finditer(rb'<([0-9A-Fa-f]{4,})>', blob):
-                        h = hm.group(1)
-                        if len(h) % 4 == 0:
-                            for i in range(0, len(h), 4):
-                                drawn.add(h[i:i + 4])
-                    # Simple fonts show text as bytes, not glyph ids. Counting
-                    # distinct bytes is coarse but stops such a page from being
-                    # scored as if it drew nothing.
-                    for sm in re.finditer(rb'\((?:\\.|[^\\()])*\)\s*Tj', blob):
-                        drawn.update(bytes([b]) for b in sm.group(0))
+            if not refs:
+                raise Unreadable('page contents not resolvable')
+            for ref in refs:
+                drawn |= _glyphs_in(_stream_payload(data, index, ref))
 
             worst = max(worst, declared + len(drawn))
 
