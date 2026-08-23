@@ -1,0 +1,18 @@
+[Unit]
+Description=ippfix document conversion socket
+Documentation=man:ippfix(8)
+
+[Socket]
+# Reachable only by the proxy. Each connection starts its own short-lived,
+# tightly confined converter instance, so one hostile document cannot affect
+# the next job.
+ListenStream=/run/ippfix/convert.sock
+SocketUser=ippfix
+SocketGroup=ippfix
+SocketMode=0600
+Accept=yes
+RuntimeDirectory=ippfix
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=sockets.target

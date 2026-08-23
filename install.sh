@@ -2,7 +2,9 @@
 export LC_ALL=C
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-SOURCES=(ippfix{,.8,.8.md,.py,.service} ippcodec.py defont {install,uninstall}.sh LICENSE README.md DEPLOYMENT.md)
+SOURCES=(ippfix{,.8,.8.md,.py,.service,.socket} ippfix-convert.socket
+         'ippfix-convert@.service' ippfix.tmpfiles.conf ippcodec.py defont
+         {install,uninstall}.sh LICENSE README.md DEPLOYMENT.md)
 DEP='zeroconf'
 
 trap 'rc="$?"
@@ -26,10 +28,13 @@ for cmd in python3 gzip mandb systemctl useradd tput gs openssl; do
   fi
 done
 
-# Check for venv module (common omission on Debian/Ubuntu)
-if ! python3 -c 'import venv' >&/dev/null; then
-  echo 'Error: Python3 "venv" module is missing.'
-  echo '  On Debian/Ubuntu, install it with: apt install python3-venv'
+# Check for venv (common omission on Debian/Ubuntu). Importing venv is not
+# enough: Debian splits out ensurepip, without which venv creation fails only
+# once we are already halfway through installing.
+if ! python3 -c 'import venv, ensurepip' >&/dev/null; then
+  pyver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)"
+  echo 'Error: Python3 "venv" support is incomplete.'
+  echo "  On Debian/Ubuntu, install it with: apt install python3${pyver:+${pyver}}-venv"
   exit 1
 fi
 
@@ -109,14 +114,23 @@ mandb -q >&/dev/null || echo " (warning: mandb failed)"
 echo ' done.'
 
 # Service & user
-echo -n 'Configuring user and storage...'
+echo -n 'Configuring users and storage...'
 conf_dir='/etc/ippfix'
+state_dir='/var/lib/ippfix'
 if ! id 'ippfix' >&/dev/null; then
   useradd -d "${conf_dir}" -U -M -r -s '/usr/sbin/nologin' 'ippfix'
 fi
-mkdir -p "${conf_dir}"
-chown 'ippfix:ippfix' "${conf_dir}"
+# Ghostscript runs under its own account, separate from the network daemon, so
+# that a flaw in document parsing reaches neither the keys nor the archive.
+if ! id 'ippfix-convert' >&/dev/null; then
+  useradd -d '/nonexistent' -U -M -r -s '/usr/sbin/nologin' 'ippfix-convert'
+fi
+mkdir -p "${conf_dir}" "${state_dir}"
+chown 'ippfix:ippfix' "${conf_dir}" "${state_dir}"
 chmod 750 "${conf_dir}"
+chmod 700 "${state_dir}"
+install -m0644 "${dst}/ippfix.tmpfiles.conf" '/usr/lib/tmpfiles.d/ippfix.conf'
+systemd-tmpfiles --create '/usr/lib/tmpfiles.d/ippfix.conf' >&/dev/null || :
 echo ' done.'
 
 # TLS credentials. Printers ship self-signed certificates of their own, so
@@ -137,15 +151,17 @@ else
   echo ' done.'
 fi
 
-echo -n 'Installing systemd service...'
-rm -f '/etc/systemd/system/ippfix.service'
-# Symlink for "single source of truth" configuration
-ln -s "${dst}/ippfix.service" '/etc/systemd/system/ippfix.service'
+echo -n 'Installing systemd units...'
+for unit in ippfix.service ippfix.socket ippfix-convert.socket 'ippfix-convert@.service'; do
+  rm -f "/etc/systemd/system/${unit}"
+  # Symlink for "single source of truth" configuration
+  ln -s "${dst}/${unit}" "/etc/systemd/system/${unit}"
+done
 
 # Reload
 systemctl daemon-reload
-systemctl stop ippfix >&/dev/null || :
-systemctl enable ippfix >&/dev/null
+systemctl stop ippfix ippfix.socket >&/dev/null || :
+systemctl enable ippfix ippfix.socket ippfix-convert.socket >&/dev/null
 echo ' done.'
 
 # Warn about a conflicting mDNS responder, which is the most common reason for

@@ -255,6 +255,37 @@ Overkill for this problem alone.
 
 **Use when** you want IoT isolation anyway and this is one beneficiary of it.
 
+## Network topology notes
+
+The common deployment has the printer on an isolated segment and clients on the
+main LAN, which means the daemon straddles two networks with different
+properties. Three things follow from that, all handled automatically, but worth
+knowing about because each fails in a way that looks like something else.
+
+**Mixed address families.** A dual-stack LAN in front of an IPv4-only printer
+segment is normal. If a printer's name resolves to both an A and an AAAA record
+but its network carries only IPv4, Python's HTTP client would use whichever
+address came first and every job would hang until it timed out. `ippfix` tries
+each address a name resolves to and remembers the one that worked, so this
+costs at most one slow attempt at startup and nothing afterwards. Configuring
+printers by literal address avoids the question entirely.
+
+**Multi-homed hosts.** The daemon publishes the address given by `--advertise`
+plus the stable global IPv6 addresses **of that same interface**. It does not
+publish every address the machine happens to have: on a host with a second
+interface facing a network clients cannot route to, advertising those addresses
+makes clients stall on an address that will never answer. If autodetection
+picks the wrong interface, set `--advertise` explicitly.
+
+**IPv6 addresses that come and go.** Privacy/temporary addresses rotate, and
+deprecated or tentative ones are not usable for new connections. Publishing any
+of them produces a queue that works today and is unreachable next week.
+`ippfix` publishes only stable, globally scoped, non-tentative addresses. Where
+IPv6 exists but is not actually routable, `--no-ipv6` publishes IPv4 only.
+
+Link-local addresses are never published: they require a scope identifier that
+a DNS-SD record cannot usefully carry.
+
 ## Step 3: verify
 
 **1. The queue is visible and answers.**

@@ -9,7 +9,7 @@ font cache.
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -76,6 +76,23 @@ halftoning, and inflate a small job into tens of megabytes.
   Address that clients should use to reach this server. Autodetected by default,
   which is wrong on hosts with several addresses.
 
+* `--also-advertise` *ADDRESS*:
+  Additional address to publish in the DNS-SD records; may be repeated. By
+  default the stable, globally scoped IPv6 addresses of the same interface as
+  `--advertise` are published alongside it, so dual-stack clients are offered
+  IPv6 without extra configuration.
+
+  Only that interface's addresses are used. On a multi-homed host, publishing
+  every address the machine happens to have invites clients to try one they
+  cannot route to, which appears as a long stall rather than a clear failure.
+  Privacy, deprecated and tentative addresses are excluded because they rotate
+  or are not valid for new connections, and link-local addresses are excluded
+  because they need a scope identifier a DNS-SD record cannot carry.
+
+* `--no-ipv6`:
+  Publish only the IPv4 address, for networks where IPv6 exists but is not
+  routable.
+
 * `--archive` *DIR*:
   Diagnostic only. Keep a copy of every job exactly as it arrived, before
   conversion, together with a short text file recording the queue, job name,
@@ -102,6 +119,14 @@ halftoning, and inflate a small job into tens of megabytes.
 
 * `--key` *FILE*:
   TLS private key. Default `/etc/ippfix/ippfix.key`.
+
+* `--list` [*URL*]:
+  Print the queues a running instance serves and exit. Intended for configuring
+  clients by address rather than by discovery: mDNS is not available everywhere,
+  and some sites prefer printers pinned by address so that discovery cannot
+  silently point users somewhere else. Defaults to the instance on this host.
+  The same listing is served as JSON at `/queues.json` and as a table at the
+  daemon's HTTP root.
 
 * `--no-advertise`:
   Do not publish the queues over DNS-SD. Useful when discovery is handled

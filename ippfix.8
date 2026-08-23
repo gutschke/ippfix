@@ -5,6 +5,10 @@ cache.
 .SH SYNOPSIS
 .B ippfix
 [\fB\-a\fR|\fB\-\-advertise\fR \fIADDRESS\fR]
+[\fB\-\-also\-advertise\fR \fIADDRESS\fR]
+[\fB\-\-archive\fR \fIDIR\fR]
+[\fB\-\-list\fR [\fIURL\fR]]
+[\fB\-\-no\-ipv6\fR]
 [\fB\-\-cert\fR \fIFILE\fR]
 [\fB\-\-converter\fR \fIPATH\fR]
 [\fB\-\-key\fR \fIFILE\fR]
@@ -86,6 +90,24 @@ May be repeated to serve several printers from one daemon.
 Address that clients should use to reach this server. Autodetected by default,
 which is wrong on hosts with several addresses.
 .TP
+.B \-\-also\-advertise " \fIADDRESS\fR"
+Additional address to publish in the DNS\-SD records; may be repeated. By
+default the stable, globally scoped IPv6 addresses of the same interface as
+.B \-\-advertise
+are published alongside it, so dual\-stack clients are offered IPv6 without
+extra configuration.
+.IP
+Only that interface's addresses are used. On a multi\-homed host, publishing
+every address the machine happens to have invites clients to try one they
+cannot route to, which appears as a long stall rather than a clear failure.
+Privacy, deprecated and tentative addresses are excluded because they rotate or
+are not valid for new connections, and link\-local addresses are excluded
+because they need a scope identifier a DNS\-SD record cannot carry.
+.TP
+.B \-\-no\-ipv6
+Publish only the IPv4 address, for networks where IPv6 exists but is not
+routable.
+.TP
 .B \-\-archive " \fIDIR\fR"
 Diagnostic only. Keep a copy of every job exactly as it arrived, before
 conversion, together with a short text file recording the queue, job name,
@@ -117,6 +139,15 @@ standard output. Default
 .B \-\-key " \fIFILE\fR"
 TLS private key. Default
 .IR /etc/ippfix/ippfix.key .
+.TP
+.B \-\-list " [\fIURL\fR]"
+Print the queues a running instance serves and exit, then stop. Intended for
+configuring clients by address rather than by discovery: mDNS is not available
+everywhere, and some sites prefer printers pinned by address so that discovery
+cannot silently point users somewhere else. Defaults to the instance on this
+host. The same listing is served as JSON at
+.I /queues.json
+and as a table at the daemon's HTTP root.
 .TP
 .B \-\-no\-advertise
 Do not publish the queues over DNS\-SD. Useful when discovery is handled

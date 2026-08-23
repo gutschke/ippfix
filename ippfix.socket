@@ -1,0 +1,13 @@
+[Unit]
+Description=IPP font-repair print proxy socket
+Documentation=man:ippfix(8)
+
+[Socket]
+# systemd opens the privileged port and hands the descriptor to the service,
+# so ippfix.service itself needs no capabilities at all.
+ListenStream=631
+BindIPv6Only=both
+Backlog=64
+
+[Install]
+WantedBy=sockets.target

@@ -55,17 +55,20 @@ there is nothing to maintain by hand as firmware changes.
 import argparse
 import hashlib
 import http.client
+import json
 import logging
 import os
 import re
 import socket
 import socketserver
 import ssl
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 
 import ippcodec as ipp
@@ -98,6 +101,7 @@ class Queue:
         self.host = parts.hostname
         self.port = parts.port or 631
         self.path = parts.path or '/ipp/print'
+        self.preferred = None        # address that last connected
         if not self.host:
             raise ValueError(f'{name}: no host in {uri!r}')
 
@@ -118,19 +122,50 @@ class Config:
         self.port = args.port
         self.queues = {q.local_path: q for q in queues}
         self.advertise = args.advertise or local_ip()
+        if args.also_advertise:
+            self.extra_addresses = args.also_advertise
+        elif args.no_ipv6:
+            self.extra_addresses = []
+        else:
+            # Only this interface's addresses: see interface_of().
+            self.extra_addresses = global_ipv6(interface_of(self.advertise))
         self.cert = args.cert
         self.key = args.key
         self.convert = not args.no_convert
         self.converter = args.converter
+        # unix:/path means the separately confined conversion service.
+        self.converter_socket = (args.converter[len('unix:'):]
+                                 if args.converter.startswith('unix:') else None)
         self.timeout = args.timeout
         self.archive = args.archive
         self.archive_max = args.archive_max
 
     def base_http(self):
-        return f'http://{self.advertise}:{self.port}'
+        host = (f'[{self.advertise}]' if ':' in self.advertise
+                else self.advertise)
+        return f'http://{host}:{self.port}'
+
+    def published_addresses(self):
+        """Addresses to put in the DNS-SD records.
+
+        The URIs name a single host, but the records can carry several, so
+        dual-stack clients are offered IPv6 as well without extra
+        configuration.
+        """
+        addrs = [self.advertise]
+        if not self.extra_addresses:
+            return addrs
+        return addrs + [a for a in self.extra_addresses if a not in addrs]
 
     def our_uri(self, queue, scheme='ipp'):
-        return f'{scheme}://{self.advertise}:{self.port}{queue.local_path}'
+        """The address a user types. Kept as short as correctness allows.
+
+        631 is the default for both ipp and ipps, so naming it adds nothing but
+        four characters to read out loud.
+        """
+        host = f'[{self.advertise}]' if ':' in self.advertise else self.advertise
+        port = '' if self.port == 631 else f':{self.port}'
+        return f'{scheme}://{host}{port}{queue.local_path}'
 
     def our_uuid(self, queue):
         """Stable, and deliberately different from the printer's own: a client
@@ -149,6 +184,71 @@ def local_ip():
         return '127.0.0.1'
     finally:
         s.close()
+
+
+# /proc/net/if_inet6 flag bits we must not publish.
+IFA_F_SECONDARY = 0x01      # also IFA_F_TEMPORARY: privacy address, rotates
+IFA_F_DEPRECATED = 0x20     # still valid for existing flows, not for new ones
+IFA_F_TENTATIVE = 0x40      # duplicate address detection has not finished
+
+
+def interface_of(address):
+    """Name of the interface holding an IPv4 address, or None.
+
+    Used to keep the published address set to a single interface. On a
+    multi-homed host, publishing every address the machine happens to have
+    invites clients to try one they cannot route to, which shows up as a long
+    stall rather than a clear failure.
+    """
+    import fcntl
+    try:
+        for _idx, name in socket.if_nameindex():
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                packed = fcntl.ioctl(s.fileno(), 0x8915,   # SIOCGIFADDR
+                                     struct.pack('256s', name[:15].encode()))
+                if socket.inet_ntoa(packed[20:24]) == address:
+                    return name
+            except OSError:
+                continue
+            finally:
+                s.close()
+    except (OSError, ImportError):
+        pass
+    return None
+
+
+def global_ipv6(device=None):
+    """Stable, globally scoped IPv6 addresses, optionally on one interface.
+
+    Published alongside the IPv4 address so dual-stack clients can reach the
+    queues over either family. Deliberately excluded:
+
+      * link-local, which needs a scope id that a DNS-SD record cannot carry;
+      * tentative and deprecated addresses, which are not usable for new
+        connections;
+      * privacy/temporary addresses, which rotate, so a client that caches one
+        finds the queue unreachable days later.
+    """
+    out = []
+    try:
+        with open('/proc/net/if_inet6', encoding='ascii') as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                raw, _idx, _plen, scope, flags, dev = parts[:6]
+                if scope != '00' or dev == 'lo':          # 00 == global
+                    continue
+                if device is not None and dev != device:
+                    continue
+                bits = int(flags, 16)
+                if bits & (IFA_F_SECONDARY | IFA_F_DEPRECATED | IFA_F_TENTATIVE):
+                    continue
+                out.append(socket.inet_ntop(socket.AF_INET6, bytes.fromhex(raw)))
+    except OSError:
+        return []
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +312,31 @@ def prune_archive(cfg):
         pass
 
 
+def convert_over_socket(path, data, timeout):
+    """Hand the document to the conversion service and read the result back.
+
+    The converter runs as a separate, unprivileged service with no network
+    access at all, so a flaw in the document parser cannot reach the network,
+    the certificates, or the archive. Each connection is its own short-lived
+    instance, so one hostile document cannot affect the next job.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+        sock.sendall(data)
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b''.join(chunks)
+    finally:
+        sock.close()
+
+
 def convert(cfg, data, fmt):
     """Outline the text of a PDF. Anything else is relayed untouched.
 
@@ -225,16 +350,22 @@ def convert(cfg, data, fmt):
 
     started = time.time()
     try:
-        proc = subprocess.run([cfg.converter], input=data,
-                              capture_output=True, timeout=cfg.timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        if cfg.converter_socket:
+            out = convert_over_socket(cfg.converter_socket, data, cfg.timeout)
+        else:
+            proc = subprocess.run([cfg.converter], input=data,
+                                  capture_output=True, timeout=cfg.timeout)
+            out = proc.stdout
+            if proc.returncode != 0:
+                log.error('converter exited %s: %s', proc.returncode,
+                          proc.stderr[:300].decode('utf-8', 'replace').strip())
+                return data, 'relayed (converter error)'
+    except (OSError, socket.timeout, subprocess.TimeoutExpired) as exc:
         log.error('converter failed (%s); relaying original', exc)
         return data, 'relayed (converter failed)'
 
-    out = proc.stdout
-    if proc.returncode != 0 or not out:
-        log.error('converter exited %s: %s', proc.returncode,
-                  proc.stderr[:300].decode('utf-8', 'replace').strip())
+    if not out:
+        log.error('converter produced nothing; relaying original')
         return data, 'relayed (converter error)'
     if b'/FontFile' in out:
         log.warning('font programs survived conversion; relaying original')
@@ -246,21 +377,57 @@ def convert(cfg, data, fmt):
 # ---------------------------------------------------------------------------
 # upstream
 # ---------------------------------------------------------------------------
+def connect_upstream(queue, port, tls, timeout):
+    """Open a connection to the printer, trying every address it resolves to.
+
+    Python's HTTP client uses only the first address a name resolves to. If a
+    printer's name has both A and AAAA records but its network carries only one
+    family -- an IPv4-only isolated segment behind a dual-stack LAN being the
+    common case -- that first address may be the unusable one, and every job
+    stalls until it times out. Trying each in turn removes the failure, and the
+    address that worked is remembered so the cost is paid at most once.
+    """
+    try:
+        targets = socket.getaddrinfo(queue.host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise OSError(f'cannot resolve {queue.host}: {exc}') from exc
+
+    if queue.preferred:                      # retry what worked last time first
+        targets.sort(key=lambda t: t[4][0] != queue.preferred)
+
+    last = None
+    for family, _stype, _proto, _canon, sockaddr in targets:
+        literal = sockaddr[0]
+        header = f'[{literal}]:{port}' if family == socket.AF_INET6 \
+            else f'{literal}:{port}'
+        try:
+            if tls:
+                ctx = ssl._create_unverified_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                conn = http.client.HTTPSConnection(literal, port,
+                                                   timeout=timeout, context=ctx)
+            else:
+                conn = http.client.HTTPConnection(literal, port, timeout=timeout)
+            conn.connect()
+        except OSError as exc:
+            last = exc
+            log.debug('%s: %s unreachable (%s)', queue.name, literal, exc)
+            continue
+        if queue.preferred != literal:
+            queue.preferred = literal
+            log.debug('%s: using %s', queue.name, literal)
+        return conn, header
+    raise OSError(f'no reachable address for {queue.host}: {last}')
+
+
 def upstream_ipp(queue, payload, timeout):
-    if queue.tls:
-        ctx = ssl._create_unverified_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        conn = http.client.HTTPSConnection(queue.host, queue.port,
-                                           timeout=timeout, context=ctx)
-    else:
-        conn = http.client.HTTPConnection(queue.host, queue.port,
-                                          timeout=timeout)
+    conn, header = connect_upstream(queue, queue.port, queue.tls, timeout)
     try:
         conn.request('POST', queue.path, body=payload,
                      headers={'Content-Type': 'application/ipp',
                               'Content-Length': str(len(payload)),
-                              'Host': f'{queue.host}:{queue.port}'})
+                              'Host': header})
         resp = conn.getresponse()
         return resp.status, resp.read()
     finally:
@@ -268,9 +435,9 @@ def upstream_ipp(queue, payload, timeout):
 
 
 def upstream_http(queue, path, timeout=30):
-    conn = http.client.HTTPConnection(queue.host, 80, timeout=timeout)
+    conn, header = connect_upstream(queue, 80, False, timeout)
     try:
-        conn.request('GET', path, headers={'Host': queue.host})
+        conn.request('GET', path, headers={'Host': header})
         resp = conn.getresponse()
         ctype = resp.getheader('Content-Type', 'application/octet-stream')
         return resp.status, ctype, resp.read()
@@ -402,7 +569,12 @@ STATUS_PAGE = """<!doctype html>
 <p>IPP proxy. Print jobs have their text converted to vector outlines before
 being forwarded, so that no embedded font program reaches the printer.</p>
 <h2>Queues</h2>
-<ul>{queues}</ul>
+<p>Add any of these by address if you would rather not rely on discovery.
+The same list is available as <a href="/queues.json">/queues.json</a>.</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Name</th><th>IPP</th><th>IPPS</th><th>Printer</th></tr>
+{queues}
+</table>
 </body></html>
 """
 
@@ -468,18 +640,47 @@ class Handler(socketserver.BaseRequestHandler):
         return True
 
     def resolve(self, cfg, path):
-        """Map a request path to a queue, tolerating trailing job ids."""
-        base = '/' + path.lstrip('/').split('?')[0]
-        if base in cfg.queues:
-            return cfg.queues[base]
+        """Map a request path to a queue.
+
+        Deliberately forgiving: /ipp/name and /name both work, case is ignored,
+        and a trailing job id is tolerated. These are addresses people type
+        from memory or read off a sticker, so the cost of being strict is a
+        support call and the cost of being lax is nothing.
+        """
+        base = '/' + path.lstrip('/').split('?')[0].rstrip('/')
+        folded = base.lower()
         for local_path, queue in cfg.queues.items():
-            if base.startswith(local_path + '/'):
+            lowered = local_path.lower()
+            if folded in (lowered, lowered.replace('/ipp/', '/', 1)):
+                return queue
+        for local_path, queue in cfg.queues.items():
+            lowered = local_path.lower()
+            if folded.startswith(lowered + '/') or \
+               folded.startswith(lowered.replace('/ipp/', '/', 1) + '/'):
                 return queue
         if len(cfg.queues) == 1:
             return next(iter(cfg.queues.values()))
         return None
 
     def handle_get(self, cfg, wfile, path):
+        # Machine-readable queue listing, so a site that prefers to hard-code
+        # printers rather than rely on mDNS has somewhere authoritative to look.
+        if path.split('?')[0] in ('/queues.json', '/queues'):
+            body = json.dumps(
+                {'queues': [
+                    {'name': q.name,
+                     'ipp': cfg.our_uri(q, 'ipp'),
+                     'ipps': cfg.our_uri(q, 'ipps'),
+                     'resource': q.local_path,
+                     'printer': f'{q.host}:{q.port}{q.path}',
+                     'uuid': cfg.our_uuid(q)}
+                    for q in cfg.queues.values()],
+                 'port': cfg.port,
+                 'addresses': cfg.published_addresses()},
+                indent=2).encode()
+            respond(wfile, '200 OK', 'application/json; charset=utf-8', body)
+            return
+
         match = re.match(r'^(/ipp/[^/]+)/(icon-small\.png|icon-large\.png|strings)$',
                          path)
         if match:
@@ -500,7 +701,10 @@ class Handler(socketserver.BaseRequestHandler):
             return
 
         items = ''.join(
-            f'<li><code>{cfg.our_uri(q)}</code> &rarr; {q.host}</li>'
+            f'<tr><td>{q.name}</td>'
+            f'<td><code>{cfg.our_uri(q, "ipp")}</code></td>'
+            f'<td><code>{cfg.our_uri(q, "ipps")}</code></td>'
+            f'<td>{q.host}:{q.port}{q.path}</td></tr>'
             for q in cfg.queues.values())
         respond(wfile, '200 OK', 'text/html; charset=utf-8',
                 STATUS_PAGE.format(queues=items).encode('utf-8'))
@@ -554,19 +758,53 @@ class Handler(socketserver.BaseRequestHandler):
                 'application/ipp', out)
 
 
+SD_LISTEN_FDS_START = 3
+
+
+def inherited_socket():
+    """The listening socket systemd passed us, if it did.
+
+    With socket activation systemd opens the port itself and hands over the
+    descriptor, so the service never needs the privilege to bind a port below
+    1024 -- it can run with no capabilities at all. Falls back to binding
+    directly when started by hand.
+    """
+    if os.environ.get('LISTEN_PID') != str(os.getpid()):
+        return None
+    try:
+        count = int(os.environ.get('LISTEN_FDS', '0'))
+    except ValueError:
+        return None
+    if count < 1:
+        return None
+    if count > 1:
+        log.warning('systemd passed %d sockets; using the first', count)
+    sock = socket.socket(fileno=SD_LISTEN_FDS_START)
+    sock.setblocking(True)
+    return sock
+
+
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
     request_queue_size = 32
     address_family = socket.AF_INET6
 
-    def __init__(self, addr, handler, cfg):
+    def __init__(self, addr, handler, cfg, listen_fd=None):
         self.cfg = cfg
         self.job_lock = threading.Lock()
-        super().__init__(addr, handler)
+        self._inherited = listen_fd
+        if listen_fd is not None:
+            self.address_family = listen_fd.family
+        super().__init__(addr, handler, bind_and_activate=listen_fd is None)
+        if listen_fd is not None:
+            self.socket.close()
+            self.socket = listen_fd
+            self.server_address = listen_fd.getsockname()
 
     def server_bind(self):
-        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
         super().server_bind()
 
 
@@ -611,7 +849,7 @@ def advertise(cfg):
                 port=cfg.port,
                 properties=props,
                 server=f'{socket.gethostname()}.local.',
-                parsed_addresses=[cfg.advertise],
+                parsed_addresses=cfg.published_addresses(),
             )
             zc.register_service(info)
             registered.append(info)
@@ -641,24 +879,69 @@ def parse_queue(spec):
     return Queue(name, uri.strip())
 
 
+def list_queues(url):
+    """Print the queues a running instance serves.
+
+    Discovery over mDNS is not always available or trusted, so the daemon also
+    answers a plain HTTP request that says exactly what to configure by hand.
+    """
+    if '://' not in url:
+        url = 'http://' + url
+    if urllib.parse.urlsplit(url).path in ('', '/'):
+        url = url.rstrip('/') + '/queues.json'
+    try:
+        with urllib.request.urlopen(url, timeout=15) as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        print(f'could not read {url}: {exc}', file=sys.stderr)
+        return 1
+
+    queues = data.get('queues', [])
+    if not queues:
+        print('no queues configured')
+        return 0
+    print(f"listening on port {data.get('port')}, "
+          f"published addresses: {', '.join(data.get('addresses', []))}\n")
+    width = max(len(q['name']) for q in queues)
+    for q in queues:
+        print(f"{q['name']:<{width}}  {q['ipp']}")
+        print(f"{'':<{width}}  {q['ipps']}")
+        print(f"{'':<{width}}  -> {q['printer']}")
+        print(f"{'':<{width}}  uuid {q['uuid']}")
+        print()
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='ippfix',
         description='IPP proxy that outlines text so no font program reaches '
                     'the printer')
-    parser.add_argument('printers', nargs='+', metavar='[NAME=]URI',
+    parser.add_argument('printers', nargs='*', metavar='[NAME=]URI',
                         help='printer to proxy, e.g. '
                              'upstairs=ipp://printer.example/ipp/print')
     parser.add_argument('-p', '--port', type=int, default=631,
                         help='port to listen on (default: 631)')
     parser.add_argument('-a', '--advertise', default=None,
-                        help='address clients should use (default: autodetect)')
+                        help='address clients should use in URIs '
+                             '(default: autodetect)')
+    parser.add_argument('--also-advertise', action='append', metavar='ADDRESS',
+                        help='additional address to publish in the DNS-SD '
+                             'records, repeatable. Defaults to the stable '
+                             'global IPv6 addresses of the same interface, so '
+                             'dual-stack clients are offered IPv6 without '
+                             'extra configuration')
+    parser.add_argument('--no-ipv6', action='store_true',
+                        help='publish only the IPv4 address, for networks '
+                             'where IPv6 is present but not routable')
     parser.add_argument('--cert', default='/etc/ippfix/ippfix.crt',
                         help='TLS certificate')
     parser.add_argument('--key', default='/etc/ippfix/ippfix.key',
                         help='TLS private key')
     parser.add_argument('--converter', default='/usr/local/lib/ippfix/defont',
-                        help='PDF conversion helper')
+                        help='PDF conversion helper: either an executable that '
+                             'filters stdin to stdout, or unix:PATH to reach '
+                             'the separately sandboxed conversion service')
     parser.add_argument('--timeout', type=int, default=300,
                         help='seconds allowed per conversion and per upstream '
                              'request (default: 300)')
@@ -673,8 +956,18 @@ def main(argv=None):
                         help='keep at most N archived jobs (default: 50)')
     parser.add_argument('--no-advertise', action='store_true',
                         help='do not publish over DNS-SD')
+    parser.add_argument('--list', nargs='?', const='http://localhost:631/',
+                        metavar='URL',
+                        help='print the queues a running instance serves, for '
+                             'configuring clients by address instead of by '
+                             'discovery. Defaults to the local instance')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args(argv)
+
+    if args.list:
+        return list_queues(args.list)
+    if not args.printers:
+        parser.error('at least one printer is required')
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -690,22 +983,31 @@ def main(argv=None):
         parser.error('duplicate queue names')
 
     cfg = Config(args, queues)
-    if cfg.convert and not os.access(cfg.converter, os.X_OK):
+    if cfg.convert and not cfg.converter_socket \
+            and not os.access(cfg.converter, os.X_OK):
         parser.error(f'converter not executable: {cfg.converter}')
 
     log.info('listening on [::]:%d (IPv4 and IPv6)', cfg.port)
+    log.info('  published addresses: %s', ', '.join(cfg.published_addresses()))
     for queue in queues:
         log.info('  %s', queue)
         log.info('    published as %s', cfg.our_uri(queue))
     log.info('  conversion: %s',
-             f'outline text via {cfg.converter}' if cfg.convert else 'DISABLED')
+             ('outline text via sandboxed service at '
+              f'{cfg.converter_socket}' if cfg.converter_socket
+              else f'outline text via {cfg.converter}') if cfg.convert
+             else 'DISABLED')
     if cfg.archive:
         log.warning('  ARCHIVING every job to %s (keeping %d) -- this stores '
                     'users\' documents; disable when done diagnosing',
                     cfg.archive, cfg.archive_max)
 
     withdraw = None if args.no_advertise else advertise(cfg)
-    server = Server(('::', cfg.port), Handler, cfg)
+    listen_fd = inherited_socket()
+    if listen_fd is not None:
+        log.info('  socket activated: using the descriptor systemd passed, '
+                 'so no capabilities are required')
+    server = Server(('::', cfg.port), Handler, cfg, listen_fd)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

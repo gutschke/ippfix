@@ -83,6 +83,38 @@ because a subsetted font program is bulkier than the outlines actually used.
 - **Leaves scanning alone.** Only `_ipp` and `_ipps` are published; eSCL
   scanning is a separate service on the printer and is untouched.
 
+## Security
+
+The proxy accepts print jobs from anyone who can reach the port — IPP has no
+authentication here, exactly as a printer would not — and then runs a document
+parser over whatever they send. Both halves of that are treated as hostile.
+
+**The two halves are separate services.** The network daemon never executes
+Ghostscript. Documents are handed over a private socket to
+`ippfix-convert@.service`, a short-lived instance started per connection under
+its own account, with `PrivateNetwork=true` and `IPAddressDeny=any`, no
+capabilities, nothing writable but a private `/tmp`, and hard limits on memory,
+tasks and run time. A flaw in document parsing therefore reaches no network, no
+TLS key, no archive, and nothing belonging to the next job.
+
+**Neither half holds any privilege.** `systemd` binds port 631 through
+`ippfix.socket` and passes the descriptor, so the daemon needs no capability to
+use a privileged port — its bounding set is empty. Both units run with
+`PrivateUsers`, `ProtectSystem=strict`, `MemoryDenyWriteExecute`, a restrictive
+`SystemCallFilter`, and only the address families they actually use.
+
+`systemd-analyze security` rates the daemon **1.1** and the converter — the
+half that touches hostile documents — **0.4**.
+
+To confine egress further, uncomment `IPAddressDeny`/`IPAddressAllow` in
+`ippfix.service` and set them to your printers and local network. It ships
+disabled because the right values are site specific.
+
+Archived jobs are pruned two ways: `--archive-max` bounds how many are kept,
+and a `tmpfiles.d` rule ages them out after seven days, so a forgotten flag
+cannot leave documents on disk indefinitely. The converter's scratch files live
+in a private `/tmp` that is destroyed with each instance.
+
 ## System Requirements
 
 - Python 3.9 or later, with the `venv` module

@@ -1,0 +1,72 @@
+[Unit]
+Description=ippfix document conversion (connection %i)
+Documentation=man:ippfix(8)
+
+[Service]
+# This is where a hostile document meets Ghostscript, so it is confined far
+# more tightly than the proxy: a separate unprivileged account, no network of
+# any kind, no capabilities, no writable filesystem beyond a private /tmp, and
+# a hard ceiling on memory and time. A flaw in the document parser therefore
+# reaches neither the network, the TLS keys, nor the job archive.
+Type=exec
+ExecStart=/usr/local/lib/ippfix/defont
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+
+User=ippfix-convert
+Group=ippfix-convert
+DynamicUser=no
+
+# No privileges whatsoever.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+PrivateUsers=true
+
+# It converts a document handed to it on a descriptor. It never needs a socket
+# of its own, and with its own empty network namespace it could not use one.
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# Filesystem: nothing writable except a private, per-instance /tmp.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateIPC=true
+UMask=0077
+
+# Host and kernel state.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+DevicePolicy=closed
+KeyringMode=private
+NoExecPaths=/
+ExecPaths=/usr/bin /usr/lib /usr/local/lib/ippfix /bin /lib /lib64
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @resources @mount @debug @cpu-emulation @swap @reboot @module
+SystemCallErrorNumber=EPERM
+
+# A hostile document can otherwise allocate without bound or spin forever.
+MemoryMax=512M
+MemoryHigh=384M
+TasksMax=16
+LimitNOFILE=64
+LimitCORE=0
+RuntimeMaxSec=300

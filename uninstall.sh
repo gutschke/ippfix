@@ -33,9 +33,12 @@ if systemctl cat 'ippfix' >&/dev/null; then
   fi
 fi
 
-systemctl stop 'ippfix' >&/dev/null || :
-systemctl disable 'ippfix' >&/dev/null || :
-rm -f '/etc/systemd/system/ippfix.service'
+for unit in ippfix.service ippfix.socket ippfix-convert.socket 'ippfix-convert@.service'; do
+  systemctl stop "${unit}" >&/dev/null || :
+  systemctl disable "${unit}" >&/dev/null || :
+  rm -f "/etc/systemd/system/${unit}"
+done
+rm -f '/usr/lib/tmpfiles.d/ippfix.conf'
 systemctl daemon-reload
 echo ' done.'
 
@@ -94,13 +97,13 @@ if [ -d '/etc/ippfix' ]; then
 fi
 
 # Delete user
-echo -n 'Removing "ippfix" user...'
-if id 'ippfix' >&/dev/null; then
-  userdel -r ippfix >&/dev/null || :
-  echo ' done.'
-else
-  echo ' not found.'
-fi
+echo -n 'Removing service users...'
+for account in ippfix ippfix-convert; do
+  if id "${account}" >&/dev/null; then
+    userdel -r "${account}" >&/dev/null || :
+  fi
+done
+echo ' done.'
 
 echo -n 'Updating man database...'
 mandb -q >&/dev/null || :
