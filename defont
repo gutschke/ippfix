@@ -15,9 +15,20 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 
 GS="${GS:-gs}"
 
+# Outlining a page inlines a full outline at every glyph occurrence, so a long
+# document can grow past what the printer will accept as a PDF at all -- HP
+# LaserJet Pro devices advertise pdf-k-octets-supported of 0-75000. Past this
+# size the page is rasterised instead: lower fidelity, but it prints, and a
+# job that prints imperfectly beats one the printer rejects outright.
+MAX_PDF_BYTES="${MAX_PDF_BYTES:-60000000}"
+RASTER_DPI="${RASTER_DPI:-600}"
+# 19 = SRGB24, the colour space these printers advertise first. 18 is W8 grey,
+# which halves the size and avoids composite-black fringing on text.
+RASTER_COLORSPACE="${RASTER_COLORSPACE:-19}"
+
 infile="$(mktemp -t defont-in-XXXXXX)"
 outfile="$(mktemp -t defont-out-XXXXXX)"
-trap 'rm -f "$infile" "$outfile"' EXIT INT TERM QUIT HUP
+trap 'rm -f "$infile" "$outfile" "${rasterfile:-}"' EXIT INT TERM QUIT HUP
 
 if [ $# -ge 1 ] && [ "$1" != "-" ]; then
   cp -- "$1" "$infile"
@@ -74,6 +85,26 @@ if grep -qa '/FontFile' "$outfile"; then
   echo "defont: font programs survived, passing input through" >&2
   emit "$infile" "${2:--}"
   exit 0
+fi
+
+# Fall back to raster only when the outlined PDF is too large to be accepted.
+outsize="$(stat -c%s "$outfile")"
+if [ "$outsize" -gt "$MAX_PDF_BYTES" ]; then
+  echo "defont: outlined output ${outsize} bytes exceeds ${MAX_PDF_BYTES};" \
+       "rasterising instead" >&2
+  rasterfile="$(mktemp -t defont-raster-XXXXXX)"
+  # Rasterise from the ORIGINAL, not the outlined copy: the outlines are a
+  # detour, and going straight from the source keeps one interpretation step.
+  if "$GS" -q -dNOPAUSE -dBATCH -dSAFER -K400000 \
+        -sDEVICE=appleraster -r"$RASTER_DPI" \
+        -dcupsColorSpace="$RASTER_COLORSPACE" -dcupsBitsPerColor=8 \
+        -sOutputFile="$rasterfile" "$infile" >&2 && [ -s "$rasterfile" ]; then
+    emit "$rasterfile" "${2:--}"
+    rm -f "$rasterfile"
+    exit 0
+  fi
+  echo "defont: rasterising failed; sending the outlined PDF anyway" >&2
+  rm -f "$rasterfile"
 fi
 
 emit "$outfile" "${2:--}"

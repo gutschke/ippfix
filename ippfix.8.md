@@ -265,9 +265,11 @@ upstairs   Print-Job   HTTP 200  [outlined 393836 -> 76789 bytes in 0.2s]
 
 Because an affected printer reports success whether or not it printed, the
 reliable check is the device's own total impression count, which does not
-advance for a job that died. On HP devices both that counter and the assertion
-log are readable over HTTP from `/DevMgmt/ProductUsageDyn.xml` and
-`/DevMgmt/ProductLogsDyn.xml`.
+advance for a job that died. The Printer MIB (RFC 3805) exposes that counter on
+essentially any network printer, as `1.3.6.1.2.1.43.10.2.1.4.1.1`. Vendors
+usually expose more besides — on the printer this was developed against, an
+assertion log naming `fontcache.c` is what identified the defect — but those
+paths are vendor specific and this program neither uses nor depends on them.
 
 <a name="notes"></a>
 

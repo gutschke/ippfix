@@ -375,6 +375,25 @@ def estimate_font_cost(data):
         return None
 
 
+def sniff_format(data):
+    """Identify what the converter handed back.
+
+    Conversion normally returns a PDF, but a document whose outlined form would
+    be too large for the printer to accept comes back as raster instead. The
+    job's document-format has to follow, or the printer is told to read a
+    bitmap as a PDF.
+    """
+    if data[:5] == b'%PDF-':
+        return 'application/pdf'
+    if data[:7] == b'UNIRAST':
+        return 'image/urf'
+    if data[:4] == b'RaS2' or data[:4] == b'RaS3':
+        return 'image/pwg-raster'
+    if data[:4] == b'PCLm':
+        return 'application/PCLm'
+    return None
+
+
 def normalise_pdf(data):
     """Return the document positioned so Ghostscript must read it as PDF.
 
@@ -1027,6 +1046,16 @@ class Handler(socketserver.BaseRequestHandler):
             original = msg.data
             try:
                 msg.data, note = convert(cfg, msg.data, fmt)
+                # Conversion may legitimately change the format: an outlined
+                # document too large for the printer to accept as a PDF comes
+                # back as raster. Say so, rather than mislabelling it.
+                if msg.data is not original:
+                    produced = sniff_format(msg.data)
+                    if produced and produced != fmt and group is not None:
+                        group.replace('document-format', ipp.TAG_MIMETYPE,
+                                      [produced])
+                        note += f'; sent as {produced}'
+
             except ConversionFailed as exc:
                 log.warning('%s: refusing job (%s)', queue.name, exc)
                 respond(wfile, '400 Bad Request', 'text/plain',

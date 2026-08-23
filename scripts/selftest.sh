@@ -209,6 +209,11 @@ PS
   printf '%%!PS-Adobe-3.0\n%%PDF-1.4\n(RAN) print\n' > "$work/confuse.ps"
   ./defont < "$work/confuse.ps" > "$work/confuse.out" 2>/dev/null
   check 'refuses PostScript disguised as PDF' "cmp -s '$work/confuse.ps' '$work/confuse.out'"
+  # A document whose outlined form exceeds what the printer accepts as a PDF
+  # must come back as raster rather than as something that will be rejected.
+  MAX_PDF_BYTES=1000 ./defont < "$work/in.pdf" > "$work/big.out" 2>/dev/null
+  check 'falls back to raster when the PDF would be too large' "head -c 7 '$work/big.out' | grep -qa UNIRAST"
+
   printf '%%PDF-1.4 truncated and broken' > "$work/broken.pdf"
   ./defont < "$work/broken.pdf" > "$work/broken.out" 2>/dev/null || true
   check 'falls back to the original on failure' "[ -s '$work/broken.out' ]"
@@ -313,6 +318,17 @@ assert high > low * 10
 # An unreadable file must NOT be reported as cheap: the caller treats None as
 # "convert", and a wrong low number would silently skip conversion.
 assert estimate_font_cost(b'%PDF-1.4\n/FontFile2 7 0 R\n') is None
+PY2
+
+python3 - <<'PY2' && ok 'recognises what conversion handed back' || bad 'format sniffing'
+import sys
+sys.path.insert(0, '.')
+from ippfix import sniff_format
+assert sniff_format(b'%PDF-1.4\\n') == 'application/pdf'
+assert sniff_format(b'UNIRAST\\x00\\x00') == 'image/urf'
+assert sniff_format(b'RaS2rest') == 'image/pwg-raster'
+assert sniff_format(b'PCLmrest') == 'application/PCLm'
+assert sniff_format(b'nonsense') is None
 PY2
 
 echo 'systemd units'

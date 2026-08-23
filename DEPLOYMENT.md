@@ -286,6 +286,143 @@ IPv6 exists but is not actually routable, `--no-ipv6` publishes IPv4 only.
 Link-local addresses are never published: they require a scope identifier that
 a DNS-SD record cannot usefully carry.
 
+## Calibrating for your printer
+
+The defaults are calibrated against **one** printer — a Color LaserJet Pro MFP
+M283fdw, which is neither new nor necessarily representative. They are honest
+measurements, not a specification, and another model will differ. This section
+exists so you can tell whether they fit yours, and change them if not.
+
+### What the numbers are, and where they came from
+
+`ippfix` estimates what a job will cost the printer's font cache from two
+things it can read without rendering: what each embedded font program declares,
+and how many distinct glyphs the page draws. On the reference printer, bisection
+found:
+
+| estimate | result |
+|---|---|
+| 3011 | printed |
+| 3558 | printed |
+| 3697 | **failed** |
+| 3844 | **failed** |
+
+So the boundary sits near 3600. The default `--convert-threshold` is **2500**,
+about thirty per cent below it. That margin is not arbitrary: the limit moves
+with the typeface. One face failed at 520 drawn glyphs where another survived
+527, so a threshold sitting just under a single measured boundary would be
+wrong for the next font.
+
+For contrast, ordinary browser jobs captured from a real Chromebook estimated
+1205, 1291 and 1820 — comfortably below the threshold, so they are relayed
+untouched and cost nothing.
+
+### Deciding whether it fits your printer
+
+Two symptoms, two directions:
+
+- **Jobs still vanish.** The threshold is too high for this device. Lower it, or
+  set `--convert-threshold 0` to convert everything. That is the correct setting
+  whenever the limit is unknown; it costs conversion work on every job but never
+  guesses.
+- **Jobs are being converted that print fine untouched.** The threshold is too
+  low. Raise it. The log says which happened:
+
+```
+Print-Job  [relayed (font cost 1205, under threshold)]
+Print-Job  [outlined 393836 -> 76789 bytes in 0.2s]
+```
+
+### Reading the printer's own diagnostics
+
+This deserves its own note, because it was the single most useful thing during
+development and it is not obvious.
+
+**Do not trust the print system.** An affected printer accepts the job, runs its
+warm-up, reports `job-state = completed`, and marks nothing. Every layer above
+it — IPP, CUPS, the client's print queue — faithfully reports success. The only
+honest signal is the device's own page counter.
+
+**The portable way: SNMP.** The Printer MIB (RFC 3805) is implemented by
+essentially every network printer, and the page counter is one OID:
+
+```sh
+snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.10.2.1.4.1.1   # pages printed
+snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.16.5.1.2.1.1   # panel text
+snmpwalk -v2c -c public PRINTER 1.3.6.1.2.1.43.18.1.1        # alert table
+```
+
+Read the page counter before and after a job. If it has not moved, nothing
+printed, whatever the print system claimed. On the printer used to develop this,
+that OID returned exactly the same number as the vendor's own counter, so the
+standard route loses nothing.
+
+SNMP is sometimes disabled by default on newer firmware; the embedded web
+server's networking page will have a switch.
+
+**The vendor-specific way, and why it is worth finding.** Manufacturers usually
+expose more than the standard MIB does — including, on the printer studied here,
+the interpreter's own assertion log, which is what identified the bug in the
+first place. On HP LaserJet devices this is LEDM, plain XML over HTTP with no
+authentication:
+
+```sh
+curl -s http://PRINTER/DevMgmt/DiscoveryTree.xml     # index of what exists
+curl -s http://PRINTER/DevMgmt/ProductUsageDyn.xml   # page counters
+curl -s http://PRINTER/DevMgmt/ProductLogsDyn.xml    # event and error log
+```
+
+**Those paths are HP's and nothing else's.** `ippfix` does not use them and does
+not depend on them; they are recorded here because they were decisive, and
+because the equivalent almost certainly exists under another name on your
+device. Look for an event log, a service or diagnostics page in the embedded web
+server, or a printable configuration or event-log report on the front panel.
+
+What made the difference was a log entry naming the failing component:
+
+```
+ASSERT FAILED
+Task: POSTSCRIPT
+File: fontcache.c  Line: 2494
+```
+
+Without that, the failure is indistinguishable from a network problem. With it,
+the cause is not in doubt. It is worth spending an hour finding the equivalent
+on your hardware before theorising.
+
+### Measuring your own limit
+
+The economics favour you: **a job that exceeds the budget marks no paper**, so
+only the passing probes cost a sheet.
+
+Do not trust `job-state` — an affected printer reports success whether or not it
+printed. Use the device's own page counter, as described above:
+
+```sh
+snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.10.2.1.4.1.1
+```
+
+Print documents of increasing font cost, bisect between the largest that printed
+and the smallest that did not, and set the threshold comfortably below the
+boundary. If your printer is a different make, the estimate may not model its
+limit at all — in that case use `--convert-threshold 0` and rely on conversion
+rather than prediction.
+
+### The size cap
+
+The third tier — rasterising — triggers when the outlined form would exceed what
+the printer accepts as a PDF. That ceiling comes from the printer's own
+`pdf-k-octets-supported` attribute, which this device reports as 75 MB; the
+converter uses 60 MB by default to stay clear of it. Check yours:
+
+```sh
+ipptool -tv ipp://PRINTER/ipp/print get-printer-attributes.test | grep pdf-k-octets
+```
+
+Adjust with `MAX_PDF_BYTES` in the converter's environment, alongside
+`RASTER_DPI` and `RASTER_COLORSPACE` (19 = sRGB, 18 = 8-bit grey, which halves
+the size and avoids composite-black fringing on text).
+
 ## Step 3: verify
 
 **1. The queue is visible and answers.**
