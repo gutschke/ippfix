@@ -12,6 +12,8 @@ cache.
 [\fB\-\-idle\-timeout\fR \fISECONDS\fR]
 [\fB\-\-require\-tls\fR]
 [\fB\-\-convert\-threshold\fR \fIN\fR]
+[\fB\-\-max\-pdf\-bytes\fR \fIMB\fR]
+[\fB\-\-all\-formats\fR]
 [\fB\-\-fail\-closed\fR]
 [\fB\-\-archive\-max\-bytes\fR \fIMB\fR]
 [\fB\-\-no\-ipv6\fR]
@@ -186,6 +188,24 @@ are relayed untouched, which is both free and perfectly faithful. Measured on a
 Color LaserJet Pro MFP M283fdw, ordinary browser jobs estimate between 1200 and
 1900 and print, while the lowest observed failure estimates about 4000. A file
 whose cost cannot be determined is always converted, never assumed cheap.
+.TP
+.B \-\-max\-pdf\-bytes " \fIMB\fR"
+Rasterise rather than send an outlined PDF larger than this. Default 60.
+Overridden by the printer's own
+.B pdf\-k\-octets\-supported
+where it reports one, so the shipped default only applies to a device that
+declares no limit.
+.TP
+.B \-\-all\-formats
+Offer clients every document format the printer supports, including
+PostScript.
+.IP
+PostScript is withheld by default. It is interpreted by exactly the task that
+fails on these devices, and it cannot be converted the way PDF is: handing
+PostScript to Ghostscript means running its PostScript interpreter, which this
+program is careful never to do. Offering it would advertise a repaired queue
+that silently is not one. PCL and PCL\-XL are offered either way \(em they are
+a separate interpreter on the device, and are relayed unchanged.
 .TP
 .B \-\-fail\-closed
 Reject a PDF that cannot be converted, instead of forwarding it unchanged.

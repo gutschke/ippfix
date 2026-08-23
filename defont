@@ -25,6 +25,9 @@ RASTER_DPI="${RASTER_DPI:-600}"
 # 19 = SRGB24, the colour space these printers advertise first. 18 is W8 grey,
 # which halves the size and avoids composite-black fringing on text.
 RASTER_COLORSPACE="${RASTER_COLORSPACE:-19}"
+# Which Ghostscript raster device to fall back to. Empty means this printer
+# accepts no raster format we can produce, so there is no fallback for it.
+RASTER_DEVICE="${RASTER_DEVICE:-appleraster}"
 
 infile="$(mktemp -t defont-in-XXXXXX)"
 outfile="$(mktemp -t defont-out-XXXXXX)"
@@ -34,6 +37,37 @@ if [ $# -ge 1 ] && [ "$1" != "-" ]; then
   cp -- "$1" "$infile"
 else
   cat > "$infile"
+fi
+
+# The caller may prefix the document with one line describing what this
+# particular printer accepts. It cannot be discovered here: this runs with no
+# network, deliberately. Without the line the defaults above apply.
+if [ "$(head -c 9 "$infile")" = '%%ippfix ' ]; then
+  header="$(head -n 1 "$infile")"
+  stripped="$(mktemp -t defont-hdr-XXXXXX)"
+  tail -n +2 "$infile" > "$stripped"
+  mv -f "$stripped" "$infile"
+  # Validate every field. The header is written by the proxy, but this script
+  # is also runnable by hand and a document could carry a line that looks like
+  # one, so nothing from it is trusted. The device name in particular reaches a
+  # Ghostscript command line, and Ghostscript has devices -- uniprint among
+  # them -- that have been used to defeat -dSAFER; only the three raster
+  # devices this tool actually emits are accepted.
+  for field in ${header#%%ippfix }; do
+    value="${field#*=}"
+    case "$field" in
+      device=appleraster|device=pclm|device=pclm8|device=pwgraster|device=urf)
+                    RASTER_DEVICE="$value" ;;
+      raster=none)  RASTER_DEVICE='' ;;
+      colorspace=*) [ "$value" -ge 0 ] 2>/dev/null && [ "$value" -le 63 ] \
+                      && RASTER_COLORSPACE="$value" ;;
+      dpi=*)        [ "$value" -ge 72 ] 2>/dev/null && [ "$value" -le 2400 ] \
+                      && RASTER_DPI="$value" ;;
+      maxpdf=*)     [ "$value" -ge 0 ] 2>/dev/null && MAX_PDF_BYTES="$value" ;;
+      device=*)     echo "defont: refusing unknown raster device ${value}" >&2 ;;
+      *)            echo "defont: ignoring unknown header field ${field}" >&2 ;;
+    esac
+  done
 fi
 
 emit() {
@@ -89,14 +123,14 @@ fi
 
 # Fall back to raster only when the outlined PDF is too large to be accepted.
 outsize="$(stat -c%s "$outfile")"
-if [ "$outsize" -gt "$MAX_PDF_BYTES" ]; then
+if [ "$outsize" -gt "$MAX_PDF_BYTES" ] && [ -n "$RASTER_DEVICE" ]; then
   echo "defont: outlined output ${outsize} bytes exceeds ${MAX_PDF_BYTES};" \
        "rasterising instead" >&2
   rasterfile="$(mktemp -t defont-raster-XXXXXX)"
   # Rasterise from the ORIGINAL, not the outlined copy: the outlines are a
   # detour, and going straight from the source keeps one interpretation step.
   if "$GS" -q -dNOPAUSE -dBATCH -dSAFER -K400000 \
-        -sDEVICE=appleraster -r"$RASTER_DPI" \
+        -sDEVICE="$RASTER_DEVICE" -r"$RASTER_DPI" \
         -dcupsColorSpace="$RASTER_COLORSPACE" -dcupsBitsPerColor=8 \
         -sOutputFile="$rasterfile" "$infile" >&2 && [ -s "$rasterfile" ]; then
     emit "$rasterfile" "${2:--}"
@@ -105,6 +139,9 @@ if [ "$outsize" -gt "$MAX_PDF_BYTES" ]; then
   fi
   echo "defont: rasterising failed; sending the outlined PDF anyway" >&2
   rm -f "$rasterfile"
+elif [ "$outsize" -gt "$MAX_PDF_BYTES" ]; then
+  echo "defont: outlined output ${outsize} bytes exceeds ${MAX_PDF_BYTES} but" \
+       "this printer accepts no raster format; sending it anyway" >&2
 fi
 
 emit "$outfile" "${2:--}"

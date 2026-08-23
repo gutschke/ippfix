@@ -9,7 +9,7 @@ font cache.
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--fail-closed] [--archive-max-bytes MB] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--archive-max-bytes MB] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -157,6 +157,22 @@ halftoning, and inflate a small job into tens of megabytes.
   and 1900 and print, while the lowest observed failure estimates about 4000. A
   file whose cost cannot be determined is always converted, never assumed
   cheap.
+
+* `--max-pdf-bytes` *MB*:
+  Rasterise rather than send an outlined PDF larger than this. Default 60.
+  Overridden by the printer's own `pdf-k-octets-supported` where it reports
+  one, so the shipped default only applies to a device that declares no limit.
+
+* `--all-formats`:
+  Offer clients every document format the printer supports, including
+  PostScript.
+
+  PostScript is withheld by default. It is interpreted by exactly the task that
+  fails on these devices, and it cannot be converted the way PDF is: handing
+  PostScript to Ghostscript means running its PostScript interpreter, which this
+  program is careful never to do. Offering it would advertise a repaired queue
+  that silently is not one. PCL and PCL-XL are offered either way — they are a
+  separate interpreter on the device, and are relayed unchanged.
 
 * `--fail-closed`:
   Reject a PDF that cannot be converted, instead of forwarding it unchanged. By

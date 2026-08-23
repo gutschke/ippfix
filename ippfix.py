@@ -110,7 +110,42 @@ ALLOWED_OPS = frozenset({
 FORBIDDEN_ATTRS = ('document-uri', 'job-uri', 'job-authorization-uri',
                    'notify-recipient-uri', 'job-mandatory-attributes')
 
+# Formats a client may be offered. PDF is converted; raster and JPEG carry no
+# font programs at all; octet-stream is sniffed and handled as whatever it turns
+# out to be. PCL and PCL-XL are relayed untouched and are listed deliberately:
+# the fault is in the device's PostScript task, which also interprets PDF, while
+# PCL is a separate interpreter -- so PCL is if anything a safer choice here,
+# and withholding it would remove a working path for no reason.
+#
+# application/postscript is the one omission. It is handled by exactly the
+# interpreter that crashes, and it cannot be converted the way PDF is: feeding
+# PostScript to Ghostscript means running its PostScript interpreter, which is
+# where the sandbox-escape history lives and which normalise_pdf() exists to
+# avoid. Offering it would advertise a fixed queue that silently is not one.
+SAFE_FORMATS = ('application/pdf', 'image/urf', 'application/PCLm',
+                'image/pwg-raster', 'image/jpeg', 'application/octet-stream',
+                'application/vnd.hp-PCL', 'application/vnd.hp-PCLXL',
+                'application/vnd.hp-PCLXL'.lower())
+
+# Raster formats worth falling back to, best first. Chosen from what the
+# printer says it accepts, never assumed.
+RASTER_PREFERENCE = ('image/urf', 'application/PCLm', 'image/pwg-raster')
+
+# Ghostscript device per raster format, and the cupsColorSpace numbers behind
+# the names printers use in urf-supported. Nothing here is assumed of a
+# printer: the choice is made from what it actually advertises.
+RASTER_DEVICE = {'image/urf': 'appleraster',
+                 'application/PCLm': 'pclm',
+                 'image/pwg-raster': 'pwgraster'}
+URF_COLORSPACE = {'SRGB24': 19, 'ADOBERGB24': 20, 'DEVRGB24': 1,
+                  'W8': 18, 'DEVW8': 0}
+# Colour first where the printer has colour, grey otherwise. Grey also halves
+# the size and avoids composite-black fringing on text.
+COLOUR_ORDER = ('SRGB24', 'ADOBERGB24', 'DEVRGB24')
+GREY_ORDER = ('W8', 'DEVW8')
+
 MAX_BODY = 64 * 1024 * 1024        # a print job larger than this is not real
+MAX_PAGES_INSPECTED = 2000         # beyond this, decline to estimate
 MAX_HEADERS = 100
 MAX_KEEPALIVE = 100
 
@@ -153,8 +188,116 @@ class Queue:
         # the upstream exchange. Conversion happens outside the lock so one
         # expensive document cannot stall every other queue.
         self.lock = threading.Lock()
+        self.raster_format = None      # learned from the printer, see below
+        self.raster_device = None
+        self.raster_colorspace = None
+        self.raster_dpi = None
+        self.max_pdf_bytes = None
+        self.learned = False
+        self._warned_formats = False
         if not self.host:
             raise ValueError(f'{name}: no host in {uri!r}')
+
+    def learn(self, timeout=20):
+        """Ask the printer what it can actually take, once.
+
+        Everything the raster fallback needs varies by model: which raster
+        format, which colour space (a monochrome device offers no colour one),
+        which resolution, and how large a PDF it will accept. Guessing any of
+        them produces a job the printer rejects, which is the failure this
+        proxy exists to remove.
+        """
+        if self.learned:
+            return
+        self.learned = True
+        try:
+            request = ipp.new_request(0x000B, 1, self.upstream_uri())
+            request.operation().replace(
+                'requested-attributes', ipp.TAG_KEYWORD,
+                ['document-format-supported', 'urf-supported',
+                 'printer-resolution-supported', 'pdf-k-octets-supported',
+                 'color-supported', 'pwg-raster-document-resolution-supported'])
+            status, raw = upstream_ipp(self, ipp.serialize(request), timeout)
+            if status != 200:
+                raise OSError(f'HTTP {status}')
+            group = ipp.parse(raw).group(ipp.PRINTER_ATTRS)
+            if group is None:
+                raise ValueError('no printer attributes')
+        except Exception as exc:
+            log.warning('%s: could not read capabilities (%s); the raster '
+                        'fallback is disabled for this printer', self.name, exc)
+            return
+
+        formats = [f.decode('utf-8', 'replace')
+                   for f in (group.get('document-format-supported') or [])]
+        for candidate in RASTER_PREFERENCE:
+            if candidate in formats:
+                self.raster_format = candidate
+                self.raster_device = RASTER_DEVICE[candidate]
+                break
+
+        urf = [f.decode('utf-8', 'replace')
+               for f in (group.get('urf-supported') or [])]
+        colour = group.get('color-supported')
+        has_colour = bool(colour and colour[0] not in (b'\x00', b''))
+        order = (COLOUR_ORDER + GREY_ORDER) if has_colour else GREY_ORDER
+        for name in order:
+            if name in urf:
+                self.raster_colorspace = URF_COLORSPACE[name]
+                self.raster_colorname = name
+                break
+        if self.raster_colorspace is None and self.raster_format:
+            # No usable token; grey is the safest thing any printer renders.
+            self.raster_colorspace = URF_COLORSPACE['W8']
+            self.raster_colorname = 'W8 (assumed)'
+
+        for token in urf:                       # e.g. RS600 or RS300-600
+            if token.startswith('RS'):
+                try:
+                    self.raster_dpi = max(int(x) for x in
+                                          token[2:].split('-') if x.isdigit())
+                except ValueError:
+                    pass
+                break
+        if not self.raster_dpi:
+            res = group.get('printer-resolution-supported')
+            if res and len(res[0]) >= 9:
+                self.raster_dpi = struct.unpack_from('>i', res[0], 0)[0]
+        self.raster_dpi = self.raster_dpi or 600
+
+        koctets = group.get('pdf-k-octets-supported')
+        if koctets and len(koctets[0]) == 8:
+            upper = struct.unpack_from('>ii', koctets[0], 0)[1]
+            if upper > 0:
+                # Stay clear of the limit rather than sitting on it.
+                self.max_pdf_bytes = int(upper * 1024 * 0.8)
+
+        if self.raster_format:
+            log.info('%s: raster fallback %s, %s, %d dpi', self.name,
+                     self.raster_format, getattr(self, 'raster_colorname', '?'),
+                     self.raster_dpi)
+        else:
+            log.warning('%s: printer accepts no raster format we can produce; '
+                        'oversized jobs will be sent as PDF and may be '
+                        'rejected', self.name)
+        if self.max_pdf_bytes:
+            log.info('%s: printer accepts PDF up to %.0f MB', self.name,
+                     self.max_pdf_bytes / 1e6)
+
+    def note_formats(self, offered, kept):
+        """Remember which raster format this printer will actually take.
+
+        Never assumed: a monochrome or older device may support none of them,
+        in which case there is no raster tier for it and that has to be known
+        rather than discovered when a job fails.
+        """
+        if not self._warned_formats:
+            self._warned_formats = True
+            dropped = [f for f in offered if f not in kept]
+            if dropped:
+                log.info('%s: not offering %s to clients (handled by the same '
+                         'interpreter that fails, and cannot be converted '
+                         'safely)', self.name, ', '.join(dropped))
 
     @property
     def local_path(self):
@@ -198,6 +341,8 @@ class Config:
         self.fail_closed = args.fail_closed
         self.archive_max_bytes = args.archive_max_bytes * 1024 * 1024
         self.convert_threshold = args.convert_threshold
+        self.restrict_formats = not args.all_formats
+        self.max_pdf_bytes = args.max_pdf_bytes * 1024 * 1024
 
     def base_http(self):
         host = (f'[{self.advertise}]' if ':' in self.advertise
@@ -313,64 +458,202 @@ def global_ipv6(device=None):
 # ---------------------------------------------------------------------------
 # document conversion
 # ---------------------------------------------------------------------------
+def _object_index(data):
+    """Byte offset of every ``N 0 obj`` in the file.
+
+    Deliberately simple. A file using cross-reference or object streams will
+    not index fully, and the caller then gets None and converts -- which is the
+    right answer, because an estimate we cannot make is not an estimate we
+    should trust.
+    """
+    index = {}
+    for m in re.finditer(rb'(?:^|[\r\n>\s])(\d+)\s+(\d+)\s+obj\b', data):
+        index[int(m.group(1))] = m.end()
+    return index
+
+
+def _resolve(data, index, ref, depth=0):
+    """Body of an indirect object, following one reference at a time."""
+    if depth > 8:
+        return b''
+    m = re.match(rb'\s*(\d+)\s+\d+\s+R\b', ref)
+    if not m:
+        return ref
+    start = index.get(int(m.group(1)))
+    if start is None:
+        return b''
+    end = data.find(b'endobj', start)
+    return _resolve(data, index, data[start:end if end > 0 else start + 4096],
+                    depth + 1)
+
+
+def _declared_glyphs(sfnt):
+    count = struct.unpack_from('>H', sfnt, 4)[0]
+    for i in range(count):
+        off = 12 + i * 16
+        if sfnt[off:off + 4] == b'maxp':
+            table = struct.unpack_from('>I', sfnt, off + 8)[0]
+            return struct.unpack_from('>H', sfnt, table + 4)[0]
+    return 0
+
+
+def _font_program_size(data, index, font_body):
+    """Glyphs declared by the program behind a /Font object, or 0."""
+    body = font_body
+    m = re.search(rb'/DescendantFonts\s*\[?\s*(\d+\s+\d+\s+R)', body)
+    if m:
+        body = _resolve(data, index, m.group(1))
+    m = re.search(rb'/FontDescriptor\s+(\d+\s+\d+\s+R)', body)
+    if not m:
+        return 0
+    descriptor = _resolve(data, index, m.group(1))
+    m = re.search(rb'/FontFile2\s+(\d+)\s+0\s+R', descriptor)
+    if not m:
+        return 0
+    start = index.get(int(m.group(1)))
+    if start is None:
+        return 0
+    head_end = data.find(b'stream', start)
+    if head_end < 0:
+        return 0
+    head = data[start:head_end]
+    body_start = head_end + len(b'stream')
+    while data[body_start:body_start + 1] in (b'\r', b'\n'):
+        body_start += 1
+    body_end = data.find(b'endstream', body_start)
+    raw = data[body_start:body_end]
+    if b'/FlateDecode' in head:
+        raw = _inflate(raw)
+    return _declared_glyphs(raw)
+
+
+MAX_INFLATE = 32 * 1024 * 1024      # enough for any real content stream
+
+
+def _inflate(raw):
+    """Decompress, refusing to be a decompression bomb."""
+    obj = zlib.decompressobj()
+    out = obj.decompress(raw, MAX_INFLATE)
+    if obj.unconsumed_tail:
+        raise ValueError('stream expands beyond the inspection limit')
+    return out
+
+
+class Unreadable(Exception):
+    """A stream we could not inspect. Never treat that as "contains nothing"."""
+
+
+def _stream_payload(data, index, ref):
+    start = index.get(ref)
+    if start is None:
+        raise Unreadable('content stream not found')
+    head_end = data.find(b'stream', start)
+    if head_end < 0:
+        raise Unreadable('content stream has no body')
+    head = data[start:head_end]
+    body_start = head_end + len(b'stream')
+    while data[body_start:body_start + 1] in (b'\r', b'\n'):
+        body_start += 1
+    body_end = data.find(b'endstream', body_start)
+    raw = data[body_start:body_end]
+    if b'/FlateDecode' in head:
+        try:
+            raw = _inflate(raw)
+        except (zlib.error, ValueError) as exc:
+            # Could be corruption, could be a decompression bomb. Either way we
+            # have not seen this page's glyphs and must not pretend otherwise.
+            raise Unreadable(f'content stream: {exc}')
+    return raw
+
+
 def estimate_font_cost(data):
-    """Estimate what this PDF will cost the printer's font cache.
+    """Estimate the worst page's cost to the printer's font cache.
 
-    The measured budget has two components, both readable without rendering:
-    the glyph count each embedded font program declares, and the distinct
-    glyphs actually drawn. Calibration against known outcomes on a Color
-    LaserJet Pro MFP M283fdw:
+    The budget is measured PER PAGE, so the estimate has to be too. Summing the
+    whole document over-states long ones badly -- a fifty-page report using one
+    font is no more expensive per page than a one-page one -- and over-stating
+    is not harmless here: it sends jobs down the conversion path, which inflates
+    them, which is how a long document ends up too large for the printer to
+    accept at all.
 
-        printed  : real browser jobs        1212, 1298, 1827
-        failed   : one full font, 528 drawn        4056
-        failed   : one full font, 908 drawn        7161
-        failed   : three full fonts                19367
+    Both terms are readable without rendering: what each font program on the
+    page declares, and how many distinct glyphs that page draws. Calibration
+    against known outcomes on a Color LaserJet Pro MFP M283fdw:
 
-    Returns None when the file cannot be read confidently, which the caller
-    must treat as "convert", never as "safe".
+        printed  : real browser jobs        1205, 1291, 1820
+        failed   : bisection boundary       between 3558 and 3697
+
+    Returns None when the file cannot be read confidently -- object streams,
+    an unusual structure, anything unexpected. The caller must treat that as
+    "convert", never as "safe".
     """
     try:
-        declared = 0
-        for m in re.finditer(rb'/FontFile2\s+(\d+)\s+0\s+R', data):
-            num = int(m.group(1))
-            om = re.search(rb'[^0-9]%d\s+0\s+obj(.{0,600}?)stream[\r\n]+'
-                           % num, data, re.S)
-            if not om:
-                return None
-            start = om.end()
-            end = data.find(b'endstream', start)
-            if end < 0:
-                return None
-            raw = data[start:end]
-            if b'/FlateDecode' in om.group(1):
-                raw = zlib.decompress(raw)
-            count = struct.unpack_from('>H', raw, 4)[0]
-            for i in range(count):
-                off = 12 + i * 16
-                if raw[off:off + 4] == b'maxp':
-                    table = struct.unpack_from('>I', raw, off + 8)[0]
-                    declared += struct.unpack_from('>H', raw, table + 4)[0]
-                    break
+        index = _object_index(data)
+        if not index:
+            return None
 
-        drawn = set()
-        for m in re.finditer(rb'stream[\r\n]+', data):
-            start = m.end()
-            end = data.find(b'endstream', start)
-            if end < 0 or end - start > 8 * 1024 * 1024:
-                continue
-            blob = data[start:end]
-            try:
-                blob = zlib.decompress(blob)
-            except zlib.error:
-                pass
-            if b'Tj' not in blob and b'TJ' not in blob:
-                continue
-            for hm in re.finditer(rb'<([0-9A-Fa-f]{4,})>', blob):
-                h = hm.group(1)
-                if len(h) % 4 == 0:
-                    for i in range(0, len(h), 4):
-                        drawn.add(h[i:i + 4])
-        return declared + len(drawn)
+        pages = [m.start() for m in re.finditer(rb'/Type\s*/Page[^s]', data)]
+        if not pages:
+            return None
+        if len(pages) > MAX_PAGES_INSPECTED:
+            # Rather than spend unbounded time on a file that may be crafted,
+            # decline to estimate. The caller converts, which is the safe answer.
+            return None
+
+        declared_cache = {}
+        worst = 0
+        for pos in pages:
+            end = data.find(b'endobj', pos)
+            page = data[max(0, pos - 400):end if end > 0 else pos + 4096]
+
+            # Fonts this page names, via its resource dictionary.
+            resources = page
+            m = re.search(rb'/Resources\s+(\d+\s+\d+\s+R)', page)
+            if m:
+                resources = _resolve(data, index, m.group(1))
+
+            declared = 0
+            seen = set()
+            for fm in re.finditer(rb'/Font\s*<<(.*?)>>', resources, re.S):
+                for rm in re.finditer(rb'/\w+\s+(\d+)\s+\d+\s+R', fm.group(1)):
+                    num = int(rm.group(1))
+                    if num in seen:
+                        continue
+                    seen.add(num)
+                    if num not in declared_cache:
+                        body = _resolve(data, index, b'%d 0 R' % num)
+                        declared_cache[num] = _font_program_size(data, index,
+                                                                 body)
+                    declared += declared_cache[num]
+
+            # Glyphs this page draws.
+            drawn = set()
+            for cm in re.finditer(rb'/Contents\s+(?:(\d+)\s+\d+\s+R|\[([^\]]*)\])',
+                                  page):
+                refs = ([int(cm.group(1))] if cm.group(1) else
+                        [int(x) for x in re.findall(rb'(\d+)\s+\d+\s+R',
+                                                    cm.group(2) or b'')])
+                if not refs:
+                    raise Unreadable('page contents not resolvable')
+                for ref in refs:
+                    blob = _stream_payload(data, index, ref)
+                    for hm in re.finditer(rb'<([0-9A-Fa-f]{4,})>', blob):
+                        h = hm.group(1)
+                        if len(h) % 4 == 0:
+                            for i in range(0, len(h), 4):
+                                drawn.add(h[i:i + 4])
+                    # Simple fonts show text as bytes, not glyph ids. Counting
+                    # distinct bytes is coarse but stops such a page from being
+                    # scored as if it drew nothing.
+                    for sm in re.finditer(rb'\((?:\\.|[^\\()])*\)\s*Tj', blob):
+                        drawn.update(bytes([b]) for b in sm.group(0))
+
+            worst = max(worst, declared + len(drawn))
+
+        return worst
+    except Unreadable as exc:
+        log.debug('cannot estimate font cost (%s); will convert', exc)
+        return None
     except Exception:
         return None
 
@@ -387,7 +670,7 @@ def sniff_format(data):
         return 'application/pdf'
     if data[:7] == b'UNIRAST':
         return 'image/urf'
-    if data[:4] == b'RaS2' or data[:4] == b'RaS3':
+    if data[:4] in (b'RaS2', b'RaS3'):
         return 'image/pwg-raster'
     if data[:4] == b'PCLm':
         return 'application/PCLm'
@@ -503,6 +786,26 @@ def prune_archive(cfg):
 MAX_CONVERTED = 256 * 1024 * 1024   # outlining inflates; bound it anyway
 
 
+def converter_header(queue, cfg):
+    """Tell the converter what this particular printer will accept.
+
+    The converter runs with no network at all, deliberately, so it cannot ask
+    the printer anything. Everything model-specific therefore travels with the
+    document: which raster format and colour space to fall back to, at what
+    resolution, and how large a PDF the printer will take. A converter that
+    receives no header keeps its built-in defaults.
+    """
+    if not queue.raster_format:
+        fields = ['raster=none']
+    else:
+        fields = [f'device={queue.raster_device}',
+                  f'colorspace={queue.raster_colorspace}',
+                  f'dpi={queue.raster_dpi}']
+    limit = queue.max_pdf_bytes or cfg.max_pdf_bytes
+    fields.append(f'maxpdf={limit}')
+    return ('%%ippfix ' + ' '.join(fields) + '\n').encode()
+
+
 def convert_over_socket(path, data, timeout):
     """Hand the document to the conversion service and read the result back.
 
@@ -550,7 +853,7 @@ def _failed(cfg, data, why):
     return data, f'relayed ({why})'
 
 
-def convert(cfg, data, fmt):
+def convert(cfg, data, fmt, queue=None):
     """Outline the text of a PDF. Anything else is relayed untouched.
 
     Fails safe: on any doubt the original is forwarded, because a job that
@@ -576,11 +879,14 @@ def convert(cfg, data, fmt):
     started = time.time()
     try:
         if cfg.converter_socket:
-            out = convert_over_socket(cfg.converter_socket, payload,
+            out = convert_over_socket(cfg.converter_socket,
+                                      converter_header(queue, cfg) + payload,
                                       cfg.timeout)
         else:
             # start_new_session so a timeout can kill the whole group:
             # terminating the helper leaves Ghostscript itself running.
+            payload = converter_header(queue, cfg) + payload if queue \
+                else payload
             proc = subprocess.Popen(
                 [cfg.converter], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -723,6 +1029,22 @@ def rewrite_response(cfg, queue, msg):
             group.replace('uri-authentication-supported', ipp.TAG_KEYWORD,
                           ['requesting-user-name', 'requesting-user-name'])
             group.replace('printer-uuid', ipp.TAG_URI, [cfg.our_uuid(queue)])
+            # Narrow what clients may choose to what we can actually protect.
+            if cfg.restrict_formats:
+                offered = [f.decode('utf-8', 'replace')
+                           for f in (group.get('document-format-supported') or [])]
+                kept = [f for f in offered
+                        if f in SAFE_FORMATS or f.lower() in SAFE_FORMATS]
+                if kept:
+                    group.replace('document-format-supported',
+                                  ipp.TAG_MIMETYPE, kept)
+                    queue.note_formats(offered, kept)
+                default = group.get_str('document-format-default')
+                if default and default not in kept and kept:
+                    group.replace('document-format-default',
+                                  ipp.TAG_MIMETYPE,
+                                  ['application/pdf' if 'application/pdf' in kept
+                                   else kept[0]])
             group.replace('printer-name', ipp.TAG_NAME, [queue.name])
             group.replace('printer-dns-sd-name', ipp.TAG_NAME, [queue.name])
             group.replace('printer-more-info', ipp.TAG_URI, [base + '/'])
@@ -1045,7 +1367,7 @@ class Handler(socketserver.BaseRequestHandler):
             # arriving mid-transfer confuses them.
             original = msg.data
             try:
-                msg.data, note = convert(cfg, msg.data, fmt)
+                msg.data, note = convert(cfg, msg.data, fmt, queue)
                 # Conversion may legitimately change the format: an outlined
                 # document too large for the printer to accept as a PDF comes
                 # back as raster. Say so, rather than mislabelling it.
@@ -1312,6 +1634,18 @@ def build_parser():
                              'expensive and most jobs are nowhere near the '
                              'printer limit. 0 converts everything (default: '
                              '2500)')
+    parser.add_argument('--max-pdf-bytes', type=int, default=60,
+                        metavar='MB',
+                        help='rasterise rather than send an outlined PDF larger '
+                             'than this. Overridden by the printer\'s own '
+                             'pdf-k-octets-supported when it reports one '
+                             '(default: 60)')
+    parser.add_argument('--all-formats', action='store_true',
+                        help='offer clients every format the printer '
+                             'supports, including PostScript. PostScript is '
+                             'handled by the interpreter that fails and cannot '
+                             'be converted safely, so it is withheld by '
+                             'default; PCL is offered either way')
     parser.add_argument('--fail-closed', action='store_true',
                         help='reject a PDF that cannot be converted instead of '
                              'forwarding it unchanged. Safer, because the '
@@ -1373,6 +1707,9 @@ def main(argv=None):
         log.warning('  ARCHIVING every job to %s (keeping %d) -- this stores '
                     'users\' documents; disable when done diagnosing',
                     cfg.archive, cfg.archive_max)
+
+    for queue in queues:
+        queue.learn()
 
     withdraw = None if args.no_advertise else advertise(cfg)
     listen_fd = inherited_socket()

@@ -214,6 +214,15 @@ PS
   MAX_PDF_BYTES=1000 ./defont < "$work/in.pdf" > "$work/big.out" 2>/dev/null
   check 'falls back to raster when the PDF would be too large' "head -c 7 '$work/big.out' | grep -qa UNIRAST"
 
+  # The per-printer header reaches a Ghostscript command line. Ghostscript has
+  # devices that have been used to defeat -dSAFER, so only the ones this tool
+  # emits may be named.
+  { printf '%%%%ippfix device=uniprint dpi=600 maxpdf=1000\n'; cat "$work/in.pdf"; } \
+    > "$work/inject.pdf"
+  ./defont < "$work/inject.pdf" > "$work/inject.out" 2>"$work/inject.err"
+  check 'refuses an unknown raster device' "grep -q 'refusing unknown raster device' '$work/inject.err'"
+  check 'still produces output after refusing one' "[ -s '$work/inject.out' ]"
+
   printf '%%PDF-1.4 truncated and broken' > "$work/broken.pdf"
   ./defont < "$work/broken.pdf" > "$work/broken.out" 2>/dev/null || true
   check 'falls back to the original on failure' "[ -s '$work/broken.out' ]"
@@ -282,37 +291,45 @@ assert normalise_pdf(b'junk\n%PDF-1.4\nx').startswith(b'%PDF-')
 PY2
 
 python3 - <<'PY2' && ok 'font-cost estimate ranks known outcomes correctly' || bad 'cost estimate'
+import struct
 import sys
+import zlib
 sys.path.insert(0, '.')
 from ippfix import estimate_font_cost
 
-# Two embedded font programs declaring 300 glyphs each, drawing four.
-def font(declared):
-    import struct
-    tables = 1
-    head = struct.pack('>IHHHH', 0x00010000, tables, 0, 0, 0)
-    maxp = struct.pack('>IH', 0x00005000, declared)
-    off = 12 + 16 * tables
-    rec = b'maxp' + struct.pack('>III', 0, off, len(maxp))
-    return head + rec + maxp
 
-import zlib
-def pdf(fonts, drawn):
+def sfnt(declared):
+    """A minimal font program declaring `declared` glyphs."""
+    maxp = struct.pack('>IH', 0x00005000, declared)
+    off = 12 + 16
+    return (struct.pack('>IHHHH', 0x00010000, 1, 0, 0, 0)
+            + b'maxp' + struct.pack('>III', 0, off, len(maxp)) + maxp)
+
+
+def pdf(declared, drawn):
+    """One page naming one font and drawing `drawn` distinct glyphs."""
+    prog = sfnt(declared)
+    text = b'BT ' + b' '.join(b'<%04X> Tj' % g for g in range(1, drawn + 1)) + b' ET'
     out = bytearray(b'%PDF-1.4\n')
-    for i, f in enumerate(fonts, start=1):
-        out += b'%d 0 obj\n<< /Length %d /Length1 %d >>\nstream\n' % (i, len(f), len(f))
-        out += f + b'\nendstream\nendobj\n'
-    body = b'BT ' + b' '.join(b'<%04X> Tj' % g for g in drawn) + b' ET'
-    out += b'9 0 obj\n<< /Length %d >>\nstream\n' % len(body) + body + b'\nendstream\nendobj\n'
-    for i in range(1, len(fonts) + 1):
-        out += b'/FontFile2 %d 0 R\n' % i
+    out += b'1 0 obj\n<< /Length1 %d /Length %d >>\nstream\n' % (len(prog), len(prog))
+    out += prog + b'\nendstream\nendobj\n'
+    out += b'2 0 obj\n<< /Type /FontDescriptor /FontFile2 1 0 R >>\nendobj\n'
+    out += (b'3 0 obj\n<< /Type /Font /Subtype /Type0 '
+            b'/DescendantFonts [4 0 R] >>\nendobj\n')
+    out += (b'4 0 obj\n<< /Type /Font /Subtype /CIDFontType2 '
+            b'/FontDescriptor 2 0 R >>\nendobj\n')
+    out += b'5 0 obj\n<< /Length %d >>\nstream\n' % len(text) + text
+    out += b'\nendstream\nendobj\n'
+    out += (b'6 0 obj\n<< /Type /Page /Resources << /Font << /F1 3 0 R >> >> '
+            b'/Contents 5 0 R >>\nendobj\n')
     return bytes(out)
 
-low = estimate_font_cost(pdf([font(40)], range(30)))
-high = estimate_font_cost(pdf([font(3000), font(3000)], range(400)))
-assert low is not None and high is not None
+
+low = estimate_font_cost(pdf(40, 30))
+high = estimate_font_cost(pdf(3000, 400))
+assert low is not None and high is not None, (low, high)
 assert low < 200, low
-assert high > 6000, high
+assert high > 3000, high
 assert high > low * 10
 
 # An unreadable file must NOT be reported as cheap: the caller treats None as
@@ -329,6 +346,50 @@ assert sniff_format(b'UNIRAST\\x00\\x00') == 'image/urf'
 assert sniff_format(b'RaS2rest') == 'image/pwg-raster'
 assert sniff_format(b'PCLmrest') == 'application/PCLm'
 assert sniff_format(b'nonsense') is None
+PY2
+
+python3 - <<'PY2' && ok 'unreadable input is never scored as cheap' || bad 'estimator safety'
+import sys, zlib
+sys.path.insert(0, '.')
+from ippfix import estimate_font_cost
+
+page = b'%PDF-1.4\n1 0 obj\n<< /Type /Page /Contents 2 0 R >>\nendobj\n'
+
+# A stream that expands enormously must not be inflated, and must not then be
+# scored as "this page draws nothing".
+bomb = zlib.compress(bytes(64 * 1024 * 1024), 9)
+pdf = (page + b'2 0 obj\n<< /Filter /FlateDecode /Length '
+       + str(len(bomb)).encode() + b' >>\nstream\n' + bomb
+       + b'\nendstream\nendobj\n')
+assert estimate_font_cost(pdf) is None, 'decompression bomb scored as readable'
+
+# Contents we cannot resolve likewise means "convert", not "safe".
+assert estimate_font_cost(page) is None
+
+# But a page that genuinely has no fonts is cheap, and must still say so.
+plain = (page + b'2 0 obj\n<< /Length 18 >>\nstream\n0 0 9 9 re f\n'
+         b'endstream\nendobj\n')
+cost = estimate_font_cost(plain)
+assert cost is not None and cost < 100, cost
+
+# The cost is per page, so it must not grow simply because a document is long.
+many = page * 3 + b'2 0 obj\n<< /Length 18 >>\nstream\n0 0 9 9 re f\nendstream\nendobj\n'
+assert estimate_font_cost(many) == cost, 'estimate grew with page count'
+PY2
+
+python3 - <<'PY2' && ok 'offers only formats it can stand behind' || bad 'format policy'
+import sys
+sys.path.insert(0, '.')
+from ippfix import SAFE_FORMATS
+
+# PostScript is handled by the interpreter that fails and cannot be converted
+# the way PDF is, so it must never be offered.
+assert 'application/postscript' not in SAFE_FORMATS
+# PCL uses a different interpreter and is a legitimate choice; withholding it
+# would remove a working path for no reason.
+assert 'application/vnd.hp-PCL' in SAFE_FORMATS
+assert 'application/vnd.hp-PCLXL' in SAFE_FORMATS
+assert 'application/pdf' in SAFE_FORMATS
 PY2
 
 echo 'systemd units'
