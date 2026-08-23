@@ -117,11 +117,11 @@ import sys, argparse
 sys.path.insert(0, '.')
 import ippfix
 
-def cfg(port=631, queues=('office=ipp://printer.example/ipp/print',)):
-    a = argparse.Namespace(port=port, advertise='192.0.2.10', also_advertise=None,
-                           no_ipv6=True, cert='c', key='k', no_convert=True,
-                           converter='x', timeout=1, archive=None, archive_max=5,
-                           max_connections=64, idle_timeout=30, require_tls=False)
+def cfg(port=631, queues=('office=ipp://printer.example/ipp/print',),
+        extra=()):
+    argv = ['--port', str(port), '--advertise', '192.0.2.10', '--no-ipv6',
+            *extra, *queues]
+    a = ippfix.build_parser().parse_args(argv)
     qs = [ippfix.parse_queue(q) for q in queues]
     return ippfix.Config(a, qs), qs
 
@@ -133,10 +133,9 @@ c2, qs2 = cfg(port=8631)
 assert c2.our_uri(qs2[0]) == 'ipp://192.0.2.10:8631/ipp/office'
 
 # IPv6 literals must be bracketed or the port cannot be told from the address.
-a = argparse.Namespace(port=631, advertise='2001:db8::1', also_advertise=[],
-                       no_ipv6=True, cert='c', key='k', no_convert=True,
-                       converter='x', timeout=1, archive=None, archive_max=5,
-                       max_connections=64, idle_timeout=30, require_tls=False)
+a = ippfix.build_parser().parse_args(
+    ['--advertise', '2001:db8::1', '--no-ipv6',
+     'office=ipp://printer.example/ipp/print'])
 c3 = ippfix.Config(a, qs)
 assert c3.our_uri(qs[0]) == 'ipp://[2001:db8::1]/ipp/office', c3.our_uri(qs[0])
 assert c3.base_http() == 'http://[2001:db8::1]:631'
@@ -206,6 +205,10 @@ PS
   printf 'UNIRAST\0not a pdf at all' > "$work/raster.bin"
   ./defont < "$work/raster.bin" > "$work/raster.out" 2>/dev/null
   check 'passes non-PDF through unchanged' "cmp -s '$work/raster.bin' '$work/raster.out'"
+  # A file gs would interpret as PostScript must never reach it.
+  printf '%%!PS-Adobe-3.0\n%%PDF-1.4\n(RAN) print\n' > "$work/confuse.ps"
+  ./defont < "$work/confuse.ps" > "$work/confuse.out" 2>/dev/null
+  check 'refuses PostScript disguised as PDF' "cmp -s '$work/confuse.ps' '$work/confuse.out'"
   printf '%%PDF-1.4 truncated and broken' > "$work/broken.pdf"
   ./defont < "$work/broken.pdf" > "$work/broken.out" 2>/dev/null || true
   check 'falls back to the original on failure' "[ -s '$work/broken.out' ]"
@@ -253,6 +256,24 @@ ippfix.rewrite_request(q, m)
 assert g.index_of('document-uri') < 0, 'document-uri survived'
 assert g.get_str('printer-uri') == 'ipp://printer.example/ipp/print'
 assert g.index_of('job-name') >= 0, 'stripped too much'
+PY2
+
+python3 - <<'PY2' && ok 'never lets the sender pick the interpreter' || bad 'interpreter selection'
+import sys
+sys.path.insert(0, '.')
+from ippfix import normalise_pdf
+
+# Ghostscript reads %PDF- at a line start as PDF and anything else as
+# PostScript, where the historical -dSAFER escapes live. A document must never
+# be able to choose the PostScript path by looking like a PDF to us.
+assert normalise_pdf(b'%PDF-1.4\n1 0 obj') is not None
+assert normalise_pdf(b'junk\n%PDF-1.4\n1 0 obj') is not None
+assert normalise_pdf(b'%!PS-Adobe-3.0\n%PDF-1.4\n') is None
+assert normalise_pdf(b'%%Title: %PDF-1.4 report\n') is None
+assert normalise_pdf(b'%!PS\n(x) print\n') is None
+assert normalise_pdf(b'no marker here') is None
+# Whatever comes back must start exactly at the header.
+assert normalise_pdf(b'junk\n%PDF-1.4\nx').startswith(b'%PDF-')
 PY2
 
 echo 'systemd units'

@@ -33,9 +33,13 @@ emit() {
   fi
 }
 
-# Only PDF is rewritten; anything else is already free of font programs as far
-# as this tool is concerned.
-if ! head -c 1024 "$infile" | grep -qa '%PDF-'; then
+# Ghostscript picks its interpreter from the start of the file: %PDF- at the
+# beginning means the hardened C PDF interpreter, anything else means the full
+# PostScript interpreter, where the historical -dSAFER escapes live. That
+# choice must never rest with whoever sent the document, so only a file whose
+# very first bytes are %PDF- is handed to gs. Everything else passes through
+# untouched -- it contains no font programs we are being asked to remove.
+if [ "$(head -c 5 "$infile")" != '%PDF-' ]; then
   emit "$infile" "${2:--}"
   exit 0
 fi
@@ -45,6 +49,7 @@ fi
 # particular is on by default in Ghostscript's named presets, which would throw
 # away half the usable resolution on a 600 dpi engine.
 "$GS" -q -dNOPAUSE -dBATCH -dSAFER \
+      -K400000 \
       -dNoOutputFonts \
       -sDEVICE=pdfwrite \
       -dCompatibilityLevel=1.4 \

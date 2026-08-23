@@ -11,6 +11,8 @@ cache.
 [\fB\-\-max\-connections\fR \fIN\fR]
 [\fB\-\-idle\-timeout\fR \fISECONDS\fR]
 [\fB\-\-require\-tls\fR]
+[\fB\-\-fail\-closed\fR]
+[\fB\-\-archive\-max\-bytes\fR \fIMB\fR]
 [\fB\-\-no\-ipv6\fR]
 [\fB\-\-cert\fR \fIFILE\fR]
 [\fB\-\-converter\fR \fIPATH\fR]
@@ -168,6 +170,18 @@ header and waiting.
 Refuse plaintext IPP and accept only implicit TLS. Off by default, because
 clients that discover a printer over DNS-SD commonly choose plaintext and would
 otherwise simply fail to print.
+.TP
+.B \-\-fail\-closed
+Reject a PDF that cannot be converted, instead of forwarding it unchanged.
+By default a conversion failure relays the original, on the grounds that a job
+which might not print beats one that prints wrongly. That is the safe choice
+for printing and the unsafe one for the guarantee this proxy exists to give,
+because whoever sends the document also decides whether conversion fails. This
+option inverts that trade.
+.TP
+.B \-\-archive\-max\-bytes " \fIMB\fR"
+Total size cap for the archive, in megabytes. Default 512. A count alone is not
+a bound when the documents are chosen by whoever is printing.
 .TP
 .B \-\-no\-advertise
 Do not publish the queues over DNS\-SD. Useful when discovery is handled

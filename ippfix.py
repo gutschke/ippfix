@@ -62,6 +62,7 @@ import re
 import socket
 import socketserver
 import ssl
+import signal
 import struct
 import subprocess
 import sys
@@ -193,6 +194,8 @@ class Config:
         self.max_connections = args.max_connections
         self.idle_timeout = args.idle_timeout
         self.require_tls = args.require_tls
+        self.fail_closed = args.fail_closed
+        self.archive_max_bytes = args.archive_max_bytes * 1024 * 1024
 
     def base_http(self):
         host = (f'[{self.advertise}]' if ':' in self.advertise
@@ -308,8 +311,35 @@ def global_ipv6(device=None):
 # ---------------------------------------------------------------------------
 # document conversion
 # ---------------------------------------------------------------------------
+def normalise_pdf(data):
+    """Return the document positioned so Ghostscript must read it as PDF.
+
+    Ghostscript decides which language to interpret by looking for %PDF- at the
+    start of a *line* near the beginning of the file, and treats anything else
+    as PostScript. A file beginning "%!PS" with a %PDF- line later on, or one
+    with %PDF- appearing mid-line, therefore looks like a PDF to a naive check
+    while making gs run its full PostScript interpreter -- which is where the
+    historical -dSAFER escapes live. For real PDF, gs 10.x uses a hardened C
+    interpreter instead.
+
+    So the choice of interpreter must not be left to the sender. Returning the
+    data trimmed to start exactly at %PDF- forces the PDF path; returning None
+    means this is not a PDF we should hand to gs at all, and the caller relays
+    it untouched.
+    """
+    if data[:2] == b'%!':                       # declares itself PostScript
+        return None
+    window = data[:1024]
+    i = window.find(b'%PDF-')
+    while i >= 0:
+        if i == 0 or window[i - 1] in (0x0a, 0x0d):
+            return data[i:] if i else data
+        i = window.find(b'%PDF-', i + 1)
+    return None
+
+
 def looks_like_pdf(data):
-    return data[:1024].find(b'%PDF-') >= 0
+    return normalise_pdf(data) is not None
 
 
 def archive_document(cfg, queue, job_name, fmt, data, note):
@@ -353,20 +383,41 @@ def archive_document(cfg, queue, job_name, fmt, data, note):
 
 
 def prune_archive(cfg):
-    """Keep the archive bounded so a forgotten flag cannot fill the disk."""
+    """Keep the archive bounded so a forgotten flag cannot fill the disk.
+
+    Bounded by total size as well as by count: fifty files of unbounded size is
+    not a bound, and the documents arriving here are chosen by whoever is
+    printing.
+    """
+    def drop(path):
+        for victim in (path, path + '.txt'):
+            try:
+                os.remove(victim)
+            except OSError:
+                pass
+
     try:
         entries = [os.path.join(cfg.archive, name)
                    for name in os.listdir(cfg.archive)
                    if not name.endswith('.txt')]
         entries.sort(key=os.path.getmtime)
         for path in entries[:max(0, len(entries) - cfg.archive_max)]:
-            for victim in (path, path + '.txt'):
-                try:
-                    os.remove(victim)
-                except OSError:
-                    pass
+            drop(path)
+            entries = entries[1:]
+
+        total = 0
+        for path in reversed(entries):          # newest first
+            try:
+                total += os.path.getsize(path)
+            except OSError:
+                continue
+            if total > cfg.archive_max_bytes:
+                drop(path)
     except OSError:
         pass
+
+
+MAX_CONVERTED = 256 * 1024 * 1024   # outlining inflates; bound it anyway
 
 
 def convert_over_socket(path, data, timeout):
@@ -384,14 +435,36 @@ def convert_over_socket(path, data, timeout):
         sock.sendall(data)
         sock.shutdown(socket.SHUT_WR)
         chunks = []
+        total = 0
         while True:
             chunk = sock.recv(65536)
             if not chunk:
                 break
+            total += len(chunk)
+            if total > MAX_CONVERTED:
+                raise OSError('converted document too large')
             chunks.append(chunk)
         return b''.join(chunks)
     finally:
         sock.close()
+
+
+class ConversionFailed(Exception):
+    """Raised instead of relaying, when the caller asked to fail closed."""
+
+
+def _failed(cfg, data, why):
+    """Decide what a conversion failure means.
+
+    Relaying the original is the safe choice for printing -- a job that might
+    not print beats one that prints something wrong -- but it is the unsafe
+    choice for the property this proxy exists to guarantee, since whoever sent
+    the document also decides whether conversion fails. --fail-closed inverts
+    that trade for sites that would rather lose the job than the guarantee.
+    """
+    if cfg.fail_closed:
+        raise ConversionFailed(why)
+    return data, f'relayed ({why})'
 
 
 def convert(cfg, data, fmt):
@@ -402,31 +475,48 @@ def convert(cfg, data, fmt):
     """
     if not cfg.convert or not data:
         return data, 'relayed'
-    if not looks_like_pdf(data):
+    payload = normalise_pdf(data)
+    if payload is None:
         return data, f'relayed ({fmt or "not PDF"})'
 
     started = time.time()
     try:
         if cfg.converter_socket:
-            out = convert_over_socket(cfg.converter_socket, data, cfg.timeout)
+            out = convert_over_socket(cfg.converter_socket, payload,
+                                      cfg.timeout)
         else:
-            proc = subprocess.run([cfg.converter], input=data,
-                                  capture_output=True, timeout=cfg.timeout)
-            out = proc.stdout
+            # start_new_session so a timeout can kill the whole group:
+            # terminating the helper leaves Ghostscript itself running.
+            proc = subprocess.Popen(
+                [cfg.converter], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True)
+            try:
+                out, err = proc.communicate(payload, timeout=cfg.timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                proc.communicate()
+                raise
+            if len(out) > MAX_CONVERTED:
+                log.error('converted document too large; relaying original')
+                return data, 'relayed (too large)'
             if proc.returncode != 0:
                 log.error('converter exited %s: %s', proc.returncode,
-                          proc.stderr[:300].decode('utf-8', 'replace').strip())
+                          err[:300].decode('utf-8', 'replace').strip())
                 return data, 'relayed (converter error)'
     except (OSError, socket.timeout, subprocess.TimeoutExpired) as exc:
-        log.error('converter failed (%s); relaying original', exc)
-        return data, 'relayed (converter failed)'
+        log.error('converter failed: %s', exc)
+        return _failed(cfg, data, 'converter failed')
 
     if not out:
-        log.error('converter produced nothing; relaying original')
-        return data, 'relayed (converter error)'
+        log.error('converter produced nothing')
+        return _failed(cfg, data, 'converter error')
     if b'/FontFile' in out:
-        log.warning('font programs survived conversion; relaying original')
-        return data, 'relayed (fonts survived)'
+        log.warning('font programs survived conversion')
+        return _failed(cfg, data, 'fonts survived')
     return out, (f'outlined {len(data)} -> {len(out)} bytes in '
                  f'{time.time() - started:.1f}s')
 
@@ -860,7 +950,13 @@ class Handler(socketserver.BaseRequestHandler):
             # multiple-document-jobs-supported = false, and a second job
             # arriving mid-transfer confuses them.
             original = msg.data
-            msg.data, note = convert(cfg, msg.data, fmt)
+            try:
+                msg.data, note = convert(cfg, msg.data, fmt)
+            except ConversionFailed as exc:
+                log.warning('%s: refusing job (%s)', queue.name, exc)
+                respond(wfile, '400 Bad Request', 'text/plain',
+                        b'document could not be converted\n')
+                return
             archive_document(cfg, queue,
                              group.get_str('job-name') if group else None,
                              fmt, original, note)
@@ -1105,6 +1201,15 @@ def build_parser():
                              'long (default: 30)')
     parser.add_argument('--require-tls', action='store_true',
                         help='refuse plaintext IPP and accept only ipps')
+    parser.add_argument('--fail-closed', action='store_true',
+                        help='reject a PDF that cannot be converted instead of '
+                             'forwarding it unchanged. Safer, because the '
+                             'sender otherwise chooses whether conversion '
+                             'happens, but it loses jobs the printer might '
+                             'have managed')
+    parser.add_argument('--archive-max-bytes', type=int, default=512,
+                        metavar='MB',
+                        help='total size cap for the archive (default: 512)')
     parser.add_argument('--no-advertise', action='store_true',
                         help='do not publish over DNS-SD')
     parser.add_argument('--list', nargs='?', const='http://localhost:631/',

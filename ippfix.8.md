@@ -9,7 +9,7 @@ font cache.
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--fail-closed] [--archive-max-bytes MB] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -142,6 +142,18 @@ halftoning, and inflate a small job into tens of megabytes.
   Refuse plaintext IPP and accept only implicit TLS. Off by default, because
   clients that discover a printer over DNS-SD commonly choose plaintext and
   would otherwise simply fail to print.
+
+* `--fail-closed`:
+  Reject a PDF that cannot be converted, instead of forwarding it unchanged. By
+  default a conversion failure relays the original, on the grounds that a job
+  which might not print beats one that prints wrongly. That is the safe choice
+  for printing and the unsafe one for the guarantee this proxy exists to give,
+  because whoever sends the document also decides whether conversion fails.
+  This option inverts that trade.
+
+* `--archive-max-bytes` *MB*:
+  Total size cap for the archive, in megabytes. Default 512. A count alone is
+  not a bound when the documents are chosen by whoever is printing.
 
 * `--no-advertise`:
   Do not publish the queues over DNS-SD. Useful when discovery is handled
