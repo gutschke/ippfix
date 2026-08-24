@@ -104,6 +104,14 @@ the font fault: the printer returns `job-state = aborted` with
 told. Colour is not what distinguishes them -- **transparency and shading** are.
 No assert is logged and no font program is involved.
 
+**The counts above are not the cause.** They describe the page that failed, and
+it is tempting to read them as a threshold, but they are not: 700 transparency
+groups alone, 250 shadings alone, and 240 shadings nested two deep inside 480
+groups with blend modes and constant alpha -- deliberately shaped like the
+COLRv1 page -- all print. Whatever aborts that page is a kind of construct, or
+an interaction between them, and it has not been identified. Do not treat "690
+groups" as a limit.
+
 **This proxy does not fix it.** That is worth stating plainly, because a first
 measurement suggested otherwise: converted through Ghostscript 10.02.1 the page
 did print. It printed because that release destroyed most of what the page
@@ -115,6 +123,80 @@ printer, and outlining fonts has no bearing on it.
 For such documents the only thing that would help is rasterising, which is not
 currently attempted on a format error. That is a plausible improvement and is
 not implemented.
+
+## A third failure: a malformed soft mask, lost silently
+
+A luminosity soft mask names a colour space in the group it points at, and a
+backdrop colour in `/BC`. When the length of `/BC` does not match the number of
+components that colour space has, the printer accepts the job, reports
+`job-state = completed`, and marks nothing.
+
+Every row below differs in one respect only -- the arity. All the values are
+zero:
+
+| group `/CS` | components | `/BC` | result |
+|---|---|---|---|
+| DeviceGray | 1 | `[0]` | prints |
+| DeviceGray | 1 | `[0 0 0]` | **silent, no output** |
+| DeviceRGB | 3 | `[0]` | **silent, no output** |
+| DeviceRGB | 3 | `[0 0 0]` | prints |
+| DeviceRGB | 3 | absent | prints |
+
+It fails in both directions. Omitting `/BC` is safe. The reproducer is 855
+bytes: one page, one rectangle, one soft mask, no font of any kind --
+`reproducers/bc-rgb-bc1.pdf`.
+
+Two nearby explanations were tested and eliminated. It is not duplicate
+dictionary keys: a file with a duplicated `/CS` whose values agree prints, and
+the duplicate mattered only because this device takes the *first* key where
+Ghostscript and poppler take the last. And it is not a general weakness with
+malformed array lengths: an image with a `/Decode` array of the wrong length
+prints normally.
+
+**Ghostscript and poppler both render the failing file correctly.** That is what
+makes it dangerous. Nothing on a desktop shows a problem, and the printer
+reports success, so no layer anywhere reports the loss.
+
+**Conversion does not fix it**, confirmed on the printer rather than assumed:
+there is no font to remove, so outlining is a no-op, and Ghostscript passes the
+mask through verbatim.
+
+### How likely is this in practice
+
+The failing input was constructed by hand, and no document produced by a
+browser has been seen to contain a mismatched `/BC`. That is much weaker
+reassurance than it sounds, for a reason worth stating: **a desktop prints
+existing PDF files as readily as it prints web pages.** The relevant population
+is therefore not "what this browser generates" but "every PDF anyone might open
+and print" -- files from word processors, typesetting systems, scanners,
+export filters and long-dead generators, many of which are careless about
+exactly this kind of arity. A viewer may re-generate the document on the way
+through, which would normalise it, or may not; that has not been established
+either.
+
+So the honest position is: this is a fault the device certainly has, reachable
+from a construct every desktop tool tolerates, whose real-world frequency is
+unknown and probably not zero. `scripts/check-softmask.py` scans documents for
+it, so an archive of real jobs can settle the question without using paper.
+
+### Why this one matters more than its likelihood suggests
+
+The raster fallback is reactive: it fires when the printer *rejects* a document.
+This failure reports success. **The proxy cannot see this class of loss at all**,
+and no improvement to the fallback will change that, because the signal never
+arrives.
+
+Guarding against silent loss therefore has to happen on the way in, by
+inspecting the document before it is sent. That is a different mechanism from
+the output check described in the next section, which asks whether conversion
+preserved what was there; here the input itself is malformed and conversion
+preserves it faithfully.
+
+Nothing is repaired automatically today. The construct is cheap to detect and
+would be cheap to repair -- deleting `/BC` is provably safe, since omitting it
+prints -- but rewriting documents on the way to a printer is itself a way to
+introduce faults, and no real document has yet been shown to need it. Detection
+first; repair when something real trips it.
 
 ## Fidelity: the conversion must not change the page
 
