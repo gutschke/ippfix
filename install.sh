@@ -91,7 +91,12 @@ for file in "${src}"/scripts/*.py; do
   cp "${file}" "${dst}/scripts/"
   chmod 0755 "${dst}/scripts/${file##*/}"
 done
+# Not part of the proxy, but the thing that stops --archive being forgotten.
+# It works out its own path, so it does the right thing from here too.
+cp "${src}/debian/pkg/ippfix-archive-reminder" "${dst}/" 2>/dev/null || :
 chmod 0755 "${dst}/ippfix" "${dst}/defont"
+[ ! -e "${dst}/ippfix-archive-reminder" ] || \
+  chmod 0755 "${dst}/ippfix-archive-reminder"
 echo ' done.'
 
 # Setup python venv

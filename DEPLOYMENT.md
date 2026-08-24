@@ -506,6 +506,19 @@ reproducible: it is attached, alongside the version the proxy actually sent, so
 whoever reads the report has both without going to the server. `0` for
 `--alert-max-attachment` keeps the reports and drops the documents.
 
+**Not forgetting to switch it off.** Nobody remembers a flag they turned on
+three months ago, so schedule the reminder when you turn it on:
+
+```
+ippfix-archive-reminder --schedule 2026-11-24
+```
+
+That writes a one-shot timer, and the reminder deletes the timer, its unit and
+itself once it has run. Turning `--archive` off is then the only thing left to
+do by hand, which is the only part that needs judgement. It goes quietly if the
+flag is already off by then, and `--cancel` removes it early. The address comes
+from `--alert-mail` unless one is given.
+
 **Large jobs.** Outlining inlines a full path at every glyph occurrence, so a
 long document can grow past what the printer will accept as a PDF. When that
 happens the job is rasterised instead — lower fidelity, but it prints rather

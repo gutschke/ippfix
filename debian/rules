@@ -17,7 +17,8 @@ override_dh_auto_install:
 	install -m0644 ippfix.py ippcodec.py debian/ippfix$(LIB)/
 	install -m0755 defont ippfix debian/ippfix$(LIB)/
 	install -m0755 debian/pkg/ippfix-setup debian/pkg/ippfix-configured \
-		debian/pkg/ippfix-sendalert debian/ippfix$(LIB)/
+		debian/pkg/ippfix-sendalert debian/pkg/ippfix-archive-reminder \
+		debian/ippfix$(LIB)/
 	install -d debian/ippfix/usr/bin
 	# Relative, and relative to /usr/bin -- not to the root. '..$(LIB)' would
 	# resolve to /usr/usr/lib/ippfix and dangle.

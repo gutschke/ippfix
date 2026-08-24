@@ -322,9 +322,10 @@ If jobs are still being lost, the useful thing is the document itself.
 ```
 
 This stores what users print, so it is off by default; see the manual page
-before enabling it, and turn it off once the question is answered. Each job is
-saved exactly as it arrived, with a sidecar recording the queue, job name,
-format and what conversion did.
+before enabling it, and turn it off once the question is answered — schedule
+`ippfix-archive-reminder --schedule DATE` at the same time and that becomes the
+only step left to remember. Each job is saved exactly as it arrived, with a
+sidecar recording the queue, job name, format and what conversion did.
 
 `--alert-mail` is the cheaper first step: it follows each job to its terminal
 state and mails a report when the printer marked nothing, including the

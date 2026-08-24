@@ -10,6 +10,8 @@ ippfix (1.0.1) unstable; urgency=medium
   * DNS-SD publishes the advertised address rather than a .local name, so
     printing no longer depends on multicast DNS reaching this host every time.
     --advertise-hostname restores a name where one is wanted.
+  * New ippfix-archive-reminder: schedules a one-shot reminder that --archive
+    is still on, and deletes itself once it has run.
 
  -- gutschke <gutschke@users.noreply.github.com>  Mon, 24 Aug 2026 07:46:30 -0700
 
