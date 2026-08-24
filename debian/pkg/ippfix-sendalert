@@ -13,6 +13,12 @@ set -u
 spool="${IPPFIX_ALERT_SPOOL:-/var/lib/ippfix/alerts}"
 [ -d "$spool" ] || exit 0
 
+# A message is written as .part and renamed into place, so a .part file means
+# the proxy died mid-write. It will never be completed and nothing will ever
+# collect it. tmpfiles ages the directory out eventually; sweep the obviously
+# dead ones now so they do not sit for a week looking like queued work.
+find "$spool" -maxdepth 1 -name '*.part' -mmin +60 -delete 2>/dev/null || :
+
 status=0
 for f in "$spool"/*.mail; do
     [ -e "$f" ] || break                      # nothing queued
@@ -20,7 +26,11 @@ for f in "$spool"/*.mail; do
         rm -f "$f"
         continue
     fi
-    if /usr/sbin/sendmail -t -i < "$f"; then
+    # -f so the envelope sender matches the From: the proxy wrote. Without it
+    # the mail system substitutes whoever ran this, and a mismatch between
+    # envelope and header is the sort of thing strict receivers reject.
+    sender="$(sed -n 's/^From:.*<\([^>]*\)>.*/\1/p; s/^From: *\([^ <]*@[^ >]*\) *$/\1/p' "$f" | head -1)"
+    if /usr/sbin/sendmail ${sender:+-f "$sender"} -t -i < "$f"; then
         rm -f "$f"
     else
         # Keep it for the next run rather than losing the report, but do not

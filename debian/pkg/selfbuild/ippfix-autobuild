@@ -67,6 +67,12 @@ log "rebuilding: $reason"
 # --- 2. Build into a staging directory -------------------------------------
 # The live environment is not touched until the new one has been shown to work.
 STAGE="$CACHE/venv.new"
+# Clean up on the way out however we leave. Without this a build that failed
+# left its half-made environment behind -- a bounded leak, since the next run
+# clears it, but 'the next run' can be a week away or never if the timer is off.
+# Only the staging copy: venv.old is the rollback target and must survive until
+# the swap is known to have worked.
+trap 'rm -rf "$STAGE"' EXIT INT TERM QUIT HUP
 rm -rf "$STAGE"
 python3 -m venv "$STAGE" || die 'could not create the environment'
 "$STAGE/bin/pip3" install --quiet --upgrade pip \
@@ -116,6 +122,6 @@ else
   log 'ippfix was not running; installed without a restart'
 fi
 
-rm -rf "$CACHE/venv.old" "$CACHE/venv.new"
+rm -rf "$CACHE/venv.old"
 log "rebuilt for python ${want_py} (${reason})"
 exit 0
