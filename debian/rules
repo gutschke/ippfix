@@ -17,7 +17,7 @@ override_dh_auto_install:
 	install -m0644 ippfix.py ippcodec.py debian/ippfix$(LIB)/
 	install -m0755 defont ippfix debian/ippfix$(LIB)/
 	install -m0755 debian/pkg/ippfix-setup debian/pkg/ippfix-configured \
-		debian/ippfix$(LIB)/
+		debian/pkg/ippfix-sendalert debian/ippfix$(LIB)/
 	install -d debian/ippfix/usr/bin
 	# Relative, and relative to /usr/bin -- not to the root. '..$(LIB)' would
 	# resolve to /usr/usr/lib/ippfix and dangle.
@@ -38,6 +38,7 @@ override_dh_auto_install:
 	      > debian/ippfix/usr/lib/systemd/system/"$$u"; \
 	done
 	install -m0644 debian/pkg/ippfix.service debian/pkg/ippfix.socket \
+		debian/pkg/ippfix-alert.path debian/pkg/ippfix-alert.service \
 		debian/ippfix/usr/lib/systemd/system/
 	# Users and directories come from debian/ippfix.{sysusers,tmpfiles};
 	# debhelper installs them and adds the snippets that apply them.
@@ -83,6 +84,11 @@ override_dh_installsystemd:
 	# unconfigured one is harmless: ExecCondition= skips it and it stays inactive
 	# rather than failing.
 	dh_installsystemd -pippfix ippfix.service
+	# The path unit watches for queued alerts; its service is triggered, never
+	# enabled on its own.
+	dh_installsystemd -pippfix --name=ippfix-alert ippfix-alert.path
+	dh_installsystemd -pippfix --name=ippfix-alert --no-enable --no-start \
+		ippfix-alert.service
 	# Only the timer is enabled for the self-build; the oneshot service is
 	# started by the apt hook and by the timer, never on its own.
 	dh_installsystemd -pippfix-selfbuild --no-start ippfix-selfbuild.timer

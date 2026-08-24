@@ -8,6 +8,7 @@ cache.
 [\fB\-\-also\-advertise\fR \fIADDRESS\fR]
 [\fB\-\-alert\-mail\fR \fIADDRESS\fR]
 [\fB\-\-alert\-max\-per\-hour\fR \fIN\fR]
+[\fB\-\-alert\-spool\fR \fIDIR\fR]
 [\fB\-\-alert\-timeout\fR \fISEC\fR]
 [\fB\-\-archive\fR \fIDIR\fR]
 [\fB\-\-list\fR [\fIURL\fR]]
@@ -47,19 +48,15 @@ records it at all, its event log reports an assertion failure in
 .BR fontcache.c .
 .PP
 The budget covers both the glyphs drawn and the embedded font programs they
-come from, and the two trade against each other. On a Color LaserJet Pro MFP
-M283fdw, one fully embedded font renders 527 distinct glyphs but not 534; add a
-second fully embedded font and the page fails at 300. A font's cost scales with
-how many glyphs its embedded program declares rather than being a flat
-per\-font constant, so a heavily subsetted face is far cheaper than a complete
-one.
-.PP
-Those figures come from probes embedding complete, unsubsetted fonts. Jobs from
-a browser subset aggressively and sit well below them: sampled from real Chrome
-output, two subsets declaring 93 and 668 glyphs, with 451 distinct glyphs drawn
-between them, printed without trouble. No fixed threshold is therefore safe to
-design against \(em whether a document crosses the line depends on its
-typefaces, how they were subsetted, and how many distinct characters appear.
+come from, and the two trade against each other, but no rule relating the two
+has survived testing. What is established is that the font's hinting is
+causally involved \(em the same 900\-glyph page fails with a hinted font and
+prints with the hinting bytecode removed \(em and that it is a property of the
+font rather than of the application, which is why printing web pages has been
+more reliable than printing PDFs. Four cost models were fitted to measured
+outcomes and every one was falsified; see
+.B CALIBRATION
+below.
 .PP
 The defect appears in firmware builds years apart and is unlikely to be fixed.
 Client\-side changes affect how often it is reached: Chrome 130 through 144
@@ -79,6 +76,17 @@ the printer's own rasteriser still renders it at full device precision and its
 edge enhancement still applies. Rasterising the page instead would commit its
 geometry to the device grid before the printer saw it, forfeit the printer's
 halftoning, and inflate a small job into tens of megabytes.
+.PP
+This addresses one fault. Two others have been reproduced on the same device
+and are not fixed here: a page of vector colour glyphs is rejected with
+.BR document\-format\-error ,
+and a soft mask whose
+.B /BC
+backdrop array does not match the component count of its group's colour space
+is accepted, reported complete, and marked nowhere. Both are properties of the
+document that conversion preserves faithfully. The distributed
+.I DIAGNOSING.md
+records how to tell them apart.
 
 .SH ARGUMENTS
 .TP
@@ -140,7 +148,11 @@ digest. It contains no text and no images from the document; the aim is to make
 a fault reproducible, not to copy what somebody printed.
 .IP
 This is off by default because a printer that does not report impressions
-honestly would report every job as lost.
+honestly would report every job as lost. Delivery uses
+.IR /usr/sbin/sendmail ,
+so a local mail transport agent is required; if it is missing or refuses, the
+report is written to the log instead of being lost. Following a job happens
+after the client has been answered, so it never delays one.
 .TP
 .B \-\-alert\-max\-per\-hour " \fIN\fR"
 Send at most
@@ -148,6 +160,27 @@ Send at most
 alerts an hour, default 6. Suppressed ones are logged, and the count is carried
 into the next message, so a flood is reported as a flood instead of becoming
 one.
+.TP
+.B \-\-alert\-spool " \fIDIR\fR"
+Write alerts into
+.I DIR
+for a helper to deliver, rather than running
+.BR sendmail (1)
+directly. Default
+.IR /var/lib/ippfix/alerts .
+.IP
+Delivery needs membership of the mail group, which on a typical system also
+grants read access to the mail system's credential file. The daemon is the most
+exposed component here and is not given either: it writes a complete message to
+this directory, and
+.I ippfix\-alert.path
+notices and hands it to
+.BR sendmail (1)
+from a unit that never sees a document or a network connection. This is the same
+separation used for document conversion.
+.IP
+Set to the empty string to deliver directly, which is appropriate when running
+by hand or outside the supplied units.
 .TP
 .B \-\-alert\-timeout " \fISEC\fR"
 Give up following a job after
@@ -216,17 +249,18 @@ otherwise simply fail to print.
 .B \-\-convert\-threshold " \fIN\fR"
 Leave a job untouched when its estimated font cost is at or below
 .IR N .
-Default 2500; 0 converts everything.
+Default 0, which converts every PDF: the test is skipped entirely rather than
+compared against zero.
 .IP
-Outlining is expensive. It replaces every drawn glyph with an inline path and
-Ghostscript emits no reusable form for them, so a fifty-page document grows
-from half a megabyte to thirty-three and takes about half a second per page.
-Most jobs are nowhere near the printer's limit, so the cost of each embedded
-font program and the glyphs drawn from it are estimated first and cheap jobs
-are relayed untouched, which is both free and perfectly faithful. Measured on a
-Color LaserJet Pro MFP M283fdw, ordinary browser jobs estimate between 1200 and
-1900 and print, while the lowest observed failure estimates about 4000. A file
-whose cost cannot be determined is always converted, never assumed cheap.
+Outlining is not free \(em it replaces every drawn glyph with an inline path,
+which costs about a third of a second and roughly doubles the size of a real
+job \(em so skipping it for documents that certainly do not need it would be
+worth having. The obstacle is that no estimate has been shown to predict the
+printer's behaviour; see
+.B CALIBRATION
+below. Set this only if you have measured your own workload, and treat it as an
+optimisation rather than as a safety margin. A file whose cost cannot be
+determined is always converted, never assumed cheap.
 .TP
 .B \-\-max\-pdf\-bytes " \fIMB\fR"
 Rasterise rather than send an outlined PDF larger than this. Default 60.
@@ -267,7 +301,9 @@ Relay jobs untouched. Intended for comparison against a converting instance,
 to confirm that conversion is what makes the difference.
 .TP
 .BR \-p ", " \-\-port " \fIPORT\fR"
-Port to listen on. Default 631, which requires
+Port to listen on. Default 631. Under the supplied units systemd binds that
+port and passes the descriptor, so no capability is needed; started by hand it
+requires
 .B CAP_NET_BIND_SERVICE
 or an adjusted
 .IR net.ipv4.ip_unprivileged_port_start .
@@ -282,9 +318,11 @@ Log protocol detail.
 A job passes through up to three stages, stopping at the first that suffices.
 .TP
 .B Relayed untouched
-The estimated font cost is at or below
-.BR \-\-convert\-threshold .
-Most jobs land here: it costs nothing and is perfectly faithful.
+The document is not a PDF, conversion failed, the converted form still
+contained a font program, or the conversion lost a whole class of drawing
+construct and was therefore discarded. A non\-zero
+.B \-\-convert\-threshold
+also lands a cheap job here, but that is off by default.
 .TP
 .B Text outlined
 Glyphs become filled paths, so no font program reaches the printer. Text stays
@@ -302,13 +340,21 @@ the printer sees it, but the printer still applies its own halftoning and edge
 enhancement, and the job prints rather than being rejected. The job's document
 format is updated to match.
 .PP
-The converter reads three environment variables, which the service unit may
-set:
+Which raster format, colour space, resolution and PDF size limit apply is read
+from the printer's own attributes and travels with each document, because the
+converter has no network and cannot ask. The environment variables
 .BR MAX_PDF_BYTES " (default 60000000),"
-.BR RASTER_DPI " (600), and"
+.BR RASTER_DPI " (600) and"
 .B RASTER_COLORSPACE
 (19 for sRGB; 18 for 8\-bit grey, which halves the size and avoids
-composite\-black fringing on text).
+composite\-black fringing on text) supply the defaults used when
+.B defont
+is run by hand, without that header.
+.PP
+The raster tier is chosen from the size of the converted document before the
+job is sent. Nothing reacts to what the printer does with a job afterwards, so
+a document the printer rejects, or accepts and does not print, is not retried
+in another form.
 
 .SH CALIBRATION
 .B By default every PDF is converted, because predicting which ones need it
@@ -363,20 +409,52 @@ Jobs are forwarded one at a time, because affected printers report
 as false and mishandle a second job arriving mid\-transfer.
 
 .SH FILES
+Two layouts are supported. The packages install under
+.IR /usr/lib/ippfix ,
+with the command line in a conffile;
+.B install.sh
+installs under
+.I /usr/local/lib/ippfix
+instead, with the command line in the unit.
 .TP
-.I /usr/local/lib/ippfix/
-Installation directory.
-.TP
-.I /usr/local/lib/ippfix/defont
-PDF conversion helper. May be run by hand for diagnosis.
-.TP
-.I /etc/ippfix/ippfix.crt\fR, \fI/etc/ippfix/ippfix.key
-Self\-signed TLS credentials created by the installer.
+.I /etc/ippfix/ippfix.conf
+Packaged installations only. Read by the unit as an environment file;
+.B IPPFIX_ARGS
+holds the whole command line. The units are conditional on this file existing,
+so nothing runs and no port is taken until it does. An example is installed as
+.IR /usr/share/doc/ippfix/ippfix.conf.example .
 .TP
 .I /etc/systemd/system/ippfix.service
-Service unit; edit
+.B install.sh
+installations only: the service unit, symlinked from the installation
+directory. Edit
 .B ExecStart
 to configure the printers.
+.TP
+.I /usr/lib/ippfix/defont
+PDF conversion helper, run as its own confined service. May be run by hand for
+diagnosis; asked to self\-check, it reports whether the installed Ghostscript
+preserves function\-based shadings. See
+.IR DIAGNOSING.md .
+.TP
+.I /etc/ippfix/ippfix.crt\fR, \fI/etc/ippfix/ippfix.key
+Self\-signed TLS credentials, generated on first start if absent.
+.TP
+.I /var/lib/ippfix/archive
+Default location for
+.BR \-\-archive .
+Aged out after seven days by a
+.I tmpfiles.d
+rule.
+.TP
+.I /usr/share/ippfix/scripts/
+Diagnostic tools, packaged installations only:
+.IR probe\-printer.py ,
+.IR make\-reproducer.py ,
+.IR make\-html\-reproducer.py ,
+.I check\-softmask.py
+and
+.IR fidelity\-check.py .
 
 .SH EXAMPLES
 Serve one printer:
@@ -410,20 +488,28 @@ Each job is logged with its queue, operation, and the result of conversion:
 .PP
 .RS
 .nf
-upstairs   Print\-Job   HTTP 200  [outlined 393836 \-> 76789 bytes in 0.2s]
+upstairs   Print\-Job   HTTP 200  [outlined 393836 \-> 76789 bytes in 0.2s (font cost 465)]
 .fi
 .RE
 .PP
 .B relayed
-indicates the job was passed through unchanged.
+indicates the job was passed through unchanged, with the reason in brackets.
+The font cost is recorded for diagnosis; nothing is decided by it unless
+.B \-\-convert\-threshold
+is set.
 .PP
 Because an affected printer reports success whether or not it printed, the
 reliable check is the device's own total impression count, which does not
-advance for a job that died. On HP devices both that counter and the assertion
-log are readable over HTTP from
+advance for a job that died.
+.B \-\-alert\-mail
+performs that check on every job by following it to its terminal state. To do
+it by hand, read the RFC 3805 counter over SNMP before and after; on HP devices
+that counter and the interpreter's assertion log are also readable over HTTP
+from
 .I /DevMgmt/ProductUsageDyn.xml
 and
-.IR /DevMgmt/ProductLogsDyn.xml .
+.IR /DevMgmt/ProductLogsDyn.xml ,
+which are vendor paths this program neither uses nor depends on.
 
 .SH NOTES
 If clients can also reach the printers directly, they will see both those and
@@ -451,7 +537,21 @@ and restart it, or run with
 .SH SEE ALSO
 .BR gs (1),
 .BR cups (1),
+.BR snmpget (1),
 .BR systemd.service (5)
+.PP
+The distributed documentation:
+.I README.md
+for what the fault looks like and how to install,
+.I DEPLOYMENT.md
+for making clients use the proxy,
+.I DIAGNOSING.md
+for the three known firmware faults and how to reproduce them,
+.I INTERNALS.md
+for the code, and
+.I OPEN-QUESTIONS.md
+for what is unsolved. Packaged installations keep these in
+.IR /usr/share/doc/ippfix/ .
 
 .SH LICENSE
 MIT.

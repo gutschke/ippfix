@@ -1,0 +1,38 @@
+#!/bin/sh
+# Deliver alerts the proxy has queued.
+#
+# The proxy cannot send mail itself: it is the most exposed component here, and
+# delivery needs the mail group, which on a typical system also grants read
+# access to the mail system's credential file. So it writes a complete RFC 5322
+# message to a spool directory and this runs -- triggered by a path unit --
+# with just enough privilege to hand that message to sendmail(1).
+#
+# Nothing here parses the message. It was composed by the proxy and is passed
+# through verbatim.
+set -u
+spool="${IPPFIX_ALERT_SPOOL:-/var/lib/ippfix/alerts}"
+[ -d "$spool" ] || exit 0
+
+status=0
+for f in "$spool"/*.mail; do
+    [ -e "$f" ] || break                      # nothing queued
+    if [ ! -s "$f" ]; then
+        rm -f "$f"
+        continue
+    fi
+    if /usr/sbin/sendmail -t -i < "$f"; then
+        rm -f "$f"
+    else
+        # Keep it for the next run rather than losing the report, but do not
+        # retry forever: a message that cannot be delivered after a day is
+        # noise, and its content is already in the journal.
+        if [ -n "$(find "$f" -mmin +1440 2>/dev/null)" ]; then
+            echo "ippfix-sendalert: giving up on $f after a day" >&2
+            rm -f "$f"
+        else
+            echo "ippfix-sendalert: could not deliver $f; will retry" >&2
+            status=1
+        fi
+    fi
+done
+exit $status

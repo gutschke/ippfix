@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for print-failure reports queued by ippfix
+Documentation=man:ippfix(8)
+
+[Path]
+# Only complete messages: the proxy writes to *.part and renames, so a
+# half-written report is never picked up.
+PathExistsGlob=/var/lib/ippfix/alerts/*.mail
+Unit=ippfix-alert.service
+
+[Install]
+WantedBy=paths.target

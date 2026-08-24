@@ -10,3 +10,7 @@ d /run/ippfix           0755 ippfix ippfix -
 
 # Configuration, owned by the daemon so it can read its own TLS key.
 d /etc/ippfix 0750 ippfix ippfix -
+
+# Queued failure reports. The proxy writes here; ippfix-alert delivers and
+# removes them. Aged out so an undeliverable one cannot accumulate.
+d /var/lib/ippfix/alerts 0700 ippfix ippfix 7d

@@ -1,15 +1,13 @@
-# ippfix(8) - IPP proxy that repairs print jobs for printers with a limited
+# ippfix(8) - IPP proxy that repairs print jobs for printers with a limited font cache
 
 1.0, August 2026
-
-font cache.
 
 <a name="synopsis"></a>
 
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--archive DIR] [--archive-max N] [--cert FILE] [--converter PATH] [--key FILE] [--no-advertise] [--no-convert] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--archive-max-bytes MB] [--no-ipv6] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--alert-mail ADDRESS] [--alert-max-per-hour N] [--alert-timeout SEC] [--archive DIR] [--archive-max N] [--archive-max-bytes MB] [--cert FILE] [--converter PATH] [--key FILE] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--no-ipv6] [--no-advertise] [--no-convert] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -23,41 +21,44 @@ untouched.
 
 It exists because HP LaserJet Pro printers run a combined PostScript/PDF
 interpreter with a fixed per-page budget for embedded fonts and the glyphs
-drawn from them. Exceeding that budget aborts the interpreter: the printer warms
-up, reports the job `completed`, and marks nothing. Sometimes the first few
-pages emerge and the job then stops. No error reaches the client and none is
-shown on the panel. Where the device records it at all, its event log reports an
-assertion failure in `fontcache.c`.
+drawn from them. Exceeding that budget aborts the interpreter: the printer
+warms up, reports the job `completed`, and marks nothing. Sometimes the first
+few pages emerge and the job then stops. No error reaches the client and none
+is shown on the panel. Where the device records it at all, its event log
+reports an assertion failure in `fontcache.c`.
 
-The budget covers both the glyphs drawn and the embedded font programs they come
-from, and the two trade against each other. On a Color LaserJet Pro MFP M283fdw,
-one fully embedded font renders 527 distinct glyphs but not 534; add a second
-fully embedded font and the page fails at 300. A font's cost scales with how
-many glyphs its embedded program declares rather than being a flat per-font
-constant, so a heavily subsetted face is far cheaper than a complete one.
-
-Those figures come from probes embedding complete, unsubsetted fonts. Jobs from
-a browser subset aggressively and sit well below them: sampled from real Chrome
-output, two subsets declaring 93 and 668 glyphs, with 451 distinct glyphs drawn
-between them, printed without trouble. No fixed threshold is therefore safe to
-design against — whether a document crosses the line depends on its typefaces,
-how they were subsetted, and how many distinct characters appear.
+The budget covers both the glyphs drawn and the embedded font programs they
+come from, and the two trade against each other, but no rule relating the two
+has survived testing. What is established is that the font's hinting is
+causally involved — the same 900-glyph page fails with a hinted font and prints
+with the hinting bytecode removed — and that it is a property of the font
+rather than of the application, which is why printing web pages has been more
+reliable than printing PDFs. Four cost models were fitted to measured outcomes
+and every one was falsified; see [Calibration](#calibration) below.
 
 The defect appears in firmware builds years apart and is unlikely to be fixed.
 Client-side changes affect how often it is reached: Chrome 130 through 144
-embedded a separate font program for every *strike* of a typeface, including one
-per text colour, which multiplied the cost of an ordinary page. Chrome 145
-removed the colour component and normalises text size out of the key, so current
-versions embed far fewer font programs than that era did.
+embedded a separate font program for every *strike* of a typeface, including
+one per text colour, which multiplied the cost of an ordinary page. Chrome 145
+removed the colour component and normalises text size out of the key, so
+current versions embed far fewer font programs than that era did.
 
 **ippfix**
-converts glyphs to filled paths using Ghostscript's `-dNoOutputFonts` option. No
-font program reaches the printer, which makes the failure structurally
-impossible rather than merely less likely. Text remains vector, so the printer's
-own rasteriser still renders it at full device precision and its edge
+converts glyphs to filled paths using Ghostscript's `-dNoOutputFonts` option.
+No font program reaches the printer, which makes the failure structurally
+impossible rather than merely less likely. Text remains vector, so the
+printer's own rasteriser still renders it at full device precision and its edge
 enhancement still applies. Rasterising the page instead would commit its
 geometry to the device grid before the printer saw it, forfeit the printer's
 halftoning, and inflate a small job into tens of megabytes.
+
+This addresses one fault. Two others have been reproduced on the same device
+and are not fixed here: a page of vector colour glyphs is rejected with
+`document-format-error`, and a soft mask whose `/BC` backdrop array does not
+match the component count of its group's colour space is accepted, reported
+complete, and marked nowhere. Both are properties of the document that
+conversion preserves faithfully. The distributed `DIAGNOSING.md` records how to
+tell them apart.
 
 <a name="arguments"></a>
 
@@ -93,6 +94,38 @@ halftoning, and inflate a small job into tens of megabytes.
   Publish only the IPv4 address, for networks where IPv6 exists but is not
   routable.
 
+* `--alert-mail` *ADDRESS*:
+  Send mail to *ADDRESS* when a job does not print. Off unless set.
+
+  The failures this proxy exists for are silent: the printer accepts the job,
+  reports it completed, and marks nothing, so every layer above it repeats that
+  success and nobody finds out. When this is set, each print job is followed to
+  its terminal state and judged on what the printer says it marked rather than
+  on whether the request succeeded. IPP reports this itself — a job that
+  completes having marked nothing gives `job-impressions-completed` of zero —
+  so no other protocol is needed.
+
+  The report names the queue, the job, what conversion did, the sequence of
+  states the printer went through, and the document's structure: producer,
+  embedded font programs, shading and pattern types, transparency groups, soft
+  masks and a digest. It contains no text and no images from the document; the
+  aim is to make a fault reproducible, not to copy what somebody printed.
+
+  This is off by default because a printer that does not report impressions
+  honestly would report every job as lost. Delivery uses `/usr/sbin/sendmail`,
+  so a local mail transport agent is required; if it is missing or refuses, the
+  report is written to the log instead of being lost. Following a job happens
+  after the client has been answered, so it never delays one.
+
+* `--alert-max-per-hour` *N*:
+  Send at most *N* alerts an hour, default 6. Suppressed ones are logged, and
+  the count is carried into the next message, so a flood is reported as a flood
+  instead of becoming one.
+
+* `--alert-timeout` *SEC*:
+  Give up following a job after *SEC* seconds, default 600. A job still
+  unfinished then is reported as such.
+
 * `--archive` *DIR*:
   Diagnostic only. Keep a copy of every job exactly as it arrived, before
   conversion, together with a short text file recording the queue, job name,
@@ -115,18 +148,19 @@ halftoning, and inflate a small job into tens of megabytes.
 
 * `--converter` *PATH*:
   Helper that rewrites a PDF read on standard input and writes the result to
-  standard output. Default `/usr/local/lib/ippfix/defont`.
+  standard output. Defaults to `defont` alongside the program, so it is correct
+  whichever way this was installed.
 
 * `--key` *FILE*:
   TLS private key. Default `/etc/ippfix/ippfix.key`.
 
 * `--list` [*URL*]:
-  Print the queues a running instance serves and exit. Intended for configuring
-  clients by address rather than by discovery: mDNS is not available everywhere,
-  and some sites prefer printers pinned by address so that discovery cannot
-  silently point users somewhere else. Defaults to the instance on this host.
-  The same listing is served as JSON at `/queues.json` and as a table at the
-  daemon's HTTP root.
+  Print the queues a running instance serves, then stop. Intended for
+  configuring clients by address rather than by discovery: mDNS is not available
+  everywhere, and some sites prefer printers pinned by address so that discovery
+  cannot silently point users somewhere else. Defaults to the instance on this
+  host. The same listing is served as JSON at `/queues.json` and as a table at
+  the daemon's HTTP root.
 
 * `--max-connections` *N*:
   Refuse connections beyond *N* concurrent ones. Default 64. Without a bound,
@@ -145,23 +179,22 @@ halftoning, and inflate a small job into tens of megabytes.
 
 * `--convert-threshold` *N*:
   Leave a job untouched when its estimated font cost is at or below *N*.
-  Default 2500; 0 converts everything.
+  Default 0, which converts every PDF: the test is skipped entirely rather than
+  compared against zero.
 
-  Outlining is expensive. It replaces every drawn glyph with an inline path and
-  Ghostscript emits no reusable form for them, so a fifty-page document grows
-  from half a megabyte to thirty-three and takes about half a second per page.
-  Most jobs are nowhere near the printer's limit, so the cost of each embedded
-  font program and the glyphs drawn from it are estimated first and cheap jobs
-  are relayed untouched, which is both free and perfectly faithful. Measured on
-  a Color LaserJet Pro MFP M283fdw, ordinary browser jobs estimate between 1200
-  and 1900 and print, while the lowest observed failure estimates about 4000. A
-  file whose cost cannot be determined is always converted, never assumed
-  cheap.
+  Outlining is not free — it replaces every drawn glyph with an inline path,
+  which costs about a third of a second and roughly doubles the size of a real
+  job — so skipping it for documents that certainly do not need it would be
+  worth having. The obstacle is that no estimate has been shown to predict the
+  printer's behaviour; see [Calibration](#calibration) below. Set this only if
+  you have measured your own workload, and treat it as an optimisation rather
+  than as a safety margin. A file whose cost cannot be determined is always
+  converted, never assumed cheap.
 
 * `--max-pdf-bytes` *MB*:
   Rasterise rather than send an outlined PDF larger than this. Default 60.
-  Overridden by the printer's own `pdf-k-octets-supported` where it reports
-  one, so the shipped default only applies to a device that declares no limit.
+  Overridden by the printer's own `pdf-k-octets-supported` where it reports one,
+  so the shipped default only applies to a device that declares no limit.
 
 * `--all-formats`:
   Offer clients every document format the printer supports, including
@@ -195,14 +228,89 @@ halftoning, and inflate a small job into tens of megabytes.
   to confirm that conversion is what makes the difference.
 
 * `-p`, `--port` *PORT*:
-  Port to listen on. Default 631, which requires `CAP_NET_BIND_SERVICE` or an
-  adjusted `net.ipv4.ip_unprivileged_port_start`.
+  Port to listen on. Default 631. Under the supplied units systemd binds that
+  port and passes the descriptor, so no capability is needed; started by hand it
+  requires `CAP_NET_BIND_SERVICE` or an adjusted
+  `net.ipv4.ip_unprivileged_port_start`.
 
 * `--timeout` *SECONDS*:
   Time allowed for each conversion and each request to the printer. Default 300.
 
 * `-v`, `--verbose`:
   Log protocol detail.
+
+<a name="conversion"></a>
+
+# Conversion
+
+A job passes through up to three stages, stopping at the first that suffices.
+
+* **Relayed untouched**:
+  The document is not a PDF, conversion failed, the converted form still
+  contained a font program, or the conversion lost a whole class of drawing
+  construct and was therefore discarded. A non-zero `--convert-threshold` also
+  lands a cheap job here, but that is off by default.
+
+* **Text outlined**:
+  Glyphs become filled paths, so no font program reaches the printer. Text stays
+  vector, so the printer's own rasteriser still renders it at full device
+  precision.
+
+* **Rasterised**:
+  Only when the outlined form would exceed what the printer will accept as a
+  PDF. These devices advertise `pdf-k-octets-supported` of 0-75000, and
+  outlining inlines an outline at every glyph occurrence, so a long document can
+  pass that. The page is then sent as 600 dpi contone URF. Fidelity is lower,
+  because the geometry is committed to the device grid before the printer sees
+  it, but the printer still applies its own halftoning and edge enhancement, and
+  the job prints rather than being rejected. The job's document format is
+  updated to match.
+
+Which raster format, colour space, resolution and PDF size limit apply is read
+from the printer's own attributes and travels with each document, because the
+converter has no network and cannot ask. The environment variables
+`MAX_PDF_BYTES` (default 60000000), `RASTER_DPI` (600) and `RASTER_COLORSPACE`
+(19 for sRGB; 18 for 8-bit grey, which halves the size and avoids
+composite-black fringing on text) supply the defaults used when `defont` is run
+by hand, without that header.
+
+The raster tier is chosen from the size of the converted document before the
+job is sent. Nothing reacts to what the printer does with a job afterwards, so
+a document the printer rejects, or accepts and does not print, is not retried
+in another form.
+
+<a name="calibration"></a>
+
+# Calibration
+
+**By default every PDF is converted, because predicting which ones need it did
+not work.** Four models were fitted to measured outcomes and each was
+falsified: the glyph count a font declares — a font declaring 65535 glyphs
+while drawing 27 printed perfectly — the glyphs a page draws — 1264 printed
+where 700 failed — the size of the embedded font program, and the outline
+complexity of the glyphs actually used, where 519 glyphs in 47 kB failed and
+519 glyphs in 50 kB printed. Whatever the firmware counts is not visible in the
+document.
+
+Converting unconditionally costs roughly a third of a second and about double
+the file size on a real job, which is a better trade than a prediction that has
+been wrong repeatedly. A cost estimate is still computed and written to the log
+for diagnosis.
+
+`--convert-threshold` can skip conversion for jobs scoring at or below a given
+value, for a site that has measured its own workload and wants the
+optimisation. It is off by default and nothing depends on the estimate being
+accurate.
+
+To investigate a printer directly, note that a job which exceeds its limit
+marks no paper, so only the passing probes cost anything. The device's own page
+counter is the reliable signal, because an affected printer reports the job
+completed either way. The Printer MIB (RFC 3805) exposes it on any network
+printer:
+
+```
+snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.10.2.1.4.1.1
+```
 
 <a name="behaviour"></a>
 
@@ -231,17 +339,36 @@ mid-transfer.
 
 # Files
 
-* `/usr/local/lib/ippfix/`:
-  Installation directory.
+Two layouts are supported. The packages install under `/usr/lib/ippfix`, with
+the command line in a conffile; `install.sh` installs under
+`/usr/local/lib/ippfix` instead, with the command line in the unit.
 
-* `/usr/local/lib/ippfix/defont`:
-  PDF conversion helper. May be run by hand for diagnosis.
-
-* `/etc/ippfix/ippfix.crt`, `/etc/ippfix/ippfix.key`:
-  Self-signed TLS credentials created by the installer.
+* `/etc/ippfix/ippfix.conf`:
+  Packaged installations only. Read by the unit as an environment file;
+  `IPPFIX_ARGS` holds the whole command line. The units are conditional on this
+  file existing, so nothing runs and no port is taken until it does. An example
+  is installed as `/usr/share/doc/ippfix/ippfix.conf.example`.
 
 * `/etc/systemd/system/ippfix.service`:
-  Service unit; edit `ExecStart` to configure the printers.
+  `install.sh` installations only: the service unit, symlinked from the
+  installation directory. Edit `ExecStart` to configure the printers.
+
+* `/usr/lib/ippfix/defont`:
+  PDF conversion helper, run as its own confined service. May be run by hand for
+  diagnosis; asked to self-check, it reports whether the installed Ghostscript
+  preserves function-based shadings. See `DIAGNOSING.md`.
+
+* `/etc/ippfix/ippfix.crt`, `/etc/ippfix/ippfix.key`:
+  Self-signed TLS credentials, generated on first start if absent.
+
+* `/var/lib/ippfix/archive`:
+  Default location for `--archive`. Aged out after seven days by a `tmpfiles.d`
+  rule.
+
+* `/usr/share/ippfix/scripts/`:
+  Diagnostic tools, packaged installations only: `probe-printer.py`,
+  `make-reproducer.py`, `make-html-reproducer.py`, `check-softmask.py` and
+  `fidelity-check.py`.
 
 <a name="examples"></a>
 
@@ -274,18 +401,21 @@ ippfix --port 6310 --no-advertise --no-convert \
 Each job is logged with its queue, operation, and the result of conversion:
 
 ```
-upstairs   Print-Job   HTTP 200  [outlined 393836 -> 76789 bytes in 0.2s]
+upstairs   Print-Job   HTTP 200  [outlined 393836 -> 76789 bytes in 0.2s (font cost 465)]
 ```
 
-`relayed` indicates the job was passed through unchanged.
+`relayed` indicates the job was passed through unchanged, with the reason in
+brackets. The font cost is recorded for diagnosis; nothing is decided by it
+unless `--convert-threshold` is set.
 
 Because an affected printer reports success whether or not it printed, the
 reliable check is the device's own total impression count, which does not
-advance for a job that died. The Printer MIB (RFC 3805) exposes that counter on
-essentially any network printer, as `1.3.6.1.2.1.43.10.2.1.4.1.1`. Vendors
-usually expose more besides — on the printer this was developed against, an
-assertion log naming `fontcache.c` is what identified the defect — but those
-paths are vendor specific and this program neither uses nor depends on them.
+advance for a job that died. `--alert-mail` performs that check on every job by
+following it to its terminal state. To do it by hand, read the RFC 3805 counter
+over SNMP before and after; on HP devices that counter and the interpreter's
+assertion log are also readable over HTTP from
+`/DevMgmt/ProductUsageDyn.xml` and `/DevMgmt/ProductLogsDyn.xml`, which are
+vendor paths this program neither uses nor depends on.
 
 <a name="notes"></a>
 
@@ -304,7 +434,13 @@ or run with `--no-advertise`.
 
 # See Also
 
-gs(1), cups(1), systemd.service(5)
+gs(1), cups(1), snmpget(1), systemd.service(5)
+
+The distributed documentation: `README.md` for what the fault looks like and
+how to install, `DEPLOYMENT.md` for making clients use the proxy,
+`DIAGNOSING.md` for the three known firmware faults and how to reproduce them,
+`INTERNALS.md` for the code, and `OPEN-QUESTIONS.md` for what is unsolved.
+Packaged installations keep these in `/usr/share/doc/ippfix/`.
 
 <a name="license"></a>
 

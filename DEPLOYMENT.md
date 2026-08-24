@@ -4,21 +4,29 @@ Installing the daemon is the easy part. The part that causes confusion is
 making clients actually *use* it, because the printer is perfectly happy to
 keep advertising itself and users will pick whichever queue appears first.
 
-This document covers that, from the cheapest approach to the most thorough.
-Most networks want option 2 or 4.
+This document covers both, from the cheapest approach to the most thorough.
+Most networks want option 2 or 4 in Step 2.
 
 ## Contents
 
 - [The one thing that goes wrong](#the-one-thing-that-goes-wrong)
 - [Choosing an approach](#choosing-an-approach)
 - [Step 1: install the daemon](#step-1-install-the-daemon)
+  - [The packages](#the-packages)
+  - [What installing the package does](#what-installing-the-package-does)
+  - [The fallback: install.sh](#the-fallback-installsh)
+  - [If the queues never appear](#if-the-queues-never-appear)
+  - [If the host has several addresses](#if-the-host-has-several-addresses)
 - [Step 2: stop the printer competing with it](#step-2-stop-the-printer-competing-with-it)
   - [Option 1: manual client configuration](#option-1-manual-client-configuration)
   - [Option 2: turn off AirPrint on the printer](#option-2-turn-off-airprint-on-the-printer)
   - [Option 3: firewall the printer's print ports](#option-3-firewall-the-printers-print-ports)
   - [Option 4: filter at an mDNS reflector](#option-4-filter-at-an-mdns-reflector)
   - [Option 5: full network isolation](#option-5-full-network-isolation)
+- [Network topology notes](#network-topology-notes)
 - [Step 3: verify](#step-3-verify)
+- [Running it](#running-it)
+- [Keeping Ghostscript current](#keeping-ghostscript-current)
 - [Rolling back](#rolling-back)
 
 ## The one thing that goes wrong
@@ -62,13 +70,106 @@ Pick a host that can reach the printer and that clients can reach. A small
 always-on machine or container is plenty; conversion is a fraction of a second
 per document and the daemon is idle otherwise.
 
+### The packages
+
+Two Debian packages are built from this tree, and they are the recommended way
+to install it. `ippfix` is the proxy itself; `ippfix-selfbuild` is optional and
+keeps the Python virtual environment rebuilt as the system Python and its
+dependencies move, which otherwise has to be remembered by hand across a
+release upgrade.
+
+```sh
+sudo apt install build-essential debhelper devscripts
+git clone https://github.com/gutschke/ippfix.git
+cd ippfix
+dpkg-buildpackage -b -us -uc
+sudo apt install ../ippfix_1.0.0_all.deb ../ippfix-selfbuild_1.0.0_all.deb
+```
+
+The package puts the program under `/usr/lib/ippfix`, the units in
+`/usr/lib/systemd/system`, the diagnostic scripts in
+`/usr/share/ippfix/scripts`, and the manual page where `man 8 ippfix` will find
+it. The service accounts `ippfix` and `ippfix-convert` are created from
+`sysusers.d`, and `/etc/ippfix`, `/var/lib/ippfix` and `/run/ippfix` from
+`tmpfiles.d`.
+
+Configuration is not shipped, so the first step after installing is to create
+it:
+
+```sh
+sudo install -m0644 /usr/share/doc/ippfix/ippfix.conf.example /etc/ippfix/ippfix.conf
+sudoedit /etc/ippfix/ippfix.conf
+```
+
+`IPPFIX_ARGS` in that file is the whole command line. It is read by a shell, so
+a printer whose name contains a space can be quoted:
+
+```
+IPPFIX_ARGS="'Front Desk=ipp://192.0.2.10/ipp/print'"
+```
+
+Then start it:
+
+```sh
+sudo systemctl start ippfix
+systemctl status ippfix
+```
+
+Editing that conffile is the supported way to change options; it survives
+upgrades, where an edited unit file would not. To change something in the unit
+itself — the egress restrictions below, for instance — use a drop-in:
+
+```sh
+sudo systemctl edit ippfix
+```
+
+To confine the daemon's outbound traffic to the printers and the local network,
+put `IPAddressDeny=any` and a matching `IPAddressAllow=` in that drop-in. It
+ships commented out because the right values are site specific.
+
+### What installing the package does
+
+Installing does not start a proxy, because the package cannot know which
+printers exist. Both the service and its listening socket are conditional on
+`/etc/ippfix/ippfix.conf` existing, and the service additionally checks that a
+printer is named in it:
+
+- **No configuration** — the units are *skipped*, not started and not failed.
+  `systemctl status ippfix` reports `inactive`, the journal says `no printer
+  configured; edit /etc/ippfix/ippfix.conf`, and nothing restart-loops. Port
+  631 is not taken either, so an unconfigured machine can still run CUPS. (The
+  two are alternatives rather than companions once `ippfix` is configured: both
+  want port 631.)
+- **A printer configured** — the service starts on installation and restarts
+  after an upgrade, without anyone having to remember to do it.
+
+So the sequence on a new machine is: install, create the conffile, then
+`systemctl start ippfix`. From then on installs and upgrades look after
+themselves.
+
+The Python virtual environment is built in the package's `postinst` rather than
+shipped, because a virtual environment is tied to the interpreter's minor
+version. That step needs the network. If it fails, the package says so and the
+service will not start until it exists; `dpkg-reconfigure ippfix` retries, and
+`ippfix-selfbuild` retries on its own schedule.
+
+### The fallback: install.sh
+
+Where building a package is not an option, `install.sh` installs the same
+software into `/usr/local` (by default `/usr/local/lib/ippfix`; it asks). It
+builds the virtual environment, installs the man page, creates the `ippfix` and
+`ippfix-convert` accounts, generates the self-signed TLS pair, and enables the
+units.
+
 ```sh
 git clone https://github.com/gutschke/ippfix.git
 cd ippfix
 sudo ./install.sh
 ```
 
-Then set the printers in `ExecStart`:
+There is no conffile in this layout: the printers are named on the `ExecStart`
+line of the unit, which `install.sh` symlinks from its installation directory
+into `/etc/systemd/system`.
 
 ```sh
 sudoedit /usr/local/lib/ippfix/ippfix.service
@@ -76,14 +177,18 @@ sudoedit /usr/local/lib/ippfix/ippfix.service
 
 ```
 ExecStart=/usr/local/lib/ippfix/venv/bin/ippfix /usr/local/lib/ippfix/ippfix.py \
+    --converter unix:/run/ippfix/convert.sock \
     office=ipp://192.0.2.10/ipp/print
 ```
 
 ```sh
 sudo systemctl daemon-reload
 sudo systemctl start ippfix
-systemctl status ippfix
 ```
+
+Everything else in this document applies to both layouts; only the paths
+differ. Where a command below names `/usr/lib/ippfix`, use your installation
+directory instead.
 
 ### If the queues never appear
 
@@ -120,6 +225,10 @@ tell people to use it.
 - **ChromeOS:** Settings → Printing → Printers → *Add printer manually*,
   protocol IPP, queue `ipp/NAME`
 - **Linux/CUPS:** `lpadmin -p office -E -v ipp://HOST/ipp/NAME -m everywhere`
+
+`ippfix --list` prints the queues a running instance serves, which is the
+easiest way to get those URIs right. The same listing is served as JSON at
+`/queues.json` and as a table at the daemon's HTTP root.
 
 **Pros.** Nothing to change on the network or the printer. Instantly
 reversible. Works even where you control nothing but the clients. Good for
@@ -286,149 +395,6 @@ IPv6 exists but is not actually routable, `--no-ipv6` publishes IPv4 only.
 Link-local addresses are never published: they require a scope identifier that
 a DNS-SD record cannot usefully carry.
 
-## Calibrating for your printer
-
-The defaults are calibrated against **one** printer — a Color LaserJet Pro MFP
-M283fdw, which is neither new nor necessarily representative. They are honest
-measurements, not a specification, and another model will differ. This section
-exists so you can tell whether they fit yours, and change them if not.
-
-### What the numbers are, and where they came from
-
-`ippfix` estimates what a job costs the printer from two things it can read
-without rendering: **how many distinct glyphs a page draws**, and **how large
-the font programs it embeds are**.
-
-```
-cost = glyphs drawn + (embedded font bytes / 4096)
-```
-
-What a font *declares* — its `maxp.numGlyphs` — is deliberately **not** counted.
-An earlier version of this tool did count it, and testing disproved that: a
-document embedding a font declaring 65535 glyphs while drawing 27 printed
-perfectly. Meanwhile a document with a tightly subsetted font drawing 700 glyphs
-failed. Drawn glyphs dominate; the font program carries a smaller cost of its
-own, which is why two large fonts fail at 300 glyphs where one small font
-survives 523.
-
-Fitted against thirteen measured outcomes on a Color LaserJet Pro MFP M283fdw:
-
-| cost | outcome |
-|---|---|
-| 35 – 471 | printed (includes all real browser jobs) |
-| 562 | printed |
-| **586 – 1156** | **failed** |
-
-The default `--convert-threshold` is **500**, below the boundary rather than on
-it. The margin is deliberate: the limit shifts with the typeface, and the gap
-between the highest success and the lowest failure is only about four per cent.
-
-### Deciding whether it fits your printer
-
-Two symptoms, two directions:
-
-- **Jobs still vanish.** The threshold is too high for this device. Lower it, or
-  set `--convert-threshold 0` to convert everything. That is the correct setting
-  whenever the limit is unknown; it costs conversion work on every job but never
-  guesses.
-- **Jobs are being converted that print fine untouched.** The threshold is too
-  low. Raise it. The log says which happened:
-
-```
-Print-Job  [relayed (font cost 1205, under threshold)]
-Print-Job  [outlined 393836 -> 76789 bytes in 0.2s]
-```
-
-### Reading the printer's own diagnostics
-
-This deserves its own note, because it was the single most useful thing during
-development and it is not obvious.
-
-**Do not trust the print system.** An affected printer accepts the job, runs its
-warm-up, reports `job-state = completed`, and marks nothing. Every layer above
-it — IPP, CUPS, the client's print queue — faithfully reports success. The only
-honest signal is the device's own page counter.
-
-**The portable way: SNMP.** The Printer MIB (RFC 3805) is implemented by
-essentially every network printer, and the page counter is one OID:
-
-```sh
-snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.10.2.1.4.1.1   # pages printed
-snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.16.5.1.2.1.1   # panel text
-snmpwalk -v2c -c public PRINTER 1.3.6.1.2.1.43.18.1.1        # alert table
-```
-
-Read the page counter before and after a job. If it has not moved, nothing
-printed, whatever the print system claimed. On the printer used to develop this,
-that OID returned exactly the same number as the vendor's own counter, so the
-standard route loses nothing.
-
-SNMP is sometimes disabled by default on newer firmware; the embedded web
-server's networking page will have a switch.
-
-**The vendor-specific way, and why it is worth finding.** Manufacturers usually
-expose more than the standard MIB does — including, on the printer studied here,
-the interpreter's own assertion log, which is what identified the bug in the
-first place. On HP LaserJet devices this is LEDM, plain XML over HTTP with no
-authentication:
-
-```sh
-curl -s http://PRINTER/DevMgmt/DiscoveryTree.xml     # index of what exists
-curl -s http://PRINTER/DevMgmt/ProductUsageDyn.xml   # page counters
-curl -s http://PRINTER/DevMgmt/ProductLogsDyn.xml    # event and error log
-```
-
-**Those paths are HP's and nothing else's.** `ippfix` does not use them and does
-not depend on them; they are recorded here because they were decisive, and
-because the equivalent almost certainly exists under another name on your
-device. Look for an event log, a service or diagnostics page in the embedded web
-server, or a printable configuration or event-log report on the front panel.
-
-What made the difference was a log entry naming the failing component:
-
-```
-ASSERT FAILED
-Task: POSTSCRIPT
-File: fontcache.c  Line: 2494
-```
-
-Without that, the failure is indistinguishable from a network problem. With it,
-the cause is not in doubt. It is worth spending an hour finding the equivalent
-on your hardware before theorising.
-
-### Measuring your own limit
-
-The economics favour you: **a job that exceeds the budget marks no paper**, so
-only the passing probes cost a sheet.
-
-Do not trust `job-state` — an affected printer reports success whether or not it
-printed. Use the device's own page counter, as described above:
-
-```sh
-snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.10.2.1.4.1.1
-```
-
-Print documents of increasing font cost, bisect between the largest that printed
-and the smallest that did not, and set the threshold comfortably below the
-boundary. If your printer is a different make, the estimate may not model its
-limit at all — in that case use `--convert-threshold 0` and rely on conversion
-rather than prediction.
-
-### The size cap
-
-The third tier — rasterising — triggers when the outlined form would exceed what
-the printer accepts as a PDF. That ceiling comes from the printer's own
-`pdf-k-octets-supported` attribute, which this device reports as 75 MB; the
-converter uses 60 MB by default to stay clear of it. Check yours:
-
-```sh
-ipptool -tv ipp://PRINTER/ipp/print get-printer-attributes.test | grep pdf-k-octets
-```
-
-Adjust with `MAX_PDF_BYTES` in the converter's environment, alongside
-`RASTER_DPI` and `RASTER_COLORSPACE` (19 = sRGB, 18 = 8-bit grey, which halves
-the size and avoids composite-black fringing on text).
-
 ## Step 3: verify
 
 **1. The queue is visible and answers.**
@@ -466,73 +432,98 @@ declined — either the job was not a PDF, or `gs` failed. Test the converter
 directly:
 
 ```sh
-/usr/local/lib/ippfix/defont < sample.pdf > out.pdf
+/usr/lib/ippfix/defont < sample.pdf > out.pdf
 ```
 
 **5. The fix actually fixes it.** An affected printer reports success whether
-or not it printed, so `job-state` proves nothing. Use the printer's own
-impression counter, which does not advance for a job that died:
+or not it printed, so `job-state` proves nothing. Judge it on the device's own
+impression counter, which does not advance for a job that died. The portable
+way is the RFC 3805 Printer MIB over SNMP, which `probe-printer.py` reads for
+you:
 
 ```sh
-curl -s http://PRINTER/DevMgmt/ProductUsageDyn.xml | grep -o 'TotalImpressions>[0-9]*'
+python3 /usr/share/ippfix/scripts/make-reproducer.py repro.pdf
+python3 /usr/share/ippfix/scripts/probe-printer.py ipp://PROXY/ipp/NAME repro.pdf
 ```
 
-Read it before and after. On HP devices the interpreter's own assertion log is
-also readable:
-
-```sh
-curl -s http://PRINTER/DevMgmt/ProductLogsDyn.xml
-```
-
-To A/B it, run a second non-converting instance on another port and send the
-same document to both:
+Send the same document straight to the printer for comparison, or run a second,
+non-converting instance on another port:
 
 ```sh
 ippfix --port 6310 --no-advertise --no-convert ipp://PRINTER/ipp/print
 ```
 
-## What happens when the package is installed
+[DIAGNOSING.md](DIAGNOSING.md) describes what else the printer can be asked,
+including the vendor-specific log that identified the defect in the first
+place.
 
-Installing the package does not start a proxy, because the package cannot know
-which printers exist. It creates `/etc/ippfix/ippfix.conf` with no printer
-named, and the service checks that file before it runs:
+## Running it
 
-- **No printer configured** -- the unit is *skipped*, not started and not
-  failed. `systemctl status ippfix` reports `inactive`, the journal says
-  `no printer configured; edit /etc/ippfix/ippfix.conf`, and nothing
-  restart-loops. This is `ExecCondition=`, which exists precisely so that
-  "not set up yet" does not have to be reported as an error.
-- **A printer configured** -- the service starts on installation, and restarts
-  after an upgrade, without anyone having to remember to do it.
+**Reading the log.** Each job is logged with its queue, the operation, and what
+conversion did:
 
-So the sequence on a new machine is: install, edit the conffile, then
-
-```sh
-systemctl start ippfix
+```
+upstairs   Print-Job   HTTP 200  [outlined 393836 -> 76789 bytes in 0.2s (font cost 465)]
 ```
 
-and from then on installs and upgrades look after themselves.
+`relayed` in that field means the job went through untouched, with the reason
+in brackets: it was not a PDF, the converter failed, or the conversion was
+rejected because it would have changed the page. The font cost is recorded for
+diagnosis only; nothing is decided by it unless `--convert-threshold` is set,
+which it is not by default.
 
-One consequence worth knowing: the listening socket is bound as soon as the
-package is installed, before any printer is configured. Port 631 is therefore
-taken on a machine that is not yet serving anything, which matters only if you
-also intend to run CUPS there -- and CUPS and this proxy are alternatives, not
-companions.
+**When a job is lost anyway.** `--alert-mail ADDRESS` follows each job to its
+terminal state and mails a report when the printer reports success having
+marked nothing — the one failure that is otherwise invisible to everybody. It
+needs a local `sendmail`; without one the report goes to the journal. See the
+manual page for the rate limit and the timeout.
+
+**Capturing a document that failed.** The failure depends on document content,
+so the single most useful thing to have is the document itself.
+
+```
+--archive /var/lib/ippfix/archive --archive-max 50
+```
+
+Each job is saved exactly as it arrived, before conversion, with a sidecar
+noting the queue, job name, format and what conversion did. **This stores the
+documents people print.** It is off by default, the directory is 0700 and the
+files 0600 owned by the service account, and the daemon logs a warning for as
+long as it is on. Archived jobs are aged out after seven days by a `tmpfiles.d`
+rule as well as bounded by `--archive-max` and `--archive-max-bytes`, so a
+forgotten flag cannot leave documents on disk indefinitely. Treat it as a
+diagnostic that gets switched on to answer a question and switched off again.
+
+**Large jobs.** Outlining inlines a full path at every glyph occurrence, so a
+long document can grow past what the printer will accept as a PDF. When that
+happens the job is rasterised instead — lower fidelity, but it prints rather
+than being rejected. The limit comes from the printer's own
+`pdf-k-octets-supported` (the daemon uses 80% of what the device reports, and
+logs the figure at startup); `--max-pdf-bytes` supplies a limit only for a
+device that declares none. To see what yours declares:
+
+```sh
+ipptool -tv ipp://PRINTER/ipp/print get-printer-attributes.test | grep pdf-k-octets
+```
+
+The raster format, colour space and resolution are read from the printer's
+attributes as well, and travel with each document to the converter, which has
+no network of its own. `RASTER_DPI` and `RASTER_COLORSPACE` in the converter's
+environment only apply when `defont` is run by hand.
 
 ## Keeping Ghostscript current
 
 Ghostscript does the conversion, and it is the most exposed component here: it
 parses documents that arrive from the network. It needs to stay patched, which
 means it needs to keep coming from the distribution. **Do not build it from
-source or carry a private copy** -- an unpackaged Ghostscript is one that
+source or carry a private copy** — an unpackaged Ghostscript is one that
 `apt upgrade` will never fix, on exactly the component you least want to leave
 unfixed.
 
 ### The version matters, but nothing needs configuring
 
-Ghostscript 10.02.1, which Ubuntu 24.04 LTS ships and will keep shipping for its
-whole life, discards function-based shadings -- how browsers emit conic and
-repeating CSS gradients. Later releases handle them:
+Ghostscript before 10.05 discards function-based shadings — how browsers emit
+conic and repeating CSS gradients. Later releases keep them:
 
 | Ghostscript | ships in | function-based shadings |
 |---|---|---|
@@ -541,12 +532,12 @@ repeating CSS gradients. Later releases handle them:
 | 10.06.0 | Ubuntu 26.04 LTS | preserved |
 
 On an affected version nothing prints wrongly, because every conversion is
-checked before it is used and one that lost something is thrown away in favour
-of the original bytes. Those documents keep their appearance and simply forgo
-the font fix. To see which behaviour you have:
+checked before it is used and one that lost a whole class of drawing construct
+is thrown away in favour of the original bytes. Those documents keep their
+appearance and simply forgo the font fix. To see which behaviour you have:
 
 ```sh
-/usr/local/lib/ippfix/defont --selfcheck
+/usr/lib/ippfix/defont --selfcheck
 ```
 
 ### What to do about it
@@ -568,7 +559,7 @@ If those documents matter enough to act sooner, in decreasing order of sanity:
 - **Installing a newer distribution's `.deb` on 24.04.** Do not. Debian 13's
   Ghostscript wants `libjpeg.so.62` and `libpaper.so.2` where 24.04 has `.so.8`
   and `.so.1`, so it drags in a private library stack that apt will not maintain
-  -- the same problem as building it yourself, with more moving parts.
+  — the same problem as building it yourself, with more moving parts.
 
 Whichever you choose, `--selfcheck` tells you where you actually stand, and the
 output check means a wrong answer degrades to "not converted" rather than to
@@ -576,8 +567,8 @@ output check means a wrong answer degrades to "not converted" rather than to
 
 ## Rolling back
 
-Every option is reversible, and none of them modifies stored jobs or printer
-configuration beyond a single toggle:
+Every option in Step 2 is reversible, and none of them modifies stored jobs or
+printer configuration beyond a single toggle:
 
 - **Option 1:** remove the printer from the clients.
 - **Option 2:** re-enable AirPrint in the printer's web interface.
@@ -588,8 +579,12 @@ configuration beyond a single toggle:
 To remove the daemon entirely:
 
 ```sh
-sudo /usr/local/lib/ippfix/uninstall.sh
+sudo apt purge ippfix ippfix-selfbuild        # packaged install
+sudo /usr/local/lib/ippfix/uninstall.sh       # install.sh install
 ```
+
+`apt purge` removes the generated TLS credentials and `/var/lib/ippfix`, but
+leaves `/etc/ippfix/ippfix.conf`, which is yours rather than the package's.
 
 Clients will rediscover the printer directly once its advertisements return —
 though they may need the stale queue removed and re-added, since discovery

@@ -1,0 +1,36 @@
+[Unit]
+Description=Deliver print-failure reports queued by ippfix
+Documentation=man:ippfix(8)
+
+# A message that cannot be handed over leaves its file in place, and the path
+# unit is level-triggered, so without a limit a refusal becomes a spin.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/ippfix/ippfix-sendalert
+# Enough to hand a message to the mail system, and nothing else. It reads files
+# the proxy wrote and runs sendmail; it never sees a document, a network
+# connection, or the proxy's TLS key.
+User=ippfix
+Group=ippfix
+SupplementaryGroups=mail
+# The mail system's own queue, which is where sendmail(1) puts the message.
+# Without this ProtectSystem=strict makes it read-only and delivery fails.
+ReadWritePaths=/var/lib/ippfix/alerts /var/spool/dma /var/spool/mail
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+TimeoutStartSec=120

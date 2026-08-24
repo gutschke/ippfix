@@ -20,7 +20,7 @@ Two things this checks that a naive harness does not, both learned the hard way:
 Nothing here is specific to one manufacturer.
 
   python3 scripts/probe-printer.py ipp://printer.example/ipp/print doc.pdf
-  python3 scripts/probe-printer.py ipp://10.0.0.5/ipp/print probes/*.pdf --continue-on-fail
+  python3 scripts/probe-printer.py ipp://192.0.2.10/ipp/print probes/*.pdf --continue-on-fail
 
 Testing an affected printer is free: a job that provokes the fault marks no
 paper. Only a job that prints costs a sheet, which is why this stops at the

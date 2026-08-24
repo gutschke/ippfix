@@ -20,19 +20,26 @@ it was built for, and does not touch two others that were found while looking.
 
 ### The structural limit
 
-Faults 1 and 3 both end with the printer reporting success. The proxy's only
-fallback — rasterising the page — is triggered by the printer *rejecting* a
-document. **A failure that reports success is invisible to it**, and no
-improvement to the fallback changes that, because the signal never arrives.
+Faults 1 and 3 both end with the printer reporting success. Nothing in the
+proxy's handling of a job reacts to what the printer then does with it: the one
+fallback it has — rasterising — is chosen from the document's size before the
+job is sent, and never from the outcome. **A failure that reports success
+cannot change how a job is prepared**, and no improvement to the fallback
+changes that.
 
 Fault 1 is nevertheless handled, because it is prevented rather than detected:
 outlining removes the font programs, so the condition cannot arise. Fault 3
 cannot be prevented that way, because the malformed construct is in the input
 and conversion preserves it faithfully.
 
-Defending against this class means **inspecting documents before sending them**,
-which is a different mechanism from anything the proxy does today. That is the
-single largest open design question here.
+`--alert-mail` closes half of this. Each job is followed to its terminal state
+and judged on what the printer says it marked, so a silent loss is at least
+reported to a human rather than disappearing. It observes; it does not repair,
+and it arrives after the job is gone.
+
+Repairing this class means **inspecting documents before sending them**, which
+is a different mechanism from anything the proxy does today. That is the single
+largest open design question here.
 
 ## Ranked, with what it would take
 
@@ -93,6 +100,11 @@ than of the document.
   that hides real problems.
 - Fault 1 sometimes leaves an assert in the device's log and sometimes leaves
   nothing at all. Whether these are one defect at two severities is unknown.
+- Whether `--alert-mail` can deliver from inside the daemon's sandbox has not
+  been confirmed on a machine with a real MTA. `NoNewPrivileges=` and
+  `PrivateUsers=` both bear on a setgid submission binary such as Postfix's
+  `postdrop`. If delivery fails the report is written to the journal, so
+  nothing is lost silently, but the mail may simply never arrive.
 
 ## Things that are settled, so nobody re-tests them
 

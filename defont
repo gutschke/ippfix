@@ -121,7 +121,8 @@ fi
 # prints; the gradient is simply absent. That is precisely the silent wrongness
 # this proxy must never introduce, so pinning a version is not enough: the
 # result is checked instead, and any release with a comparable defect is caught
-# by the same test. Ghostscript 10.07.1 handles these correctly.
+# by the same test. Ghostscript 10.05 and later handle these correctly;
+# 10.02.1, which Ubuntu 24.04 ships, does not.
 #
 # The test is deliberately coarse -- whether a whole class of construct has
 # vanished, not whether counts match. Ghostscript legitimately merges identical
@@ -238,7 +239,7 @@ for m in $before; do
 done
 if [ -n "$lost" ]; then
   echo "defont: conversion dropped${lost}; passing input through." \
-       "Ghostscript before 10.07 discards function-based shadings, which is" \
+       "Ghostscript before 10.05 discards function-based shadings, which is" \
        "how browsers emit conic and repeating gradients; upgrading it restores" \
        "the fix for these documents." >&2
   emit "$infile" "${2:--}"

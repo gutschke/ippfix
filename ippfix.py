@@ -157,8 +157,11 @@ MAX_PAGES_INSPECTED = 2000         # beyond this, decline to estimate
 # too -- two large fonts fail at 300 drawn glyphs where one small font survives
 # 523.
 #
-# Against thirteen observed jobs this separates cleanly: everything scoring 562
-# or less printed, everything scoring 586 or more did not.
+# Against the thirteen jobs it was fitted to, this separated cleanly: everything
+# scoring 562 or less printed, everything scoring 586 or more did not. It did
+# not survive contact with real browser output -- a page drawing 1264 glyphs
+# printed where one drawing 700 failed -- so the score is kept for diagnosis
+# and nothing is decided by it unless --convert-threshold is set explicitly.
 FONT_BYTE_UNIT = 4096
 MAX_HEADERS = 100
 MAX_KEEPALIVE = 100
@@ -369,7 +372,8 @@ class Config:
         self.alert_max_watchers = 32
         self.watching = 0
         self.watch_lock = threading.Lock()
-        self.alerter = (Alerter(args.alert_mail, args.alert_max_per_hour)
+        self.alerter = (Alerter(args.alert_mail, args.alert_max_per_hour,
+                                spool=args.alert_spool)
                         if args.alert_mail else None)
         self.archive_max = args.archive_max
         self.max_connections = args.max_connections
@@ -708,11 +712,13 @@ def estimate_font_cost(data):
     sends jobs down the conversion path, which inflates them, which is how a
     long document ends up too large for the printer to accept at all.
 
-    Both terms are readable without rendering: what each font program reachable
-    from the page declares, and how many distinct glyphs are drawn. Calibrated
-    against known outcomes on a Color LaserJet Pro MFP M283fdw -- browser jobs
-    at 1205, 1291 and 1820 printed; bisection put the limit between 3558 and
-    3697.
+    Both terms are readable without rendering: how large each font program
+    reachable from the page is, and how many distinct glyphs are drawn. What a
+    font DECLARES is deliberately not counted; that model was falsified. Fitted
+    against measured outcomes on a Color LaserJet Pro MFP M283fdw, where real
+    browser jobs scored 434 to 471 and everything at 586 or above failed -- but
+    later measurements falsified this model too, so the number is a diagnostic
+    rather than a decision. See DIAGNOSING.md.
 
     Returns None when the file cannot be read confidently. The caller must
     treat that as "convert", never as "safe".
@@ -919,33 +925,36 @@ ALERT_TERMINAL = {7: 'canceled', 8: 'aborted', 9: 'completed'}
 class Alerter:
     """Rate-limited delivery of 'that job did not print' reports."""
 
-    def __init__(self, address, max_per_hour, sender=None):
+    def __init__(self, address, max_per_hour, sender=None, spool=None):
         self.address = address
         self.max_per_hour = max_per_hour
+        self.spool = spool
         self.sender = sender or f'ippfix@{socket.getfqdn()}'
         self.sent = []                      # monotonic timestamps
         self.suppressed = 0
         self.lock = threading.Lock()
 
     def _allow(self):
-        """True if we may send now. Keeps a bounded window, not a counter."""
+        """How many were suppressed before this one, or None to stay silent."""
         now = time.monotonic()
         with self.lock:
             self.sent = [t for t in self.sent if now - t < 3600]
             if len(self.sent) >= self.max_per_hour:
                 self.suppressed += 1
-                return False
+                return None
             self.sent.append(now)
             held, self.suppressed = self.suppressed, 0
-        self.held = held
-        return True
+        # Returned rather than stashed on self: several watcher threads can be
+        # in here at once, and a count attached to the wrong message is a number
+        # somebody would believe.
+        return held
 
     def send(self, subject, body):
-        if not self._allow():
+        held = self._allow()
+        if held is None:
             log.warning('alert suppressed (%d in the last hour already): %s',
                         self.max_per_hour, subject)
             return
-        held = getattr(self, 'held', 0)
         if held:
             body += (f'\n{held} further alert(s) were suppressed by the rate '
                      f'limit before this one. Raise --alert-max-per-hour, or '
@@ -960,11 +969,34 @@ class Alerter:
             f'Message-ID: {email.utils.make_msgid(domain=host)}\n'
             f'Auto-Submitted: auto-generated\n'
             f'\n{body}')
+        raw = message.encode('utf-8', 'replace')
+
+        # Handing the message to a spool directory rather than to sendmail(1).
+        # This daemon is the most exposed thing here, and delivery needs the
+        # mail group -- which would also grant it the mail system's credential
+        # file. A separate unit picks messages up, exactly as document
+        # conversion is a separate unit for the same reason.
+        if self.spool:
+            try:
+                os.makedirs(self.spool, mode=0o700, exist_ok=True)
+                path = os.path.join(
+                    self.spool, f'{int(time.time())}-{os.getpid()}-{id(raw):x}.mail')
+                fd = os.open(path + '.part',
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, 'wb') as fh:
+                    fh.write(raw)
+                os.rename(path + '.part', path)   # appears complete or not at all
+                log.info('alert queued for %s: %s', to, subject)
+                return
+            except OSError as exc:
+                log.error('could not queue the alert (%s)', exc)
+
+        # No spool: running by hand, or an install that has no helper. Try to
+        # deliver directly, which works wherever this is not confined.
         try:
             proc = subprocess.run(
                 ['/usr/sbin/sendmail', '-f', self.sender, '-t', '-i'],
-                input=message.encode('utf-8', 'replace'),
-                capture_output=True, timeout=60)
+                input=raw, capture_output=True, timeout=60)
             if proc.returncode == 0:
                 log.info('alert sent to %s: %s', to, subject)
                 return
@@ -2075,6 +2107,12 @@ def build_parser():
                              '6). Suppressed ones are logged and counted in the '
                              'next message, so a flood is reported as a flood '
                              'rather than becoming one.')
+    parser.add_argument('--alert-spool', metavar='DIR',
+                        default='/var/lib/ippfix/alerts',
+                        help='hand alerts to this directory instead of running '
+                             'sendmail, so the daemon needs no mail privileges; '
+                             'ippfix-alert.path delivers them. Empty string to '
+                             'send directly.')
     parser.add_argument('--alert-timeout', type=int, default=600, metavar='SEC',
                         help='how long to follow a job before giving up on it '
                              '(default 600)')
