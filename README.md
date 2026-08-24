@@ -147,12 +147,25 @@ at all. With `systemd-resolved` that means setting `MulticastDNS=no` in
 A lost job reports success, so nothing complains. `--alert-mail` closes that
 gap: each print job is followed to its terminal state and judged on what the
 printer says it marked, and a job that completes having marked nothing produces
-a mailed report naming the queue, the job, what conversion did, and the
-document's structure — no text and no images from the document itself.
+a mailed report naming the queue, the job, what conversion did, the document's
+structure, and what the printer said about itself at the time — an empty
+cartridge prints nothing and blames nobody, and that is worth ruling out before
+blaming firmware.
 
 ```
 IPPFIX_ARGS="--alert-mail admin@ops.example office=ipp://192.0.2.10/ipp/print"
 ```
+
+With `--archive` also on, the report **carries the documents themselves**: the
+job as the client sent it, and the job as the proxy handed it to the printer.
+Those are the two things that make a fault reproducible, and they are not the
+same document — a fault that survives conversion is a different bug from one
+conversion introduced. Without `--archive` the report describes the document
+but cannot attach it, because no copy was kept.
+
+That also means a report can carry something somebody printed. Send it
+somewhere that reflects how sensitive the printing is, and see
+`--alert-max-attachment` for the size bound.
 
 It is off unless an address is set, because a printer that does not report
 impressions honestly would report every job as lost. Delivery uses the local

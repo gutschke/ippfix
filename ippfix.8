@@ -8,6 +8,7 @@ cache.
 [\fB\-\-advertise\-hostname\fR \fINAME\fR]
 [\fB\-\-also\-advertise\fR \fIADDRESS\fR]
 [\fB\-\-alert\-mail\fR \fIADDRESS\fR]
+[\fB\-\-alert\-max\-attachment\fR \fIMB\fR]
 [\fB\-\-alert\-max\-per\-hour\fR \fIN\fR]
 [\fB\-\-alert\-spool\fR \fIDIR\fR]
 [\fB\-\-alert\-timeout\fR \fISEC\fR]
@@ -219,6 +220,27 @@ by hand or outside the supplied units.
 Give up following a job after
 .I SEC
 seconds, default 600. A job still unfinished then is reported as such.
+.TP
+.B \-\-alert\-max\-attachment " \fIMB\fR"
+Attach at most
+.I MB
+megabytes of documents to a report, default 8.
+.IP
+A report carries the two documents that matter, and they are not the same one:
+the job as the client sent it, which requires
+.BR \-\-archive ,
+and the job as this proxy handed it to the printer. A fault that survives
+conversion is a different bug from one conversion introduced, and only having
+both tells them apart. Attachments are sent as they are so they can be fed
+straight to the tools this page names; a document that would not otherwise fit
+is compressed, and one that still does not fit is named but not attached.
+.I 0
+attaches nothing, which leaves the report itself \- states, timings and
+structure \- intact.
+.IP
+Note what this means: a report can carry a document somebody printed. That is
+the point of it, but it is also mail. Send it somewhere that reflects how
+sensitive the printing is.
 .TP
 .B \-\-archive " \fIDIR\fR"
 Diagnostic only. Keep a copy of every job exactly as it arrived, before

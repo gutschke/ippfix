@@ -1,3 +1,18 @@
+ippfix (1.0.1) unstable; urgency=medium
+
+  * Reports about a job that did not print now carry what is needed to
+    reproduce it: the job as the client sent it, when --archive is on, and the
+    job as this proxy handed it to the printer. --alert-max-attachment bounds
+    what a report may carry.
+  * Reports also record what the printer said about itself at the time. An
+    empty cartridge prints nothing and blames nobody, and that is worth ruling
+    out before blaming firmware.
+  * DNS-SD publishes the advertised address rather than a .local name, so
+    printing no longer depends on multicast DNS reaching this host every time.
+    --advertise-hostname restores a name where one is wanted.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Mon, 24 Aug 2026 07:46:30 -0700
+
 ippfix (1.0.0) unstable; urgency=medium
 
   * Initial packaging.

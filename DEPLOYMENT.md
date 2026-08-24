@@ -474,9 +474,16 @@ which it is not by default.
 
 **When a job is lost anyway.** `--alert-mail ADDRESS` follows each job to its
 terminal state and mails a report when the printer reports success having
-marked nothing — the one failure that is otherwise invisible to everybody. It
-needs a local `sendmail`; without one the report goes to the journal. See the
-manual page for the rate limit and the timeout.
+marked nothing — the one failure that is otherwise invisible to everybody. The
+report carries the job's state history, the document's structure, and what the
+printer said about itself at the time. It needs a local `sendmail`; without one
+the report goes to the journal. See the manual page for the rate limit and the
+timeout.
+
+The report's `From:` is the address it is addressed to. That address was
+configured to receive these, so it is known to route — where `ippfix@` plus
+whatever the host calls itself often does not, and a bounce that goes nowhere
+is a second thing failing silently.
 
 **Capturing a document that failed.** The failure depends on document content,
 so the single most useful thing to have is the document itself.
@@ -493,6 +500,11 @@ long as it is on. Archived jobs are aged out after seven days by a `tmpfiles.d`
 rule as well as bounded by `--archive-max` and `--archive-max-bytes`, so a
 forgotten flag cannot leave documents on disk indefinitely. Treat it as a
 diagnostic that gets switched on to answer a question and switched off again.
+
+With `--alert-mail` also set, the archived copy is what makes a report
+reproducible: it is attached, alongside the version the proxy actually sent, so
+whoever reads the report has both without going to the server. `0` for
+`--alert-max-attachment` keeps the reports and drops the documents.
 
 **Large jobs.** Outlining inlines a full path at every glyph occurrence, so a
 long document can grow past what the printer will accept as a PDF. When that

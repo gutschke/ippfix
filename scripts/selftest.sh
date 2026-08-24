@@ -108,7 +108,7 @@ cfg = ippfix.Config(args, [ippfix.parse_queue('x=ipp://printer.example/ipp/print
 for attr in ('port', 'advertise', 'cert', 'key', 'convert', 'converter',
              'timeout', 'archive', 'archive_max', 'max_connections',
              'idle_timeout', 'require_tls', 'extra_addresses',
-             'advertise_hostname'):
+             'advertise_hostname', 'alert_max_attachment'):
     assert hasattr(cfg, attr), attr
 PY2
 
@@ -441,6 +441,76 @@ if command -v systemd-analyze >/dev/null 2>&1; then
 else
   echo '  skip  systemd units (systemd-analyze not available)'
 fi
+
+echo 'reporting'
+python3 - <<'PY2' && ok 'a report carries the documents needed to reproduce it' || bad 'report attachments'
+import os, sys, tempfile
+sys.path.insert(0, '.')
+import ippfix
+
+d = tempfile.mkdtemp()
+cfg = object.__new__(ippfix.Config)
+cfg.archive = d
+arrived = b'%PDF-1.4\n' + b'A' * 4000
+sent = b'%PDF-1.4\n' + b'B' * 6000
+path = os.path.join(d, '20260824-120000-q-doc.pdf')
+open(path, 'wb').write(arrived)
+
+# Both documents matter and they are not the same one: a fault that survives
+# conversion is a different bug from one conversion introduced.
+parts, lines = ippfix.gather_evidence(cfg, path, sent, 'outlined', 1 << 20)
+assert len(parts) == 2, parts
+assert parts[0][2] == arrived and parts[1][2] == sent
+assert all(t == 'application/pdf' for _n, t, _b in parts), parts
+
+# Unchanged jobs must not be attached twice under two names.
+parts, _ = ippfix.gather_evidence(cfg, path, arrived, '', 1 << 20)
+assert len(parts) == 1, parts
+
+# Too large to send: compressed to fit rather than dropped...
+parts, lines = ippfix.gather_evidence(cfg, path, sent, '', 3000)
+assert len(parts) == 2 and all(n.endswith('.gz') for n, _t, _b in parts), parts
+# ...and named rather than silently missing when even that will not fit.
+parts, lines = ippfix.gather_evidence(cfg, path, sent, '', 0)
+assert parts == [], parts
+assert any('NOT attached' in x for x in lines), lines
+
+# Without an archive there is no document as the client sent it, and the
+# report has to say so rather than implying the attachment is the original.
+cfg2 = object.__new__(ippfix.Config)
+cfg2.archive = None
+parts, lines = ippfix.gather_evidence(cfg2, None, sent, '', 1 << 20)
+assert len(parts) == 1 and 'given-to-printer' in parts[0][0], parts
+assert any('--archive is off' in x for x in lines), lines
+PY2
+
+python3 - <<'PY2' && ok 'alerts are well-formed mail with attachments' || bad 'alert MIME'
+import email, email.policy, sys, subprocess
+sys.path.insert(0, '.')
+import ippfix
+
+captured = []
+class Done:
+    returncode = 0
+    stderr = b''
+subprocess.run = lambda cmd, input=None, **kw: (captured.append((cmd, input)), Done())[1]
+
+a = ippfix.Alerter('someone@example.com', 6)
+a.send('subject', 'body\n', [('doc.pdf', 'application/pdf', b'%PDF-1.4\nx')])
+cmd, raw = captured[0]
+# Envelope sender must match the header, or strict receivers refuse it, and
+# both are the recipient: that address is known to route, where ippfix@ plus
+# whatever this host calls itself frequently does not.
+assert cmd[:3] == ['/usr/sbin/sendmail', '-f', 'someone@example.com'], cmd
+msg = email.message_from_bytes(raw, policy=email.policy.default)
+assert msg.is_multipart(), 'attachments must not collapse the message'
+kids = list(msg.iter_parts())
+assert kids[0].get_content().startswith('body'), kids[0].get_content()
+assert kids[1].get_filename() == 'doc.pdf'
+assert kids[1].get_content() == b'%PDF-1.4\nx'
+assert msg['From'] == 'ippfix <someone@example.com>', msg['From']
+assert msg['To'] == 'someone@example.com', msg['To']
+PY2
 
 echo 'documentation'
 check 'man page renders without warnings' \

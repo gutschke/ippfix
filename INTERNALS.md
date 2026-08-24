@@ -191,8 +191,22 @@ having marked pages is not reported at all.
 `describe_document()` builds the structural summary that goes in the report:
 producer, embedded font programs, shading/pattern/function types, transparency
 groups, soft masks, images, a digest. **No text and no images from the
-document.** The report exists to make a fault reproducible, not to copy what
-somebody printed; keep it that way if you extend it.
+document.** `printer_snapshot()` adds what the printer says about itself right
+then — model, firmware, state reasons, marker levels — which is how the
+alternative explanations get ruled out.
+
+`gather_evidence()` attaches the documents, and only when `--archive` is on is
+there an original to attach. It attaches two when they differ: the job as the
+client sent it, read back from the archive, and the job as the proxy handed it
+to the printer. Attachments go out raw so they can be fed straight to the tools
+the report names; compression is a fallback used to make something fit, not a
+default, and a document that still will not fit is named rather than silently
+missing. `--alert-max-attachment` is the bound.
+
+The summary stays free of text and images regardless: it is the part that is
+always sent. The attachments are the part that is opt-in, gated on a flag whose
+whole documentation says it stores what people print. Keep that split if you
+extend either.
 
 Delivery is `/usr/sbin/sendmail -t`. If that fails the body is written to the
 log rather than dropped.

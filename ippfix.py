@@ -53,7 +53,9 @@ colour modes and live supply and error state are always exactly right and
 there is nothing to maintain by hand as firmware changes.
 """
 import argparse
+import email.message
 import email.utils
+import gzip
 import hashlib
 import http.client
 import json
@@ -370,6 +372,7 @@ class Config:
         # given: on a printer that does not report impressions honestly this
         # would report every job as lost.
         self.alert_timeout = args.alert_timeout
+        self.alert_max_attachment = args.alert_max_attachment * 1024 * 1024
         self.alert_max_watchers = 32
         self.watching = 0
         self.watch_lock = threading.Lock()
@@ -863,9 +866,12 @@ def archive_document(cfg, queue, job_name, fmt, data, note):
     the document that provoked it there is very little to go on.
 
     Turn it off again once the question is answered.
+
+    Returns the path written, so that a job which then fails to print can be
+    reported with the document that provoked it attached.
     """
     if not cfg.archive:
-        return
+        return None
     try:
         os.makedirs(cfg.archive, mode=0o700, exist_ok=True)
         stamp = time.strftime('%Y%m%d-%H%M%S')
@@ -890,8 +896,10 @@ def archive_document(cfg, queue, job_name, fmt, data, note):
                          f'bytes: {len(data)}\nconversion: {note}\n')
         prune_archive(cfg)
         log.debug('archived %s', path)
+        return path
     except OSError as exc:
         log.warning('could not archive job: %s', exc)
+        return None
 
 
 def prune_archive(cfg):
@@ -958,10 +966,16 @@ class Alerter:
     """Rate-limited delivery of 'that job did not print' reports."""
 
     def __init__(self, address, max_per_hour, sender=None, spool=None):
-        self.address = address
+        host = socket.getfqdn()
+        self.address = address if '@' in address else f'{address}@{host}'
         self.max_per_hour = max_per_hour
         self.spool = spool
-        self.sender = sender or f'ippfix@{socket.getfqdn()}'
+        # From: is the recipient. An address that was configured to receive
+        # these is known to route and known to be deliverable, which is more
+        # than can be said for ippfix@ plus whatever this host calls itself --
+        # a name that is frequently internal, and which turns a bounce or a
+        # reply into a second thing that goes missing silently.
+        self.sender = sender or self.address
         self.sent = []                      # monotonic timestamps
         self.suppressed = 0
         self.lock = threading.Lock()
@@ -981,7 +995,7 @@ class Alerter:
         # somebody would believe.
         return held
 
-    def send(self, subject, body):
+    def send(self, subject, body, attachments=()):
         held = self._allow()
         if held is None:
             log.warning('alert suppressed (%d in the last hour already): %s',
@@ -992,16 +1006,21 @@ class Alerter:
                      f'limit before this one. Raise --alert-max-per-hour, or '
                      f'treat the rate itself as the finding.\n')
         host = socket.getfqdn()
-        to = self.address if '@' in self.address else f'{self.address}@{host}'
-        message = (
-            f'From: ippfix <{self.sender}>\n'
-            f'To: {to}\n'
-            f'Subject: {subject}\n'
-            f'Date: {email.utils.formatdate(localtime=True)}\n'
-            f'Message-ID: {email.utils.make_msgid(domain=host)}\n'
-            f'Auto-Submitted: auto-generated\n'
-            f'\n{body}')
-        raw = message.encode('utf-8', 'replace')
+        to = self.address
+        message = email.message.EmailMessage()
+        message['From'] = f'ippfix <{self.sender}>'
+        message['To'] = to
+        message['Subject'] = subject
+        message['Date'] = email.utils.formatdate(localtime=True)
+        message['Message-ID'] = email.utils.make_msgid(domain=host)
+        message['Auto-Submitted'] = 'auto-generated'
+        message.set_content(body)
+        for name, mimetype, payload in attachments:
+            maintype, _, subtype = mimetype.partition('/')
+            message.add_attachment(payload, maintype=maintype,
+                                   subtype=subtype or 'octet-stream',
+                                   filename=name)
+        raw = message.as_bytes()
 
         # Handing the message to a spool directory rather than to sendmail(1).
         # This daemon is the most exposed thing here, and delivery needs the
@@ -1089,7 +1108,131 @@ def describe_document(data, fmt):
     return out
 
 
-def watch_job(cfg, queue, job_id, jobname, fmt, data, note):
+# RFC 8011 printer-state. Three numbers nobody remembers, in a report meant to
+# be read once, quickly, by somebody who has just been told printing is broken.
+PRINTER_STATES = {3: 'idle', 4: 'processing', 5: 'stopped'}
+
+PRINTER_FACTS = (
+    'printer-make-and-model', 'printer-firmware-string-version',
+    'printer-state', 'printer-state-reasons', 'printer-state-message',
+    'printer-up-time', 'printer-alert', 'printer-alert-description',
+    'marker-names', 'marker-levels', 'marker-types',
+)
+
+
+def printer_snapshot(queue, timeout=20):
+    """What the printer says about itself, right after a job went wrong.
+
+    Worth having in the report because several of these are alternative
+    explanations for a page that came out blank -- a cartridge at zero prints
+    nothing and blames nobody -- and because firmware version is the first
+    thing anyone asks when a fault is model specific.
+    """
+    try:
+        req = ipp.new_request(0x000B, 3, queue.upstream_uri())
+        req.operation().replace('requested-attributes', ipp.TAG_KEYWORD,
+                                list(PRINTER_FACTS))
+        status, raw = upstream_ipp(queue, ipp.serialize(req), timeout)
+        if status != 200:
+            raise OSError(f'HTTP {status}')
+        group = ipp.parse(raw).group(ipp.PRINTER_ATTRS)
+        if group is None:
+            raise ValueError('no printer attributes')
+    except Exception as exc:
+        return [f'(the printer did not answer: {exc})']
+
+    out = []
+    for name in PRINTER_FACTS:
+        values = group.get(name)
+        if not values:
+            continue
+        shown = []
+        for v in values:
+            if len(v) == 4 and name.endswith(('-state', '-levels', '-time')):
+                n = struct.unpack('>i', v)[0]
+                shown.append(f'{n} ({PRINTER_STATES[n]})'
+                             if name == 'printer-state' and n in PRINTER_STATES
+                             else str(n))
+            else:
+                shown.append(v.decode('utf-8', 'replace')[:120])
+        text = ', '.join(x for x in shown if x)
+        if text:
+            out.append(f'{name}: {text}')
+    return out or ['(the printer answered, but said nothing useful)']
+
+
+def gather_evidence(cfg, archived, data, note, budget):
+    """Attach what somebody would need to reproduce this, within a size limit.
+
+    Two documents matter and they are not the same one: what the client sent,
+    and what this proxy handed the printer. A fault that survives conversion is
+    a different bug from one that conversion introduced, and only having both
+    tells them apart. The original is only available when --archive is on;
+    without it the report can describe the document but not hand it over.
+
+    Attachments go out raw so they can be fed straight back to the tools the
+    report names. Compression is a fallback used to make something fit, not a
+    default: a gzipped PDF is one more step between a report and an answer.
+    """
+    def attach(name, payload):
+        nonlocal budget
+        if len(payload) <= budget:
+            budget -= len(payload)
+            kind = 'application/pdf' if payload.startswith(b'%PDF-') \
+                else 'application/octet-stream'
+            return (name, kind, payload), f'{name} ({len(payload):,} bytes)'
+        squeezed = gzip.compress(payload, 6)
+        if len(squeezed) <= budget:
+            budget -= len(squeezed)
+            return ((name + '.gz', 'application/gzip', squeezed),
+                    f'{name}.gz ({len(squeezed):,} bytes, '
+                    f'{len(payload):,} uncompressed)')
+        return None, (f'{name} NOT attached: {len(payload):,} bytes exceeds '
+                      f'--alert-max-attachment')
+
+    original = None
+    if archived:
+        try:
+            with open(archived, 'rb') as fh:
+                original = fh.read()
+        except OSError as exc:
+            log.warning('could not read %s back for the report: %s',
+                        archived, exc)
+
+    stem = os.path.basename(archived) if archived else 'document'
+    stem = re.sub(r'\.(pdf|bin)$', '', stem)
+    parts, lines = [], []
+    if original is None:
+        lines.append('  nothing from the client: '
+                     + ('--archive is off, so the document as it arrived was '
+                        'not kept' if not cfg.archive else
+                        'the archived copy could not be read back'))
+    elif original == data:
+        part, said = attach(f'{stem}.pdf' if original.startswith(b'%PDF-')
+                            else f'{stem}.bin', original)
+        lines.append('  ' + said + '  -- sent to the printer unchanged')
+        if part:
+            parts.append(part)
+    else:
+        part, said = attach(f'{stem}-as-sent-by-client.pdf'
+                            if original.startswith(b'%PDF-')
+                            else f'{stem}-as-sent-by-client.bin', original)
+        lines.append('  ' + said + '  -- what the client sent')
+        if part:
+            parts.append(part)
+
+    if original is None or original != data:
+        ext = 'pdf' if data.startswith(b'%PDF-') else 'bin'
+        part, said = attach(f'{stem}-as-given-to-printer.{ext}', data)
+        lines.append('  ' + said + '  -- what this proxy handed the printer'
+                     + (f' ({note})' if note else ''))
+        if part:
+            parts.append(part)
+    return parts, lines
+
+
+def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
+              archived=None):
     """Follow one job to its end and report if the printer marked nothing."""
     deadline = time.monotonic() + cfg.alert_timeout
     state = impressions = None
@@ -1166,17 +1309,23 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note):
              '', 'What the printer said, in order:']
     lines += [f'  {st} impressions={im} reasons={rs or "none"}'
               for st, im, rs in history]
-    lines += ['', 'The document, structurally:']
+    lines += ['', 'The document this proxy gave the printer, structurally:']
     lines += [f'  {x}' for x in describe_document(data, fmt)]
+    lines += ['', 'The printer, asked just now:']
+    lines += [f'  {x}' for x in printer_snapshot(queue)]
+
+    parts, said = gather_evidence(cfg, archived, data, note,
+                                  cfg.alert_max_attachment)
+    lines += ['', 'Attached:'] + said
     lines += ['', 'To investigate:', '']
     if verdict == 'LOST SILENTLY':
         lines += [
             '  A job that the printer says succeeded but did not print is the',
             '  whole point of this proxy, so this is worth chasing.',
             '',
-            '  1. If --archive was on, the document is in the archive directory',
-            '     under this job name. That copy is the single most useful',
-            '     thing to keep; everything else can be derived from it.',
+            '  1. Save the attachment. It is the document that provoked this,',
+            '     and it is the one thing here that cannot be reconstructed',
+            '     afterwards; everything else can be derived from it.',
             '  2. Check it for a malformed soft mask, a known cause that',
             '     conversion cannot repair:',
             '         python3 scripts/check-softmask.py FILE.pdf',
@@ -1184,18 +1333,24 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note):
             '         python3 scripts/probe-printer.py ipp://PRINTER/ipp/print FILE.pdf',
             '     If it fails both ways, conversion is not the answer for it.',
             '  4. See OPEN-QUESTIONS.md for the faults already known.']
+        if archived:
+            lines += ['',
+                      f'  The same copy is on the server at {archived}, next to',
+                      '  a .txt file recording the queue, job name and format.']
     else:
         lines += ['  See DIAGNOSING.md, and keep the document if you can.']
     if not cfg.archive:
         lines += ['',
-                  '  --archive is off, so no copy of this document was kept.',
-                  '  Turning it on captures the next one -- but it stores what',
-                  '  people print, so turn it off again afterwards.']
+                  '  --archive is off, so the document the client sent could',
+                  '  not be attached. Turning it on captures the next one --',
+                  '  but it stores what people print, so turn it off again',
+                  '  afterwards.']
     cfg.alerter.send(f'ippfix: job {verdict.lower()} on {queue.name}',
-                     '\n'.join(lines) + '\n')
+                     '\n'.join(lines) + '\n', parts)
 
 
-def maybe_watch(cfg, queue, reply, msg, fmt, data, note):
+def maybe_watch(cfg, queue, reply, msg, fmt, data, note,
+                archived=None):
     """Start following a print job, if alerting is configured."""
     if not cfg.alerter:
         return
@@ -1218,7 +1373,8 @@ def maybe_watch(cfg, queue, reply, msg, fmt, data, note):
 
     def run():
         try:
-            watch_job(cfg, queue, job_id, jobname, fmt, data, note)
+            watch_job(cfg, queue, job_id, jobname, fmt, data, note,
+                      archived)
         except Exception as exc:
             log.error('while following job %s: %s', job_id, exc)
         finally:
@@ -1843,6 +1999,7 @@ class Handler(socketserver.BaseRequestHandler):
             return
         note = ''
         fmt = None
+        archived = None
 
         if msg.code in (OP_PRINT_JOB, OP_SEND_DOCUMENT) and msg.data:
             group = msg.operation()
@@ -1868,9 +2025,9 @@ class Handler(socketserver.BaseRequestHandler):
                 respond(wfile, '400 Bad Request', 'text/plain',
                         b'document could not be converted\n')
                 return
-            archive_document(cfg, queue,
-                             group.get_str('job-name') if group else None,
-                             fmt, original, note)
+            archived = archive_document(
+                cfg, queue, group.get_str('job-name') if group else None,
+                fmt, original, note)
             rewrite_request(queue, msg)
             payload = ipp.serialize(msg)
             if not queue.lock.acquire(timeout=cfg.timeout):
@@ -1919,7 +2076,7 @@ class Handler(socketserver.BaseRequestHandler):
         if msg.code in (0x0002, 0x0006) and status == 200 and cfg.alerter:
             try:
                 maybe_watch(cfg, queue, ipp.parse(raw), msg, fmt,
-                            msg.data or b'', note)
+                            msg.data or b'', note, archived)
             except Exception as exc:
                 log.error('could not start following the job: %s', exc)
 
@@ -2156,6 +2313,13 @@ def build_parser():
     parser.add_argument('--alert-timeout', type=int, default=600, metavar='SEC',
                         help='how long to follow a job before giving up on it '
                              '(default 600)')
+    parser.add_argument('--alert-max-attachment', type=int, default=8,
+                        metavar='MB',
+                        help='attach at most MB megabytes of documents to a '
+                             'report (default: 8). Attachments are the job as '
+                             'the client sent it, which requires --archive, and '
+                             'the job as this proxy handed it to the printer. 0 '
+                             'attaches nothing.')
     parser.add_argument('--no-convert', action='store_true',
                         help='relay jobs untouched, for comparison')
     parser.add_argument('--archive', metavar='DIR', default=None,

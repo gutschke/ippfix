@@ -330,7 +330,14 @@ format and what conversion did.
 state and mails a report when the printer marked nothing, including the
 document's structure — producer, embedded font programs, shading and pattern
 types, transparency groups, soft masks, a digest — without copying any of its
-content.
+content, plus what the printer said about itself at the time.
+
+The two flags are worth more together than apart. With both on, a report about
+a lost job arrives with the document that provoked it attached, and with the
+version the proxy actually sent alongside it — which is the difference between
+knowing a job was lost and being able to reproduce it. Without `--archive` the
+report can describe the document but not hand it over, and by the time anyone
+reads it the job is gone.
 
 With a job in hand, the questions worth answering are:
 

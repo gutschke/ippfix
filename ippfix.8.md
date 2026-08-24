@@ -7,7 +7,7 @@
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--advertise-hostname NAME] [--also-advertise ADDRESS] [--alert-mail ADDRESS] [--alert-max-per-hour N] [--alert-timeout SEC] [--archive DIR] [--archive-max N] [--archive-max-bytes MB] [--cert FILE] [--converter PATH] [--key FILE] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--no-ipv6] [--no-advertise] [--no-convert] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--advertise-hostname NAME] [--also-advertise ADDRESS] [--alert-mail ADDRESS] [--alert-max-attachment MB] [--alert-max-per-hour N] [--alert-timeout SEC] [--archive DIR] [--archive-max N] [--archive-max-bytes MB] [--cert FILE] [--converter PATH] [--key FILE] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--no-ipv6] [--no-advertise] [--no-convert] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -137,6 +137,23 @@ tell them apart.
   so a local mail transport agent is required; if it is missing or refuses, the
   report is written to the log instead of being lost. Following a job happens
   after the client has been answered, so it never delays one.
+
+* `--alert-max-attachment` *MB*:
+  Attach at most *MB* megabytes of documents to a report, default 8.
+
+  A report carries the two documents that matter, and they are not the same
+  one: the job as the client sent it, which requires `--archive`, and the job
+  as this proxy handed it to the printer. A fault that survives conversion is a
+  different bug from one conversion introduced, and only having both tells them
+  apart. Attachments are sent as they are so they can be fed straight to the
+  tools this page names; a document that would not otherwise fit is compressed,
+  and one that still does not fit is named but not attached. `0` attaches
+  nothing, which leaves the report itself -- states, timings and structure --
+  intact.
+
+  Note what this means: a report can carry a document somebody printed. That is
+  the point of it, but it is also mail. Send it somewhere that reflects how
+  sensitive the printing is.
 
 * `--alert-max-per-hour` *N*:
   Send at most *N* alerts an hour, default 6. Suppressed ones are logged, and
