@@ -66,6 +66,18 @@ printer's own halftoning, and inflates a small job into tens of megabytes.
 In practice the converted files are usually *smaller* than the originals,
 because a subsetted font program is bulkier than the outlines actually used.
 
+## Reproducing and investigating
+
+A reproducer, what is actually known about the cause, and how to gather
+evidence about the parts that are not: **[DIAGNOSING.md](DIAGNOSING.md)**.
+
+The short version is that the font's hinting is causally involved — the same
+900-glyph page fails with a hinted font and prints with the hinting removed —
+and that it is a property of the font rather than of the application, which is
+why printing web pages has been more reliable than printing PDFs. No formula
+predicting which documents fail has survived testing, which is why this proxy
+converts everything rather than guessing.
+
 ## Capabilities
 
 - **Driverless.** Clients see a standard IPP Everywhere / AirPrint printer.

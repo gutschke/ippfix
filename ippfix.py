@@ -14,20 +14,20 @@ none appears on the panel. Where a device records it at all, it shows up in
     Task: POSTSCRIPT
     File: fontcache.c  Line: 2494
 
-The budget is measured per page, and what it counts is the glyphs a page
-draws plus the size of the font programs it embeds. What a font *declares* --
-its maxp.numGlyphs -- turns out not to matter: a font declaring 65535 glyphs
-while drawing 27 printed without trouble.
+What makes a page too expensive is not reliably predictable from outside.
+Four models were fitted and each falsified by measurement: the glyph count a
+font declares (a font declaring 65535 while drawing 27 printed), the glyphs a
+page draws (1264 printed where 700 failed), the size of the embedded font
+program, and the outline complexity of the glyphs used (519 glyphs in 47 kB
+failed where 519 in 50 kB printed). Whatever the firmware counts is not
+apparent in the file.
 
-Fitting every measured outcome gives cost = glyphs drawn + (font bytes /
-4096). On a Color LaserJet Pro MFP M283fdw that separates thirteen observed
-jobs cleanly: everything scoring 562 or below printed, everything scoring 586
-or above did not. Real browser jobs score between 434 and 471, so they are
-relayed untouched; the documents observed to fail score 638 and up.
-
-The figures are empirical and from one printer. They are not a specification,
-and the margin between "printed" and "failed" is narrow, so the default
-threshold sits well below the boundary rather than on it.
+So this proxy does not try to predict. It converts every PDF, which removes
+every font program and therefore the whole failure mode, at a cost of about a
+third of a second and roughly double the file size on a real job. A cost
+estimate is still computed and logged, because it is useful when investigating,
+and --convert-threshold can act on it for a site that has measured its own
+workload -- but nothing depends on it being right.
 
 The defect has been present across firmware builds years apart, so waiting for
 a fix is not a strategy. Client-side changes affect how often it is reached:
@@ -949,17 +949,26 @@ def convert(cfg, data, fmt, queue=None):
     if payload is None:
         return data, f'relayed ({fmt or "not PDF"})'
 
-    # Outlining is expensive: it replaces every drawn glyph with an inline
-    # path, and Ghostscript emits no reusable form for them, so a fifty-page
-    # document grows from half a megabyte to thirty-three and takes half a
-    # second per page. Most jobs are nowhere near the printer's limit, so
-    # estimate first and leave those alone entirely -- that is both free and
-    # perfectly faithful. An unreadable estimate means convert, never skip.
+    # Skipping conversion is an optimisation, and it is off by default.
+    #
+    # Predicting which jobs a printer will refuse turned out to be unreliable.
+    # A model fitted to thirteen measured outcomes was falsified twice by real
+    # browser output: a font declaring 65535 glyphs printed where the model said
+    # it would fail, and a page drawing 1200 glyphs printed where the model said
+    # the same. Documents constructed here fail as predicted; documents a
+    # browser produces do not follow the same rule, and the difference is not
+    # understood.
+    #
+    # Converting unconditionally costs about a third of a second on a real job
+    # and roughly doubles a hundred-kilobyte file, which is not worth trading
+    # for a prediction that has been wrong twice. The estimate is still computed
+    # and logged, because it is useful for diagnosis, and a site that has
+    # measured its own workload can act on it via --convert-threshold.
     if cfg.convert_threshold:
-        cost = estimate_font_cost(payload)
         if cost is not None and cost <= cfg.convert_threshold:
             return data, f'relayed (font cost {cost}, under threshold)'
 
+    cost = estimate_font_cost(payload)
     started = time.time()
     try:
         if cfg.converter_socket:
@@ -1002,7 +1011,7 @@ def convert(cfg, data, fmt, queue=None):
         log.warning('font programs survived conversion')
         return _failed(cfg, data, 'fonts survived')
     return out, (f'outlined {len(data)} -> {len(out)} bytes in '
-                 f'{time.time() - started:.1f}s')
+                 f'{time.time() - started:.1f}s (font cost {cost})')
 
 
 # ---------------------------------------------------------------------------
@@ -1711,13 +1720,14 @@ def build_parser():
                              'long (default: 30)')
     parser.add_argument('--require-tls', action='store_true',
                         help='refuse plaintext IPP and accept only ipps')
-    parser.add_argument('--convert-threshold', type=int, default=500,
+    parser.add_argument('--convert-threshold', type=int, default=0,
                         metavar='N',
                         help='leave a job untouched when its estimated font '
-                             'cost is at or below N, since outlining is '
-                             'expensive and most jobs are nowhere near the '
-                             'printer limit. 0 converts everything '
-                             '(default: 500)')
+                             'cost is at or below N. The default of 0 converts '
+                             'every PDF, because the cost model predicts '
+                             'synthetic documents well and real browser output '
+                             'poorly, and converting is cheap. Set a threshold '
+                             'only if you have measured your own workload')
     parser.add_argument('--max-pdf-bytes', type=int, default=60,
                         metavar='MB',
                         help='rasterise rather than send an outlined PDF larger '

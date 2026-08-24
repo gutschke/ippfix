@@ -272,43 +272,36 @@ set:
 composite\-black fringing on text).
 
 .SH CALIBRATION
-.B The cost model and its threshold come from measuring one printer.
-Cost is estimated as the glyphs a page draws plus the size of the font
-programs it embeds, divided by 4096. What a font declares is deliberately not
-counted: a font declaring 65535 glyphs while drawing 27 printed without
-trouble, which disproved an earlier model built on that number.
+.B By default every PDF is converted, because predicting which ones need it
+.B did not work.
+Four models were fitted to measured outcomes and each was falsified: the glyph
+count a font declares \(em a font declaring 65535 glyphs while drawing 27
+printed perfectly \(em the glyphs a page draws \(em 1264 printed where 700
+failed \(em the size of the embedded font program, and the outline complexity
+of the glyphs actually used, where 519 glyphs in 47 kB failed and 519 glyphs in
+50 kB printed. Whatever the firmware counts is not visible in the document.
 .PP
-On a Color LaserJet Pro MFP M283fdw this separates thirteen measured jobs
-cleanly \(em everything scoring 562 or below printed, everything scoring 586 or
-above did not. Browser jobs score between 434 and 471. The default threshold of
-500 therefore sits below the boundary rather than on it, because the margin is
-narrow and the limit shifts with the typeface.
+Converting unconditionally costs roughly a third of a second and about double
+the file size on a real job, which is a better trade than a prediction that has
+been wrong repeatedly. A cost estimate is still computed and written to the log
+for diagnosis.
 .PP
-Another model will differ, and this one is not new. If jobs still vanish, lower
-the threshold; if jobs are converted that need not be, raise it.
-.B \-\-convert\-threshold 0
-converts everything, which is the honest setting when the limit is unknown, at
-the cost of doing expensive work on every job.
+.B \-\-convert\-threshold
+can skip conversion for jobs scoring at or below a given value, for a site that
+has measured its own workload and wants the optimisation. It is off by default
+and nothing depends on the estimate being accurate.
 .PP
-To measure a printer directly, note that a job which exceeds the budget marks
-no paper, so only the passing probes cost anything.
-.PP
-The device's own page counter is the reliable signal, because an affected
-printer reports the job completed either way and every layer above it repeats
-that. The Printer MIB (RFC 3805) exposes it on every network printer worth the
-name:
+To investigate a printer directly, note that a job which exceeds its limit
+marks no paper, so only the passing probes cost anything. The device's own page
+counter is the reliable signal, because an affected printer reports the job
+completed either way. The Printer MIB (RFC 3805) exposes it on any network
+printer:
 .PP
 .RS
 .nf
 snmpget \-v2c \-c public PRINTER 1.3.6.1.2.1.43.10.2.1.4.1.1
 .fi
 .RE
-.PP
-Manufacturers usually expose more than the standard MIB, sometimes including
-the interpreter's own error log. Those paths are vendor specific and this
-program neither uses nor depends on them; look for an event log or diagnostics
-page in the printer's web interface, or a printable event\-log report on its
-panel.
 
 .SH BEHAVIOUR
 Both plaintext IPP and implicit TLS are accepted on the same port, and both
