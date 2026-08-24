@@ -1,0 +1,17 @@
+[Unit]
+# Do not take port 631 on a machine that has not been configured to serve
+# anything: a client would get a connection that goes nowhere, and CUPS
+# could not start alongside. The service carries the same condition.
+ConditionPathExists=/etc/ippfix/ippfix.conf
+Description=IPP font-repair print proxy socket
+Documentation=man:ippfix(8)
+
+[Socket]
+# systemd opens the privileged port and hands the descriptor to the service,
+# so ippfix.service itself needs no capabilities at all.
+ListenStream=631
+BindIPv6Only=both
+Backlog=64
+
+[Install]
+WantedBy=sockets.target

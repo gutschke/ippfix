@@ -23,18 +23,22 @@ override_dh_auto_install:
 	# resolve to /usr/usr/lib/ippfix and dangle.
 	ln -sf ../lib/ippfix/ippfix debian/ippfix/usr/bin/ippfix
 
-	# Conffile: the only thing an administrator has to touch.
-	install -D -m0644 debian/pkg/ippfix.conf debian/ippfix/etc/ippfix/ippfix.conf
+	# The configuration is NOT shipped. The package cannot know which printers
+	# exist, and a file that always exists cannot tell systemd whether the
+	# machine has been set up -- so an example is installed instead and the units
+	# are conditional on the real one appearing. Same arrangement as splitdnsd.
+	install -D -m0644 debian/pkg/ippfix.conf \
+		debian/ippfix/usr/share/doc/ippfix/ippfix.conf.example
 
 	# Units, with the install path corrected and the command line moved out of
 	# ExecStart into the conffile.
 	install -d debian/ippfix/usr/lib/systemd/system
-	for u in ippfix.socket ippfix-convert.socket ippfix-convert@.service; do \
+	for u in ippfix-convert.socket ippfix-convert@.service; do \
 	  sed -e 's#/usr/local/lib/ippfix#$(LIB)#g' "$$u" \
 	      > debian/ippfix/usr/lib/systemd/system/"$$u"; \
 	done
-	install -m0644 debian/pkg/ippfix.service \
-		debian/ippfix/usr/lib/systemd/system/ippfix.service
+	install -m0644 debian/pkg/ippfix.service debian/pkg/ippfix.socket \
+		debian/ippfix/usr/lib/systemd/system/
 	# Users and directories come from debian/ippfix.{sysusers,tmpfiles};
 	# debhelper installs them and adds the snippets that apply them.
 
@@ -65,8 +69,13 @@ override_dh_installtmpfiles:
 override_dh_installsystemd:
 	# The proxy's sockets are enabled; the service itself is socket-activated
 	# and, in any case, does nothing until a printer is configured.
-	dh_installsystemd -pippfix --name=ippfix-convert ippfix-convert.socket
-	dh_installsystemd -pippfix ippfix.socket
+	# Sockets are not restarted on upgrade. A listening socket cannot rebind
+	# while the service still holds its descriptor, so the restart returns
+	# non-zero and dpkg prints a failure that is not one. There is nothing to
+	# gain either: the service restarts and re-inherits the same descriptor.
+	dh_installsystemd -pippfix --name=ippfix-convert --no-restart-after-upgrade \
+		ippfix-convert.socket
+	dh_installsystemd -pippfix --no-restart-after-upgrade ippfix.socket
 	# Enabled, not merely socket-activated. The daemon has to be running to
 	# publish the queue over DNS-SD, and a client cannot connect to something it
 	# cannot discover -- so leaving it to start on the first connection means it

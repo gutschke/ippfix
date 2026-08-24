@@ -28,8 +28,10 @@ Description: IPP proxy that removes embedded fonts from print jobs
  The network daemon never executes the document converter: documents are
  handed to a separate, per-connection service that has no network at all.
  .
- Configuration is not shipped with any printer defined. Edit
- /etc/ippfix/ippfix.conf before starting the service.
+ Configuration is not shipped: copy the example from
+ /usr/share/doc/ippfix/ippfix.conf.example to /etc/ippfix/ippfix.conf and name
+ your printers in it. Until that file exists nothing starts and no port is
+ taken.
 
 Package: ippfix-selfbuild
 Architecture: all

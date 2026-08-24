@@ -1,7 +1,17 @@
 [Unit]
+# Nothing here runs until an administrator has written a configuration. The
+# package deliberately ships none, because it cannot know which printers
+# exist; see /usr/share/doc/ippfix/ippfix.conf.example.
+ConditionPathExists=/etc/ippfix/ippfix.conf
 Description=IPP font-repair print proxy
 Documentation=man:ippfix(8) https://github.com/gutschke/ippfix
-Requires=ippfix.socket ippfix-convert.socket
+# Wants, not Requires. Both sockets carry the same configuration condition as
+# this unit, and a condition-skipped unit counts as a failed dependency for
+# anything that Requires it -- which left this service retrying forever on a
+# machine that simply had not been configured yet. With Wants the condition
+# here skips it cleanly instead, and After= still guarantees the sockets are
+# up first so the descriptors are inherited.
+Wants=ippfix.socket ippfix-convert.socket
 After=network.target network-online.target ippfix.socket ippfix-convert.socket
 Wants=network-online.target
 
