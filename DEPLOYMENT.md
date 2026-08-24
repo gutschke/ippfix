@@ -491,6 +491,34 @@ same document to both:
 ippfix --port 6310 --no-advertise --no-convert ipp://PRINTER/ipp/print
 ```
 
+## What happens when the package is installed
+
+Installing the package does not start a proxy, because the package cannot know
+which printers exist. It creates `/etc/ippfix/ippfix.conf` with no printer
+named, and the service checks that file before it runs:
+
+- **No printer configured** -- the unit is *skipped*, not started and not
+  failed. `systemctl status ippfix` reports `inactive`, the journal says
+  `no printer configured; edit /etc/ippfix/ippfix.conf`, and nothing
+  restart-loops. This is `ExecCondition=`, which exists precisely so that
+  "not set up yet" does not have to be reported as an error.
+- **A printer configured** -- the service starts on installation, and restarts
+  after an upgrade, without anyone having to remember to do it.
+
+So the sequence on a new machine is: install, edit the conffile, then
+
+```sh
+systemctl start ippfix
+```
+
+and from then on installs and upgrades look after themselves.
+
+One consequence worth knowing: the listening socket is bound as soon as the
+package is installed, before any printer is configured. Port 631 is therefore
+taken on a machine that is not yet serving anything, which matters only if you
+also intend to run CUPS there -- and CUPS and this proxy are alternatives, not
+companions.
+
 ## Keeping Ghostscript current
 
 Ghostscript does the conversion, and it is the most exposed component here: it
