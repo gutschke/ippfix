@@ -4,29 +4,37 @@ What is not solved, what is not understood, and what would be worth
 investigating next. Kept separate from `DIAGNOSING.md`, which records what *is*
 established.
 
-## Whether the raster tier is the right last resort
+## Whether rasterising is the right last resort for an over-large job
 
 When an outlined PDF exceeds what the printer will accept, the job is
 rasterised. Measured on dense body copy that happens at roughly 90 pages, or
 around 180 at normal density — reachable by a long report.
 
-There is a third option that has not been evaluated: forward the **original**
-PDF unconverted. It is small (the growth is all in the outlining), it keeps
-full vector text, and the documents that reach this tier are the ones least
-likely to have needed conversion at all — the fault depends on distinct glyphs
-per page, and a long report drawing the same ninety-odd characters throughout is
-nowhere near the threshold.
+An earlier draft of this section suggested a third option — forward the
+**original** unconverted, since it is small and keeps full vector text — on the
+grounds that a document long enough to reach this tier is unlikely to have
+needed conversion anyway. **That reasoning is wrong, and is recorded here so it
+is not proposed again.**
 
-The trade is quality against the fault the proxy exists to prevent. Rasterising
-always prints and gives up some geometry precision (a modest loss -- the printer
-still halftones contone input itself); relaying the original keeps full fidelity
-and reintroduces the risk. That risk is now *visible* rather than silent, since
-the page-counter cross-check reports a job the printer claims to have printed
-and did not, which is an argument for reconsidering the order.
+The fault is per page. A long document is not a document of uniformly dull
+pages: it takes one cover page in a display face, one chart with a symbol font,
+one equation, or one quoted passage in another script, and the whole job fails.
+Length says nothing about whether any individual page is risky, and "the
+document got longer" is not a reason to stop converting it.
 
-What would settle it: how often real workloads reach the tier at all, and
-whether any document large enough to reach it has ever provoked the fault.
-Neither has been measured.
+The estimator already works this way — it reports the worst page, never an
+average — so a non-zero `--convert-threshold` does not dilute one costly page
+among a hundred cheap ones, wherever in the document it sits. That behaviour is
+pinned by the self-test.
+
+What remains genuinely open is narrower: whether rasterising is the best last
+resort for an over-large job. It always prints, and gives up some geometry
+precision — a modest loss, since the printer still halftones contone input
+itself. Any alternative has to keep converting every page, so the candidates are
+things like splitting the job, not skipping the work.
+
+What would settle it: how often real workloads reach the tier at all. That has
+not been measured.
 
 ## What this proxy does and does not protect against
 

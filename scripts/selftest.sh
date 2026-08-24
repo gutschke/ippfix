@@ -411,6 +411,71 @@ many = page * 3 + b'2 0 obj\n<< /Length 18 >>\nstream\n0 0 9 9 re f\nendstream\n
 assert estimate_font_cost(many) == cost, 'estimate grew with page count'
 PY2
 
+python3 - <<'PY2' && ok 'one costly page is not diluted by a long document' || bad 'per-page worst case'
+import sys, zlib
+sys.path.insert(0, '.')
+from ippfix import estimate_font_cost
+
+# The fault is per page, so a hundred-page report is not safe because most of
+# its pages are dull: one chart, cover or equation page drawing an unusual set
+# of glyphs breaks the whole job. The estimate must therefore report the WORST
+# page, never an average and never the first one it happens to look at.
+FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+try:
+    font = open(FONT, 'rb').read()
+except OSError:
+    sys.exit(0)                      # no font installed; nothing to measure
+
+def esc(b):
+    return b.replace(b'\\', b'\\\\').replace(b'(', b'\\(').replace(b')', b'\\)')
+
+def build(total, odd_index=None):
+    out = bytearray(b'%PDF-1.4\n')
+    offs = {}
+    def add(num, raw):
+        offs[num] = len(out)
+        out.extend(b'%d 0 obj\n' % num + raw + b'\nendobj\n')
+    kids = ' '.join('%d 0 R' % (5 + i) for i in range(total))
+    add(1, b'<< /Type /Catalog /Pages 2 0 R >>')
+    add(2, ('<< /Type /Pages /Kids [%s] /Count %d >>' % (kids, total)).encode())
+    add(3, ('<< /Type /Font /Subtype /TrueType /BaseFont /DejaVuSans '
+            '/FirstChar 32 /LastChar 126 /Widths [%s] /FontDescriptor 4 0 R >>'
+            % ' '.join(['600'] * 95)).encode())
+    comp = zlib.compress(font, 9)
+    add(4, ('<< /Type /FontDescriptor /FontName /DejaVuSans /Flags 32 '
+            '/FontBBox [-1021 -463 1793 1232] /ItalicAngle 0 /Ascent 928 '
+            '/Descent -236 /CapHeight 700 /StemV 80 /FontFile2 %d 0 R >>'
+            % (5 + total)).encode())
+    for p in range(total):
+        add(5 + p, ('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] '
+                    '/Resources << /Font << /F1 3 0 R >> >> /Contents %d 0 R >>'
+                    % (5 + total + 1 + p)).encode())
+    add(5 + total,
+        b'<< /Length %d /Length1 %d /Filter /FlateDecode >>\nstream\n'
+        % (len(comp), len(font)) + comp + b'\nendstream')
+    for p in range(total):
+        txt = esc(bytes(range(33, 127))) if p == odd_index else b'the quick fox'
+        body = b'BT /F1 9 Tf 36 756 Td (' + txt + b') Tj ET'
+        add(5 + total + 1 + p,
+            b'<< /Length %d >>\nstream\n' % len(body) + body + b'\nendstream')
+    x = len(out)
+    n = max(offs) + 1
+    out += b'xref\n0 %d\n0000000000 65535 f \n' % n
+    for i in range(1, n):
+        out += b'%010d 00000 n \n' % offs.get(i, 0)
+    out += (b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n'
+            % (n, x))
+    return bytes(out)
+
+alone = estimate_font_cost(build(1, 0))
+plain = estimate_font_cost(build(100))
+assert alone > plain, (alone, plain)
+# Wherever the costly page sits, the answer is the same as that page alone.
+for where in (0, 50, 99):
+    got = estimate_font_cost(build(100, where))
+    assert got == alone, ('diluted at position %d' % where, got, alone)
+PY2
+
 python3 - <<'PY2' && ok 'offers only formats it can stand behind' || bad 'format policy'
 import sys
 sys.path.insert(0, '.')

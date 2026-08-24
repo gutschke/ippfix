@@ -589,13 +589,18 @@ logged whenever it fires:
 journalctl -u ippfix | grep 'rasterising instead'
 ```
 
-Two things follow. Documents that hit it give up the vector-text advantage the
-proxy otherwise preserves — a real cost, if a small one. And they are also the
-documents *least* likely to have needed conversion in the first place: the fault depends on distinct glyphs
-per page, and a hundred-page report drawing the same ninety-odd characters
-throughout is nowhere near it. A site that prints long documents routinely
-should consider `--convert-threshold`, which skips conversion for pages that
-draw few glyphs and so avoids reaching the raster tier at all. The limit comes from the printer's own
+Documents that hit it give up the vector-text advantage the proxy otherwise
+preserves — a real cost, if a small one.
+
+What does **not** follow is that long documents are safe to leave unconverted.
+The fault is per page: one cover page in a display face, one chart with a symbol
+font, one quoted passage in another script, and the job fails no matter how dull
+the other ninety-nine pages are. `--convert-threshold` is judged on the worst
+page in a document, never on an average, so it does not dilute one costly page
+among many cheap ones — but it is still a prediction, and the model behind it
+has been falsified twice. That is why it is off by default.
+
+The limit comes from the printer's own
 `pdf-k-octets-supported` (the daemon uses 80% of what the device reports, and
 logs the figure at startup); `--max-pdf-bytes` supplies a limit only for a
 device that declares none. To see what yours declares:
