@@ -1,0 +1,24 @@
+[Unit]
+Description=SNMP relay socket for ippfix
+Documentation=man:ippfix(8)
+ConditionPathExists=/etc/ippfix/ippfix.conf
+
+# NOT enabled by the package, deliberately. Everything else here starts on
+# install because a print queue nobody can discover is useless; this opens a
+# UDP port to answer questions about a printer, which is a decision about what
+# the network may see and belongs to the administrator, not to a postinst.
+#
+#     systemctl enable --now ippfix-snmp.socket
+#
+# The daemon serves read-only GET and GETNEXT inside the Printer MIB, refuses
+# GETBULK and SET, rate limits per source, and does not start the relay at all
+# if the printer itself does not answer SNMP. See ippfix(8).
+
+[Socket]
+ListenDatagram=161
+BindIPv6Only=both
+Service=ippfix.service
+FileDescriptorName=snmp
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,43 @@
+# Serving SNMP for more than one printer.
+#
+# SNMP carries nothing that names a printer -- no virtual hosts, no equivalent
+# of an HTTP Host header -- so one listener can only ever speak for one of
+# them. With several printers configured the daemon refuses to answer on a
+# wildcard listener and says so in the journal, rather than picking one and
+# leaving a monitoring system reading the wrong printer's page counter.
+#
+# Addresses are the way out: give the host one address per printer, run one
+# socket unit per address, and let the address do the naming the protocol will
+# not. The daemon matches a listener to a printer by asking the socket what it
+# bound, so nothing depends on what these units are called.
+#
+# Copy this to /etc/systemd/system/ippfix-snmp-NAME.socket once per printer,
+# set the address, and tell the printer which listener is its own:
+#
+#     'Front Desk=ipp://192.0.2.10/ipp/print?snmp-relay=198.51.100.11'
+#     'Workshop=ipp://192.0.2.11/ipp/print?snmp-relay=198.51.100.12'
+#
+# Then, in this order and only the first time -- a socket unit cannot hand its
+# descriptor to a service that is already running:
+#
+#     systemctl enable ippfix-snmp-front-desk.socket
+#     systemctl stop ippfix
+#     systemctl start ippfix-snmp-front-desk.socket
+#     systemctl start ippfix
+#
+# An address a printer claims with no listener behind it, and a listener with
+# no printer behind it, are both reported as errors at startup: a setting that
+# looks applied and is not is worse than one that was never made.
+
+[Unit]
+Description=SNMP relay socket for ippfix (one printer)
+Documentation=man:ippfix(8)
+ConditionPathExists=/etc/ippfix/ippfix.conf
+
+[Socket]
+ListenDatagram=198.51.100.11:161
+Service=ippfix.service
+FileDescriptorName=snmp
+
+[Install]
+WantedBy=sockets.target

@@ -1,3 +1,34 @@
+ippfix (1.0.2) unstable; urgency=medium
+
+  * Reports now cross-check the printer's job accounting against its own RFC
+    3805 page counter over SNMP. job-impressions-completed comes from the
+    firmware that just claimed success for a job it did not print; the page
+    counter comes from the marking engine. A job the printer says it printed
+    while its counter did not move is a failure nothing else here would have
+    noticed, and is now reported.
+  * The counter is checked before it is believed -- the printer is asked what
+    its counter counts -- and switched off, loudly, if it goes backwards twice,
+    jumps implausibly, stops answering, or repeatedly fails to move for jobs
+    reporting impressions. It never raises an alert of its own until it has
+    been seen to move for a job that did print. --no-page-counter, or
+    ?page-counter=off per printer.
+  * New optional SNMP relay, so the printer's counters are reachable from
+    networks the printer is not. Read-only GET and GETNEXT inside the Printer
+    MIB; GETBULK, SET, SNMPv3 and everything outside those subtrees are
+    refused; rate limited per source and overall. Its socket is shipped
+    disabled: opening a UDP port is the administrator's decision.
+  * The relay can serve several printers, one per address: ?snmp-relay=ADDRESS
+    names the listener a printer owns, and listeners are matched to printers by
+    the address they bound rather than by what the units are called. With
+    several printers and only a wildcard listener it answers nothing and says
+    so, rather than picking one.
+  * Per-printer settings now travel as a query string on the printer's URI,
+    and an unrecognised one is an error rather than silently ignored.
+  * snmpmini.py replaces the SNMP implementation that probe-printer.py carried
+    privately, so the daemon and the probe read the counter the same way.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Mon, 24 Aug 2026 09:44:24 -0700
+
 ippfix (1.0.1) unstable; urgency=medium
 
   * Reports about a job that did not print now carry what is needed to

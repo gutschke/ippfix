@@ -480,6 +480,35 @@ printer said about itself at the time. It needs a local `sendmail`; without one
 the report goes to the journal. See the manual page for the rate limit and the
 timeout.
 
+**Reading the printer's own page counter.** Every report cross-checks
+`job-impressions-completed` against `prtMarkerLifeCount` over SNMP. This is on
+by default and needs no configuration; the printer is asked what its counter
+counts, and the signal switches itself off, loudly, if the counter misbehaves.
+Turn it off with `--no-page-counter`, or per printer with `?page-counter=off`
+on its URI.
+
+**Letting clients read the printer's counters.** Optional, and the socket ships
+disabled, because opening a UDP port to answer questions about a printer is a
+decision about what the network may see:
+
+```
+systemctl enable ippfix-snmp.socket
+systemctl stop ippfix
+systemctl start ippfix-snmp.socket
+systemctl start ippfix
+```
+
+That order, once. A socket unit cannot hand its descriptor to a service that is
+already running; boots after this are automatic.
+
+The relay serves read-only `GET` and `GETNEXT` inside the Printer MIB and
+refuses `GETBULK`, `SET`, SNMPv3 and everything outside its subtrees, rate
+limited per source. Measured against a real printer the worst answer in the
+allowlist is 143 bytes to a 45-byte request, so it is a poor reflector — but it
+does put the printer in front of whatever can reach this host, which may be more
+than can reach the printer. `--snmp-allow CIDR` narrows that back down and is
+worth setting.
+
 **A mail system that queues is not a mail system that delivers.** `sendmail(1)`
 returns as soon as the message is queued; a separate agent delivers it. If that
 agent is a child of a `Type=oneshot` unit, the default `KillMode` tears it down

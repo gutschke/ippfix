@@ -57,6 +57,7 @@ import email.message
 import email.utils
 import gzip
 import hashlib
+import ipaddress
 import http.client
 import json
 import logging
@@ -77,6 +78,7 @@ import urllib.request
 import uuid
 
 import ippcodec as ipp
+import snmpmini as snmp
 
 log = logging.getLogger('ippfix')
 
@@ -191,10 +193,48 @@ class Queue:
     or capitals into an address anyone has to read aloud.
     """
 
+    # Settings that belong to one printer rather than to the daemon travel in
+    # the printer's own URI, because that is the only place a per-device
+    # setting can be written without inventing a way to say which device a
+    # flag applies to. Unknown keys are an error: a mistyped option that is
+    # silently ignored is how a printer ends up not doing what its
+    # configuration says it does.
+    URI_OPTIONS = ('page-counter', 'community', 'snmp-relay')
+
     def __init__(self, name, uri):
         parts = urllib.parse.urlsplit(uri)
         if parts.scheme not in ('ipp', 'ipps'):
             raise ValueError(f'{name}: expected an ipp:// or ipps:// URI')
+        options = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        for key in options:
+            if key not in self.URI_OPTIONS:
+                raise ValueError(
+                    f'{name}: unknown option {key!r} in the printer URI; '
+                    f'known options are {", ".join(self.URI_OPTIONS)}')
+        self.community = options.get('community', ['public'])[0]
+        want = options.get('page-counter', ['on'])[0].lower()
+        if want not in ('on', 'off'):
+            raise ValueError(f'{name}: page-counter must be on or off, '
+                             f'not {want!r}')
+        self.want_page_counter = want == 'on'
+        # None means "unset", which is not the same as "off": with a single
+        # printer an unset relay is served, and with several the administrator
+        # has to say which one, because SNMP carries nothing that names a
+        # printer. An address says which listener speaks for this printer,
+        # which is the only way to serve several of them at once -- one
+        # address each, one socket each.
+        relay = options.get('snmp-relay', [None])[0]
+        if relay is None:
+            self.snmp_relay = None
+        elif relay.lower() in ('on', 'off'):
+            self.snmp_relay = relay.lower() == 'on'
+        else:
+            try:
+                self.snmp_relay = str(ipaddress.ip_address(relay))
+            except ValueError:
+                raise ValueError(
+                    f'{name}: snmp-relay must be on, off, or an address to '
+                    f'listen on, not {relay!r}') from None
         self.name = name
         self.slug = slugify(name)
         self.tls = parts.scheme == 'ipps'
@@ -214,6 +254,7 @@ class Queue:
         self.max_pdf_bytes = None
         self.learned = False
         self.learn_failed_at = None    # monotonic time of the last failure
+        self.pages = None              # PageCounter, once Config has built it
         self._warned_formats = False
         if not self.host:
             raise ValueError(f'{name}: no host in {uri!r}')
@@ -350,6 +391,14 @@ class Config:
     def __init__(self, args, queues):
         self.port = args.port
         self.queues = {q.local_path: q for q in queues}
+        for q in queues:
+            q.pages = PageCounter(
+                q, community=q.community,
+                enabled=q.want_page_counter and not args.no_page_counter)
+        self.no_snmp_relay = args.no_snmp_relay
+        self.snmp_allow = []
+        for cidr in args.snmp_allow or ():
+            self.snmp_allow.append(ipaddress.ip_network(cidr, strict=False))
         self.advertise = args.advertise or local_ip()
         if args.also_advertise:
             self.extra_addresses = args.also_advertise
@@ -1231,9 +1280,576 @@ def gather_evidence(cfg, archived, data, note, budget):
     return parts, lines
 
 
+# ---------------------------------------------------------------------------
+# The printer's own page counter.
+#
+# job-impressions-completed comes from the same firmware that just claimed to
+# have printed a job it did not print. The RFC 3805 page counter comes from the
+# marking engine, which is a different subsystem and much harder to lie with:
+# it is the number the meter reads and the number a service contract bills on.
+# When the two disagree, the page counter is the one to believe.
+#
+# It is not free of doubt either. Some printers do not answer SNMP; some answer
+# this OID with something else entirely; some reset it when a cartridge is
+# replaced. So it is checked before it is trusted, and it is checked again on
+# every job -- see PageCounter, which can revoke its own trust.
+# ---------------------------------------------------------------------------
+OID_PAGE_COUNT = '1.3.6.1.2.1.43.10.2.1.4.1.1'      # prtMarkerLifeCount
+OID_COUNTER_UNIT = '1.3.6.1.2.1.43.10.2.1.3.1.1'    # prtMarkerCounterUnit
+
+# prtMarkerCounterUnit, RFC 3805. Only two of the legal values describe
+# something comparable with job-impressions-completed. The rest -- characters,
+# lines, micrometres, feet -- are correct answers to this OID and useless ones
+# here, and asking is much better than assuming: the printer says outright
+# whether its counter can be read as a page count.
+COUNTER_UNITS = {7: 'impressions', 8: 'sheets'}
+
+COUNTER32 = 1 << 32
+# A single job that moves the counter by more than this is not counting pages.
+# Real jobs are bounded by the paper in the tray; a byte counter, a timer or an
+# uptime is not. Deliberately generous: a busy shared printer can advance a
+# long way between two readings through nobody's fault, because this proxy is
+# not the only way to print. That is why a large jump is treated as evidence
+# about the OID rather than about the job.
+MAX_PLAUSIBLE_JUMP = 20000
+# One job whose impressions never reached the page counter is the finding this
+# signal exists to surface. Three of them means the instrument is broken, not
+# the printer.
+FROZEN_LIMIT = 3
+# Consecutive unanswered reads before giving up on a printer that answered once.
+MISS_LIMIT = 3
+# Let the engine finish marking before reading the counter again. A job reaches
+# job-state=completed slightly before the last sheet is counted.
+SETTLE = 8
+
+
+# ---------------------------------------------------------------------------
+# Relaying SNMP to the printer.
+#
+# The printer often sits where clients cannot reach it -- that is why this
+# proxy exists -- which also puts its status information out of reach. The
+# supply levels and state that a print client actually uses already travel over
+# IPP and are relayed with everything else; this covers the rest, for a person
+# with snmpget who wants the page counter or the console text.
+#
+# What it will not do is the point of it:
+#
+#   * GET and GETNEXT only. GETBULK is refused, because max-repetitions is the
+#     knob that turns a small request into a large reply, and that is what
+#     makes an open SNMP responder useful for reflection. GET and GETNEXT
+#     answer one varbind each, so the reply is about the size of the request.
+#   * SET is refused. The Printer MIB has writable objects, including a reset.
+#   * Only inside a small list of subtrees, checked on the way out as well as
+#     on the way in: a GETNEXT at the end of a subtree walks into the next one,
+#     and the answer is dropped rather than relayed.
+#   * Rate limited per source and overall, and over the limit it answers
+#     nothing at all. Answering is the amplification; refusing costs a packet.
+#
+# None of that defends against somebody on the path, and none of it needs to:
+# a printer that answers SNMP on a LAN is already in that position. What this
+# does avoid is putting the printer in front of a *wider* audience than the
+# administrator chose, which is the one thing the proxy changes.
+# ---------------------------------------------------------------------------
+RELAY_SUBTREES = (
+    '1.3.6.1.2.1.1.',          # system: sysDescr, sysName, sysUpTime
+    '1.3.6.1.2.1.25.3.2.',     # hrDeviceTable
+    '1.3.6.1.2.1.25.3.5.',     # hrPrinterTable: status and detected errors
+    '1.3.6.1.2.1.43.',         # the Printer MIB, RFC 3805
+)
+RELAY_PDUS = (snmp.GET, snmp.GETNEXT)
+RELAY_MAX_VARBINDS = 8         # snmpget takes several; nothing legitimate needs more
+RELAY_TIMEOUT = 2              # the forward blocks this loop; keep it short
+
+
+def client_ip(peer):
+    """The source address of a datagram, as somebody would write it.
+
+    A dual-stack socket reports an IPv4 peer as ::ffff:10.0.0.1, which is the
+    same host by a name that does not match an IPv4 network in --snmp-allow and
+    does not match what an administrator typed. Unmap it once, here, so both
+    the filter and the log see the address the operator is thinking of.
+    """
+    ip = peer[0]
+    try:
+        # Only IPv6Address carries ipv4_mapped; an address that is already v4
+        # has nothing to unmap.
+        mapped = getattr(ipaddress.ip_address(ip), 'ipv4_mapped', None)
+    except ValueError:
+        return ip
+    return str(mapped) if mapped else ip
+
+
+def in_allowlist(oid):
+    return any(oid.startswith(t) or oid == t.rstrip('.')
+               for t in RELAY_SUBTREES)
+
+
+class TokenBucket:
+    """Rate limit with a burst allowance, in the smallest form that works."""
+
+    def __init__(self, rate, burst):
+        self.rate = float(rate)
+        self.burst = float(burst)
+        self.tokens = float(burst)
+        self.when = time.monotonic()
+
+    def take(self):
+        now = time.monotonic()
+        self.tokens = min(self.burst, self.tokens + (now - self.when) * self.rate)
+        self.when = now
+        if self.tokens < 1:
+            return False
+        self.tokens -= 1
+        return True
+
+
+class SnmpRelay:
+    """A read-only SNMP window onto one printer."""
+
+    PER_SOURCE_RATE, PER_SOURCE_BURST = 5, 10
+    OVERALL_RATE, OVERALL_BURST = 20, 40
+    MAX_SOURCES = 512          # bounded: one packet per spoofed source otherwise
+    SOURCE_IDLE = 300
+
+    def __init__(self, queue, allow=()):
+        self.queue = queue
+        self.allow = list(allow)
+        self.overall = TokenBucket(self.OVERALL_RATE, self.OVERALL_BURST)
+        self.sources = {}
+        self.lock = threading.Lock()
+        self.refused = 0
+        self.relayed = 0
+
+    def permitted_source(self, ip):
+        if not self.allow:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(addr in net for net in self.allow)
+
+    def allowed_rate(self, ip):
+        """Both buckets, and neither is allowed to grow without bound."""
+        with self.lock:
+            if not self.overall.take():
+                return False
+            now = time.monotonic()
+            if len(self.sources) > self.MAX_SOURCES:
+                for key, (bucket, seen) in list(self.sources.items()):
+                    if now - seen > self.SOURCE_IDLE:
+                        del self.sources[key]
+                if len(self.sources) > self.MAX_SOURCES:
+                    # Still full: somebody is walking source addresses. Serve
+                    # only the sources already known rather than evicting one
+                    # of them to make room for the flood.
+                    if ip not in self.sources:
+                        return False
+            bucket, _seen = self.sources.get(
+                ip, (TokenBucket(self.PER_SOURCE_RATE, self.PER_SOURCE_BURST), 0))
+            self.sources[ip] = (bucket, now)
+            return bucket.take()
+
+    def acceptable(self, msg):
+        """Whether this request may be put to the printer at all."""
+        if msg.version not in (snmp.V1, snmp.V2C):
+            return 'version %s' % msg.version
+        if msg.pdu_type not in RELAY_PDUS:
+            return snmp.PDU_NAMES.get(msg.pdu_type, hex(msg.pdu_type))
+        if not msg.varbinds or len(msg.varbinds) > RELAY_MAX_VARBINDS:
+            return '%d varbinds' % len(msg.varbinds)
+        for oid in msg.oids:
+            if not in_allowlist(oid):
+                return 'oid %s' % oid
+        return None
+
+    def forward(self, packet):
+        """Put the client's datagram to the printer, verbatim.
+
+        Verbatim on purpose. Re-encoding would mean writing an encoder whose
+        bugs are reachable from the network, to gain nothing: the bytes are
+        already a valid request for exactly what was asked, and the policy
+        decision was made from the parse, not from the re-encoding.
+        """
+        sock = socket.socket(socket.AF_INET6 if ':' in self.queue.host
+                             else socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(RELAY_TIMEOUT)
+        try:
+            sock.connect((self.queue.host, 161))
+            sock.send(packet)
+            return sock.recv(snmp.MAX_DATAGRAM)
+        except OSError:
+            return None
+        finally:
+            sock.close()
+
+    def handle(self, packet, peer):
+        """One datagram in, at most one datagram out."""
+        ip = client_ip(peer)
+        if not self.permitted_source(ip):
+            return None
+        try:
+            msg = snmp.parse(packet)
+        except snmp.SnmpError as exc:
+            log.debug('snmp relay: unparseable request from %s (%s)', ip, exc)
+            return None
+        refusal = self.acceptable(msg)
+        if refusal:
+            self.refused += 1
+            log.info('snmp relay: refused %s from %s', refusal, ip)
+            return None
+        if not self.allowed_rate(ip):
+            self.refused += 1
+            return None
+
+        reply = self.forward(packet)
+        if reply is None:
+            return None
+        try:
+            parsed = snmp.parse(reply)
+        except snmp.SnmpError:
+            return None
+        if parsed.request_id != msg.request_id:
+            return None
+        # A GETNEXT at the end of a subtree answers with the next object in the
+        # printer's MIB, which is outside what this agreed to serve. Drop it:
+        # the walk stops at the boundary, which is what a boundary is for.
+        for oid in parsed.oids:
+            if not in_allowlist(oid):
+                log.debug('snmp relay: not relaying %s, outside the allowlist',
+                          oid)
+                return None
+        self.relayed += 1
+        return reply
+
+    def serve(self, sock):
+        """Read datagrams until the socket goes away."""
+        log.info('snmp relay: answering for %s on behalf of %s',
+                 self.queue.name, self.queue.host)
+        while True:
+            try:
+                packet, peer = sock.recvfrom(snmp.MAX_DATAGRAM)
+            except OSError as exc:
+                log.warning('snmp relay: stopped (%s)', exc)
+                return
+            try:
+                reply = self.handle(packet, peer)
+                if reply is not None:
+                    sock.sendto(reply, peer)
+            except Exception as exc:
+                # One bad datagram must never take the relay down with it.
+                log.error('snmp relay: while answering %s: %s', peer[0], exc)
+
+
+WILDCARD_BINDS = ('::', '0.0.0.0', '')
+
+
+def bound_address(sock):
+    """The address a socket is listening on, or None if it is the wildcard.
+
+    This is how a listener is matched to a printer. Asking the socket beats any
+    naming convention: whatever the administrator called the unit, the address
+    it actually bound is the thing that has to agree with the configuration.
+    """
+    try:
+        addr = sock.getsockname()[0]
+    except OSError:
+        return None
+    if addr in WILDCARD_BINDS:
+        return None
+    return client_ip((addr,))
+
+
+def choose_relay_queue(queues, address=None):
+    """Which printer a listener speaks for, or None with a reason.
+
+    SNMP carries nothing that names a printer -- no virtual hosts, no
+    equivalent of an HTTP Host header -- so one listener can only ever speak
+    for one of them, and a monitoring system silently reading the wrong
+    printer's page counter is worse than one that reads nothing.
+
+    Which leaves addresses. A host with an alias per printer can run a listener
+    per address, and then the address does the naming that the protocol will
+    not. That is what `?snmp-relay=ADDRESS` configures, and it is the only way
+    to serve several printers at once.
+    """
+    if address is not None:
+        named = [q for q in queues if q.snmp_relay == address]
+        if len(named) == 1:
+            return named[0], None
+        if named:
+            return None, (f'{len(named)} printers claim the listener on '
+                          f'{address}')
+        return None, (f'nothing is listening for a printer on {address}; add '
+                      f'"?snmp-relay={address}" to the URI of the printer it '
+                      f'should answer for')
+
+    # The wildcard listener. Printers that named an address are served by their
+    # own listener and must not also be served by this one.
+    unbound = [q for q in queues if not isinstance(q.snmp_relay, str)]
+    marked = [q for q in unbound if q.snmp_relay is True]
+    if len(marked) > 1:
+        return None, 'several printers are marked "?snmp-relay=on"'
+    if marked:
+        return marked[0], None
+    eligible = [q for q in unbound if q.snmp_relay is None]
+    if len(eligible) == 1:
+        return eligible[0], None
+    if not eligible:
+        return None, 'no printer is left for it'
+    return None, (f'{len(eligible)} printers share this listener and SNMP '
+                  f'cannot say which one a request is for. Mark one with '
+                  f'"?snmp-relay=on", or give each its own address with '
+                  f'"?snmp-relay=ADDRESS" and a socket unit bound to it')
+
+
+def start_snmp_relays(cfg, socks):
+    """Serve SNMP on each listener systemd passed, for the printer it names."""
+    if not socks:
+        return []
+    if cfg.no_snmp_relay:
+        log.info('snmp relay: disabled by --no-snmp-relay; the %d socket(s) '
+                 'systemd passed will not be answered', len(socks))
+        return []
+    queues = list(cfg.queues.values())
+    started = []
+    for sock in socks:
+        address = bound_address(sock)
+        where = address or 'every address'
+        queue, why = choose_relay_queue(queues, address)
+        if queue is None:
+            # Loud: the socket is open, so somebody meant this to work, and a
+            # relay that is listening but answering nothing looks identical
+            # from outside to one that is simply slow.
+            log.error('snmp relay: NOT answering on %s -- %s', where, why)
+            continue
+        # A printer that does not answer SNMP has nothing to relay, and
+        # standing up a responder for it would add a reflector to the network
+        # in exchange for errors.
+        if snmp.get(queue.host, OID_PAGE_COUNT, queue.community,
+                    timeout=3) is None:
+            log.info('snmp relay: not answering on %s -- %s does not answer '
+                     'SNMP itself', where, queue.name)
+            continue
+        relay = SnmpRelay(queue, cfg.snmp_allow)
+        threading.Thread(target=relay.serve, args=(sock,), daemon=True,
+                         name=f'snmp-relay-{queue.slug}').start()
+        started.append(relay)
+
+    # A printer configured for an address nobody is listening on is a setting
+    # that looks applied and is not.
+    listening = {bound_address(s) for s in socks}
+    for queue in queues:
+        if isinstance(queue.snmp_relay, str) and queue.snmp_relay not in listening:
+            log.error('snmp relay: %s expects a listener on %s and none was '
+                      'passed. Add a socket unit with '
+                      '"ListenDatagram=%s:161".',
+                      queue.name, queue.snmp_relay, queue.snmp_relay)
+    return started
+
+
+def plural(n, word):
+    return f'{n} {word}' if n == 1 else f'{n} {word}s'
+
+
+class PageCounter:
+    """The page counter for one printer, and a running opinion of it.
+
+    Two levels of confidence, because they carry different consequences:
+
+      trusted -- the printer answers, and says its counter counts impressions
+                 or sheets. Enough to print the numbers in a report.
+      proven  -- the counter has been seen to move in step with a job that
+                 printed. Enough to let it contradict the printer's own job
+                 accounting and raise an alert of its own.
+
+    Nothing is persisted. Trust is established from what the printer states
+    about itself, which is available immediately and does not need a history,
+    and is revoked from behaviour, which does. That way this is useful on the
+    first job after a restart without keeping a state file to go stale.
+    """
+
+    def __init__(self, queue, community='public', enabled=True):
+        self.queue = queue
+        self.community = community
+        self.enabled = enabled
+        self.unit = None
+        self.probed = False
+        self.moved = False           # seen to advance in step with a job
+        self.misses = 0
+        self.frozen = 0
+        self.backwards = 0
+        self.reason = None           # why it was switched off, if it was
+        self.lock = threading.Lock()
+
+    # -- state ------------------------------------------------------------
+    @property
+    def trusted(self):
+        return self.enabled and self.probed and self.unit in COUNTER_UNITS
+
+    @property
+    def proven(self):
+        return self.trusted and self.moved
+
+    def disable(self, reason):
+        """Stop using the counter, and say so where somebody will see it.
+
+        Loudly, and once. A signal that silently degrades to nothing is worse
+        than one that was never there: reports keep arriving, one of their
+        arguments quietly stops meaning anything, and nobody knows which.
+        """
+        if not self.enabled:
+            return
+        self.enabled = False
+        self.reason = reason
+        log.error('%s: DISABLING the SNMP page-counter cross-check -- %s. '
+                  'Reports will no longer corroborate impressions against the '
+                  'printer\'s own counter. Silence this with '
+                  '"?page-counter=off" on the printer URI once you have '
+                  'decided it is expected.', self.queue.name, reason)
+
+    # -- reading ----------------------------------------------------------
+    def read(self, timeout=5):
+        if not self.enabled:
+            return None
+        return snmp.get(self.queue.host, OID_PAGE_COUNT, self.community,
+                        timeout=timeout)
+
+    def probe(self, timeout=5):
+        """Ask once whether this printer has a counter worth reading."""
+        with self.lock:
+            if self.probed or not self.enabled:
+                return
+            value = self.read(timeout)
+            if value is None:
+                self.enabled = False
+                self.reason = 'the printer does not answer SNMP'
+                log.info('%s: no SNMP page counter (%s); reports will rely on '
+                         'the printer\'s own job accounting alone',
+                         self.queue.name, self.reason)
+                return
+            if not isinstance(value, int):
+                self.probed = True
+                self.disable(f'the page-counter OID returned {value!r}, '
+                             f'which is not a number')
+                return
+            unit = snmp.get(self.queue.host, OID_COUNTER_UNIT, self.community,
+                            timeout=timeout)
+            self.unit = unit if isinstance(unit, int) else None
+            self.probed = True
+            if self.unit not in COUNTER_UNITS:
+                self.disable(f'the printer counts in units {self.unit!r}, '
+                             f'which cannot be compared with impressions')
+                return
+            log.info('%s: SNMP page counter at %d %s', self.queue.name,
+                     value, COUNTER_UNITS[self.unit])
+
+    # -- judging ----------------------------------------------------------
+    def delta(self, before, after):
+        """How far the counter moved, or None if the move makes no sense."""
+        if before is None or after is None:
+            return None
+        step = after - before
+        if step >= 0:
+            return step
+        # Counter32 wrapping is legitimate and looks like a huge drop. A small
+        # drop is not a wrap: it is a reset, which some printers do when a
+        # cartridge is replaced, and which invalidates this reading but not
+        # necessarily the counter.
+        if before > COUNTER32 - MAX_PLAUSIBLE_JUMP:
+            return step + COUNTER32
+        return None
+
+    def assess(self, before, after, impressions):
+        """Judge one finished job, and the counter along with it.
+
+        Called for every job that is followed, not only for failing ones: the
+        counter can only earn or lose trust from jobs that worked.
+
+        Returns (lines, contradicted) -- report text, and whether the counter
+        says this job did not print despite the printer saying it did.
+        """
+        with self.lock:
+            return self._assess(before, after, impressions)
+
+    def _assess(self, before, after, impressions):
+        # Snapshot before anything below can revoke it. Otherwise a job that
+        # both contradicts the counter and exhausts its credibility reports
+        # "not yet corroborated" about a counter that was corroborated right
+        # up until this line.
+        was_proven = self.proven
+        if not self.enabled:
+            why = self.reason or 'switched off'
+            return [f'page counter: not used ({why})'], False
+        if before is None or after is None:
+            self.misses += 1
+            if self.misses >= MISS_LIMIT:
+                self.disable('the printer stopped answering SNMP')
+            return ['page counter: could not be read for this job'], False
+        self.misses = 0
+
+        moved = self.delta(before, after)
+        if moved is None:
+            self.backwards += 1
+            if self.backwards >= 2:
+                self.disable(f'the counter went backwards more than once '
+                             f'({before} then {after})')
+            else:
+                log.warning('%s: the page counter went backwards, %d then %d. '
+                            'A cartridge change or a service reset does this; '
+                            'once is not enough to stop believing it.',
+                            self.queue.name, before, after)
+            return [f'page counter: {before} then {after} -- went backwards, '
+                    f'so this job cannot be judged by it'], False
+
+        if moved > MAX_PLAUSIBLE_JUMP:
+            self.disable(f'the counter jumped by {moved:,} during one job, '
+                         f'which is not a page count')
+            return [f'page counter: jumped {moved:,} ({before} to {after})'],\
+                False
+
+        unit = COUNTER_UNITS.get(self.unit, 'units')
+        line = f'page counter: {before} to {after} ({moved:+d} {unit})'
+        contradicted = False
+        if impressions:
+            if moved:
+                self.moved = True       # the instrument works; now it counts
+                self.frozen = 0
+            else:
+                self.frozen += 1
+                if was_proven:
+                    contradicted = True
+                    line += (f'  -- the job reported {plural(impressions, "impression")}'
+                             ' and the counter did not move at all')
+                if self.frozen >= FROZEN_LIMIT:
+                    # Having decided the instrument is broken, do not also act
+                    # on its last reading.
+                    contradicted = False
+                    self.disable(
+                        f'{self.frozen} jobs reported impressions without '
+                        f'moving the counter, so it is not tracking this '
+                        f'printer\'s output. ANY EARLIER REPORT THAT BLAMED '
+                        f'THIS COUNTER WAS PROBABLY WRONG')
+        elif moved:
+            line += '  -- something was marked, though not necessarily this job'
+        else:
+            line += '  -- nothing was marked, by the printer\'s own count'
+        if not was_proven:
+            line += ('\n  (not yet corroborated: the counter has not been seen '
+                     'to move for a job that printed)')
+        return [line], contradicted
+
+
 def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
               archived=None):
     """Follow one job to its end and report if the printer marked nothing."""
+    # Read the page counter before following the job. This happens just after
+    # the client was answered, so the printer may in principle have started
+    # marking already -- but the failure this matters most for marks nothing at
+    # all, and no race can turn "never moved" into "moved".
+    queue.pages.probe()
+    before = queue.pages.read()
+
     deadline = time.monotonic() + cfg.alert_timeout
     state = impressions = None
     reasons = ''
@@ -1272,11 +1888,27 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
         if new_state in ALERT_TERMINAL:
             break
 
+    if queue.pages.enabled and before is not None:
+        time.sleep(SETTLE)          # the last sheet is counted after the job
+    after = queue.pages.read()
+    page_lines, contradicted = queue.pages.assess(before, after, impressions)
+
     # Judge. Only complain about things that are actually wrong: a job that
-    # completed having marked pages is the ordinary case and says nothing.
-    if state == 9 and impressions:
+    # completed having marked pages is the ordinary case and says nothing --
+    # unless the counter that is tied to the marking engine says otherwise,
+    # which is the one case where the job accounting alone would have missed
+    # the failure entirely.
+    if state == 9 and impressions and not contradicted:
         return
-    if state is None:
+    if contradicted:
+        verdict = 'COUNTED BUT NOT PRINTED'
+        detail = (f'the printer reported the job completed and claimed '
+                  f'{impressions} impressions, but its own page counter did '
+                  f'not move. Those two numbers come from different parts of '
+                  f'the printer, and the page counter is the one tied to the '
+                  f'marking engine -- so the job most likely did not print. '
+                  f'Nothing above this proxy would ever have noticed.')
+    elif state is None:
         verdict = 'NO ANSWER'
         detail = (f'the printer stopped answering questions about this job '
                   f'within {cfg.alert_timeout}s')
@@ -1305,8 +1937,9 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
              f'conversion:   {note or "relayed unconverted"}',
              f'final state:  {ALERT_TERMINAL.get(state, state)}'
              + (f' ({reasons})' if reasons else ''),
-             f'impressions:  {impressions}',
-             '', 'What the printer said, in order:']
+             f'impressions:  {impressions}']
+    lines += [f'{x}' for x in page_lines]
+    lines += ['', 'What the printer said, in order:']
     lines += [f'  {st} impressions={im} reasons={rs or "none"}'
               for st, im, rs in history]
     lines += ['', 'The document this proxy gave the printer, structurally:']
@@ -1318,7 +1951,7 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
                                   cfg.alert_max_attachment)
     lines += ['', 'Attached:'] + said
     lines += ['', 'To investigate:', '']
-    if verdict == 'LOST SILENTLY':
+    if verdict in ('LOST SILENTLY', 'COUNTED BUT NOT PRINTED'):
         lines += [
             '  A job that the printer says succeeded but did not print is the',
             '  whole point of this proxy, so this is worth chasing.',
@@ -2084,30 +2717,40 @@ class Handler(socketserver.BaseRequestHandler):
 SD_LISTEN_FDS_START = 3
 
 
-def inherited_socket():
-    """The listening socket systemd passed us, if it did.
+def inherited_sockets():
+    """The listening sockets systemd passed us, by name.
 
-    With socket activation systemd opens the port itself and hands over the
-    descriptor, so the service never needs the privilege to bind a port below
-    1024 -- it can run with no capabilities at all. Falls back to binding
-    directly when started by hand.
+    With socket activation systemd opens the ports itself and hands over the
+    descriptors, so the service never needs the privilege to bind a port below
+    1024 -- it can run with no capabilities at all. Returns {name: socket};
+    empty when started by hand, in which case the caller binds for itself.
+
+    Names come from FileDescriptorName= in each socket unit. There is more than
+    one socket now, and taking "the first" would work right up until systemd
+    passed them in a different order.
     """
     if os.environ.get('LISTEN_PID') != str(os.getpid()):
-        return None
+        return {}
     try:
         count = int(os.environ.get('LISTEN_FDS', '0'))
     except ValueError:
-        return None
-    if count < 1:
-        return None
-    if count > 1:
-        log.warning('systemd passed %d sockets; using the first', count)
-    sock = socket.socket(fileno=SD_LISTEN_FDS_START)
-    sock.setblocking(True)
-    os.set_inheritable(sock.fileno(), False)
+        return {}
+    names = os.environ.get('LISTEN_FDNAMES', '').split(':')
+    out = []
+    for i in range(count):
+        fd = SD_LISTEN_FDS_START + i
+        name = names[i] if i < len(names) and names[i] else str(fd)
+        sock = socket.socket(fileno=fd)
+        sock.setblocking(True)
+        os.set_inheritable(fd, False)
+        out.append((name, sock))
     for name in ('LISTEN_PID', 'LISTEN_FDS', 'LISTEN_FDNAMES'):
         os.environ.pop(name, None)
-    return sock
+    # A list, not a dict: an administrator serving several printers runs one
+    # socket unit per address, and nothing stops two of them carrying the same
+    # FileDescriptorName. Keyed by name, the second would replace the first and
+    # one printer would silently go unanswered.
+    return out
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -2313,6 +2956,22 @@ def build_parser():
     parser.add_argument('--alert-timeout', type=int, default=600, metavar='SEC',
                         help='how long to follow a job before giving up on it '
                              '(default 600)')
+    parser.add_argument('--no-page-counter', action='store_true',
+                        help='do not read the printer\'s RFC 3805 page counter '
+                             'over SNMP when judging a job. It is used by '
+                             'default because it comes from the marking engine '
+                             'rather than from the job accounting that just '
+                             'reported success; see ippfix(8). Per printer, put '
+                             '"?page-counter=off" on its URI instead.')
+    parser.add_argument('--no-snmp-relay', action='store_true',
+                        help='do not answer SNMP on the printer\'s behalf, even '
+                             'if a socket is passed for it. The relay serves '
+                             'read-only GET and GETNEXT inside the Printer MIB '
+                             'and refuses everything else; see ippfix(8).')
+    parser.add_argument('--snmp-allow', action='append', metavar='CIDR',
+                        help='only answer SNMP from this network; repeatable. '
+                             'By default any source is answered, subject to the '
+                             'rate limit.')
     parser.add_argument('--alert-max-attachment', type=int, default=8,
                         metavar='MB',
                         help='attach at most MB megabytes of documents to a '
@@ -2423,10 +3082,19 @@ def main(argv=None):
         queue.learn()
 
     withdraw = None if args.no_advertise else advertise(cfg)
-    listen_fd = inherited_socket()
+    passed = inherited_sockets()
+    # 'ipp' is the name the socket unit gives it; a hand-started daemon and an
+    # older unit without FileDescriptorName= fall back to the first stream
+    # socket. Datagram sockets are the SNMP listeners, matched to printers by
+    # the address they bound rather than by what they were called.
+    streams = [s for n, s in passed if s.type == socket.SOCK_STREAM]
+    listen_fd = next((s for n, s in passed if n == 'ipp'),
+                     streams[0] if streams else None)
     if listen_fd is not None:
         log.info('  socket activated: using the descriptor systemd passed, '
                  'so no capabilities are required')
+    start_snmp_relays(cfg, [s for n, s in passed
+                            if s.type == socket.SOCK_DGRAM])
     server = Server(('::', cfg.port), Handler, cfg, listen_fd)
     try:
         server.serve_forever()

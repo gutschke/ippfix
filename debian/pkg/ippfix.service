@@ -18,7 +18,11 @@ Documentation=man:ippfix(8) https://github.com/gutschke/ippfix
 # here skips it cleanly instead, and After= still guarantees the sockets are
 # up first so the descriptors are inherited.
 Wants=ippfix.socket ippfix-convert.socket
+# ippfix-snmp.socket is ordered but deliberately not wanted: Wants= would
+# start it, which would open UDP 161 on every install. After= is a no-op
+# unless an administrator has enabled it.
 After=network.target network-online.target ippfix.socket ippfix-convert.socket
+After=ippfix-snmp.socket
 Wants=network-online.target
 
 [Service]

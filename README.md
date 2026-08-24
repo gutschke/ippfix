@@ -163,6 +163,21 @@ same document — a fault that survives conversion is a different bug from one
 conversion introduced. Without `--archive` the report describes the document
 but cannot attach it, because no copy was kept.
 
+Every report also cross-checks the printer against **its own page counter**,
+read over SNMP. `job-impressions-completed` comes from the firmware that has
+just reported success for a job it did not print; the RFC 3805 page counter
+comes from the marking engine — a different subsystem, and the number a service
+contract bills on. When the two disagree, the counter is the one to believe:
+a job the printer claims to have printed while its counter never moved is a
+failure nothing else in the stack would have noticed.
+
+It is checked before it is believed. The printer is asked what its counter
+counts, and a counter that goes backwards twice, jumps implausibly, stops
+answering, or repeatedly fails to move for jobs reporting impressions is
+switched off with an error in the journal saying so. It is never trusted enough
+to accuse a printer until it has been seen to move for a job that did print.
+`--no-page-counter` turns it off, or `?page-counter=off` on one printer's URI.
+
 That also means a report can carry something somebody printed. Send it
 somewhere that reflects how sensitive the printing is, and see
 `--alert-max-attachment` for the size bound.

@@ -6,6 +6,10 @@ Documentation=man:ippfix(8)
 # systemd opens the privileged port and hands the descriptor to the service,
 # so ippfix.service itself needs no capabilities at all.
 ListenStream=631
+# Named, because there is more than one socket now and the daemon must be able
+# to tell them apart. Without this it falls back to "the first descriptor",
+# which is correct only until systemd passes them in a different order.
+FileDescriptorName=ipp
 BindIPv6Only=both
 Backlog=64
 

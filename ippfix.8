@@ -9,6 +9,9 @@ cache.
 [\fB\-\-also\-advertise\fR \fIADDRESS\fR]
 [\fB\-\-alert\-mail\fR \fIADDRESS\fR]
 [\fB\-\-alert\-max\-attachment\fR \fIMB\fR]
+[\fB\-\-no\-page\-counter\fR]
+[\fB\-\-no\-snmp\-relay\fR]
+[\fB\-\-snmp\-allow\fR \fICIDR\fR]
 [\fB\-\-alert\-max\-per\-hour\fR \fIN\fR]
 [\fB\-\-alert\-spool\fR \fIDIR\fR]
 [\fB\-\-alert\-timeout\fR \fISEC\fR]
@@ -104,6 +107,48 @@ becomes the queue name, published at
 Without one, the queue is named
 .BR print .
 May be repeated to serve several printers from one daemon.
+
+.SH PRINTER OPTIONS
+Settings that belong to one printer rather than to the daemon are written as a
+query string on that printer's URI, because that is the only place a per\-device
+setting can be put without inventing a way to name the device it applies to:
+.PP
+.EX
+ippfix 'Front Desk=ipp://192.0.2.10/ipp/print?page\-counter=off'
+.EE
+.TP
+.B page\-counter=on|off
+Whether to cross\-check this printer's jobs against its SNMP page counter.
+Default on. See
+.BR \-\-no\-page\-counter .
+.TP
+.B community=NAME
+SNMP community for this printer. Default
+.BR public .
+.TP
+.B snmp\-relay=on|off|ADDRESS
+Whether the SNMP relay speaks for this printer, and on which listener. Unset
+means "if it is the only one".
+.IP
+With several printers, a wildcard listener is not answered at all and the
+journal says why: SNMP carries nothing that names a printer, so answering would
+mean picking one, and a monitoring system reading the wrong printer's page
+counter is worse than one that reads nothing. Either mark exactly one printer
+.BR on ,
+or give the host an address per printer, run a socket unit bound to each, and
+name that address here. The daemon matches a listener to a printer by asking
+the socket what it bound, so nothing depends on what the units are called. An
+address claimed with no listener behind it, or a listener with no printer, is
+reported as an error at startup.
+.IP
+See
+.I ippfix\-snmp\-per\-printer.socket.example
+in the package documentation, and
+.BR \-\-no\-snmp\-relay .
+.PP
+An unrecognised option is an error rather than something ignored: a mistyped
+setting that is silently dropped is how a printer ends up not doing what its
+configuration says.
 
 .SH OPTIONS
 .TP
@@ -241,6 +286,95 @@ structure \- intact.
 Note what this means: a report can carry a document somebody printed. That is
 the point of it, but it is also mail. Send it somewhere that reflects how
 sensitive the printing is.
+.TP
+.B \-\-no\-page\-counter
+Do not read the printer's page counter over SNMP when judging a job.
+.IP
+.B job\-impressions\-completed
+comes from the same firmware that has just reported success for a job it did
+not print. The RFC 3805 page counter
+.RB ( prtMarkerLifeCount )
+comes from the marking engine: a different subsystem, the number the meter
+reads and the number a service contract bills on. When the two disagree, the
+page counter is the one to believe, and a job the printer claims to have
+printed while its own counter did not move is a failure nothing else here would
+have noticed.
+.IP
+It is used by default, and checked before it is believed. The printer is asked
+what its counter counts
+.RB ( prtMarkerCounterUnit );
+anything but impressions or sheets cannot be compared with impressions and the
+signal is switched off. After that it is judged on behaviour: a counter that
+goes backwards twice, that jumps by an implausible amount during one job, that
+stops answering, or that three times fails to move for a job reporting
+impressions is switched off with an error in the journal saying so \- including
+that earlier reports which relied on it were probably wrong. It is never
+believed enough to raise an alert of its own until it has been seen to move for
+a job that did print.
+.IP
+A forward jump is deliberately not treated as suspicion of a fault. This proxy
+is not the only way to reach a printer, and copies, received faxes and internal
+pages all advance the counter; only a jump too large to be paper is taken as
+evidence, and then as evidence about the OID rather than about the job.
+.IP
+Per printer, put
+.B ?page\-counter=off
+on its URI instead. See
+.B PRINTER OPTIONS
+below.
+.TP
+.B \-\-no\-snmp\-relay
+Do not answer SNMP on the printer's behalf.
+.IP
+The printer is often somewhere clients cannot reach, which is the reason this
+proxy exists and also puts the printer's status out of reach. What a print
+client actually uses \- supply levels, state reasons \- already travels over IPP
+and is relayed with everything else. This is for the rest: a person with
+.BR snmpget (1)
+who wants the page counter or the console text.
+.IP
+The relay serves
+.B GET
+and
+.B GETNEXT
+inside the system group, the host\-resources device and printer tables, and the
+Printer MIB. It refuses
+.BR GETBULK ,
+because max\-repetitions is what turns a small request into a large reply and
+that is what makes an open SNMP responder worth reflecting off; it refuses
+.BR SET ,
+because the Printer MIB has writable objects including a reset; and it refuses
+SNMPv3 and anything outside those subtrees. A
+.B GETNEXT
+that walks off the end of a subtree is not answered, so a walk stops at the
+boundary. Requests are rate limited per source and overall, and over the limit
+nothing is sent at all \- answering is the amplification.
+.IP
+Its socket is shipped but not enabled. Opening a UDP port to answer questions
+about a printer is a decision about what the network may see:
+.IP
+.EX
+systemctl enable ippfix\-snmp.socket
+systemctl stop ippfix
+systemctl start ippfix\-snmp.socket
+systemctl start ippfix
+.EE
+.IP
+In that order, and only the first time. A socket unit cannot hand its
+descriptor to a service that is already running, so systemd refuses to start it
+while the daemon is up. On every boot afterwards the ordering is automatic.
+.IP
+The relay speaks for one printer, because SNMP has no way to say which printer
+a request is about. With one printer configured that is unambiguous; with
+several, mark one with
+.BR ?snmp\-relay=on .
+If the printer does not answer SNMP itself the relay is not started at all.
+.TP
+.B \-\-snmp\-allow " \fICIDR\fR"
+Answer SNMP only from this network; may be repeated. By default any source is
+answered, subject to the rate limit. Worth setting: the exposure this adds is
+not a new protocol \- the printer already speaks it \- but a wider audience for
+it, and this is what narrows the audience again.
 .TP
 .B \-\-archive " \fIDIR\fR"
 Diagnostic only. Keep a copy of every job exactly as it arrived, before

@@ -28,7 +28,6 @@ first failure unless told otherwise.
 """
 import argparse
 import os
-import socket
 import struct
 import sys
 import time
@@ -48,6 +47,17 @@ else:
     sys.exit('cannot find ippcodec.py; run this from the source tree, or '
              'install ippfix')
 import ippcodec as ipp                                              # noqa: E402
+import snmpmini                                                     # noqa: E402
+
+
+def snmp_get(host, oid, community='public', timeout=5):
+    """One SNMP v2c GET. Returns str, int, or None when unreachable.
+
+    Kept as a name of its own because this script has always had one; the
+    implementation now lives beside the daemon so both read the counter the
+    same way, including checking that the answer belongs to the question.
+    """
+    return snmpmini.get(host, oid, community, timeout=timeout)
 
 # RFC 3805 / RFC 2790. Portable across manufacturers.
 OID_PAGE_COUNT = '1.3.6.1.2.1.43.10.2.1.4.1.1'      # prtMarkerLifeCount
@@ -79,89 +89,6 @@ def _len(n):
         out = bytes([n & 0xFF]) + out
         n >>= 8
     return bytes([0x80 | len(out)]) + out
-
-
-def _tlv(tag, payload):
-    return bytes([tag]) + _len(len(payload)) + payload
-
-
-def _int(n):
-    if n == 0:
-        return _tlv(0x02, b'\x00')
-    out = b''
-    while n:
-        out = bytes([n & 0xFF]) + out
-        n >>= 8
-    if out[0] & 0x80:
-        out = b'\x00' + out
-    return _tlv(0x02, out)
-
-
-def _oid(text):
-    parts = [int(x) for x in text.split('.')]
-    body = bytes([parts[0] * 40 + parts[1]])
-    for p in parts[2:]:
-        if p < 0x80:
-            body += bytes([p])
-            continue
-        chunk = []
-        while p:
-            chunk.insert(0, (p & 0x7F) | 0x80)
-            p >>= 7
-        chunk[-1] &= 0x7F
-        body += bytes(chunk)
-    return _tlv(0x06, body)
-
-
-def _read(buf, pos):
-    tag = buf[pos]
-    ln = buf[pos + 1]
-    pos += 2
-    if ln & 0x80:
-        k = ln & 0x7F
-        ln = int.from_bytes(buf[pos:pos + k], 'big')
-        pos += k
-    return tag, buf[pos:pos + ln], pos + ln
-
-
-def snmp_get(host, oid, community='public', timeout=5):
-    """One SNMP v2c GET. Returns str, int, or None when unreachable."""
-    varbind = _tlv(0x30, _oid(oid) + _tlv(0x05, b''))
-    pdu = _tlv(0xA0, _int(1) + _int(0) + _int(0) + _tlv(0x30, varbind))
-    pkt = _tlv(0x30, _int(1) + _tlv(0x04, community.encode()) + pdu)
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout)
-    try:
-        s.sendto(pkt, (host, 161))
-        data, _ = s.recvfrom(4096)
-    except OSError:
-        return None
-    finally:
-        s.close()
-    try:
-        _t, seq, _ = _read(data, 0)
-        pos = 0
-        _t, _v, pos = _read(seq, pos)
-        _t, _c, pos = _read(seq, pos)
-        _t, body, _ = _read(seq, pos)
-        pos = 0
-        _t, _rid, pos = _read(body, pos)
-        _t, err, pos = _read(body, pos)
-        if int.from_bytes(err, 'big'):
-            return None
-        _t, _idx, pos = _read(body, pos)
-        _t, vbs, _ = _read(body, pos)
-        _t, vb, _ = _read(vbs, 0)
-        pos = 0
-        _t, _o, pos = _read(vb, pos)
-        tag, val, _ = _read(vb, pos)
-    except (IndexError, ValueError):
-        return None
-    if tag in (0x02, 0x41, 0x42, 0x43, 0x44, 0x45):
-        return int.from_bytes(val, 'big')
-    if tag == 0x05:
-        return None
-    return val.decode('utf-8', 'replace').strip()
 
 
 # --------------------------------------------------------------------------

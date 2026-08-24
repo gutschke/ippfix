@@ -541,6 +541,207 @@ assert msg['From'] == 'ippfix <someone@example.com>', msg['From']
 assert msg['To'] == 'someone@example.com', msg['To']
 PY2
 
+echo 'page counter'
+python3 - <<'PY2' && ok 'the page counter is checked before it is believed' || bad 'page counter trust'
+import logging, sys
+sys.path.insert(0, '.')
+logging.disable(logging.CRITICAL)      # this deliberately provokes error logs
+import ippfix
+
+def counter(unit=7):
+    q = ippfix.parse_queue('t=ipp://printer.example/ipp/print')
+    pc = ippfix.PageCounter(q)
+    pc.probed, pc.unit = True, unit
+    return pc
+
+# The printer says what its counter counts. Anything but impressions or sheets
+# is a correct answer to that OID and a useless one here.
+assert counter(7).trusted and counter(8).trusted
+assert not counter(5).trusted, 'characters is not a page count'
+assert not counter(None).trusted
+
+# Nothing is believed enough to raise an alert until it has been seen to work.
+pc = counter()
+_lines, contradicted = pc.assess(100, 100, 3)
+assert not contradicted, 'an uncorroborated counter must not accuse a printer'
+_lines, contradicted = pc.assess(100, 103, 3)      # now it has been seen to move
+assert not contradicted and pc.proven
+_lines, contradicted = pc.assess(103, 103, 3)
+assert contradicted, 'a proven counter that does not move is the finding'
+
+# ...and three of those means the instrument is broken, not the printer. The
+# last one must not also be reported: we have just decided not to believe it.
+pc = counter(); pc.assess(0, 1, 1)
+verdicts = [pc.assess(1, 1, 1)[1] for _ in range(3)]
+assert verdicts == [True, True, False], verdicts
+assert not pc.enabled and 'PROBABLY WRONG' in pc.reason
+
+# Backwards once is a cartridge change; twice is not.
+pc = counter()
+assert pc.delta(500, 400) is None
+pc.assess(500, 400, 1); assert pc.enabled
+pc.assess(400, 300, 1); assert not pc.enabled
+# ...but a Counter32 wrap is not backwards at all.
+assert counter().delta((1 << 32) - 5, 3) == 8
+
+# A jump too large to be paper says the OID is not a page count. A merely large
+# one does not: this proxy is not the only way to reach a printer.
+pc = counter(); pc.assess(0, ippfix.MAX_PLAUSIBLE_JUMP - 1, 1)
+assert pc.enabled
+pc = counter(); pc.assess(0, ippfix.MAX_PLAUSIBLE_JUMP + 1, 1)
+assert not pc.enabled
+
+# Silence is also a verdict.
+pc = counter()
+for _ in range(ippfix.MISS_LIMIT):
+    pc.assess(None, None, 1)
+assert not pc.enabled
+PY2
+
+python3 - <<'PY2' && ok 'per-printer settings ride on the printer URI' || bad 'printer URI options'
+import sys
+sys.path.insert(0, '.')
+import ippfix
+
+q = ippfix.parse_queue('t=ipp://p.example/ipp/print')
+assert q.want_page_counter and q.community == 'public'
+assert q.snmp_relay is None, 'unset is not the same as off'
+q = ippfix.parse_queue('t=ipp://p.example/ipp/print?page-counter=off&community=x')
+assert not q.want_page_counter and q.community == 'x'
+assert q.path == '/ipp/print', 'options must not leak into the upstream path'
+# A mistyped option that is silently ignored is how a printer ends up not doing
+# what its configuration says.
+for bad_uri in ('t=ipp://p/ipp/print?pagecounter=off',
+                't=ipp://p/ipp/print?page-counter=maybe'):
+    try:
+        ippfix.parse_queue(bad_uri)
+    except ValueError:
+        continue
+    raise AssertionError(bad_uri)
+
+# SNMP carries nothing that names a printer, so one listener speaks for one
+# printer -- and with several printers the daemon must refuse rather than pick.
+def qs(*specs):
+    return [ippfix.parse_queue(s) for s in specs]
+one = qs('a=ipp://p1/ipp/print')
+assert ippfix.choose_relay_queue(one)[0] is one[0]
+two = qs('a=ipp://p1/ipp/print', 'b=ipp://p2/ipp/print')
+picked, why = ippfix.choose_relay_queue(two)
+assert picked is None and 'snmp-relay' in why, why
+marked = qs('a=ipp://p1/ipp/print?snmp-relay=on', 'b=ipp://p2/ipp/print')
+assert ippfix.choose_relay_queue(marked)[0].name == 'a'
+both = qs('a=ipp://p1/ipp/print?snmp-relay=on', 'b=ipp://p2/ipp/print?snmp-relay=on')
+assert ippfix.choose_relay_queue(both)[0] is None
+
+# One address per printer is the way to serve several at once: the address
+# does the naming the protocol will not.
+pair = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1',
+          'b=ipp://p2/ipp/print?snmp-relay=10.0.0.2')
+assert ippfix.choose_relay_queue(pair, '10.0.0.1')[0].name == 'a'
+assert ippfix.choose_relay_queue(pair, '10.0.0.2')[0].name == 'b'
+assert ippfix.choose_relay_queue(pair, '10.0.0.3')[0] is None
+# A printer with its own listener must not also be answered by the wildcard.
+assert ippfix.choose_relay_queue(pair, None)[0] is None
+mixed = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1', 'c=ipp://p3/ipp/print')
+assert ippfix.choose_relay_queue(mixed, None)[0].name == 'c'
+# Two printers claiming one address is a configuration error, not a coin toss.
+clash = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1',
+           'b=ipp://p2/ipp/print?snmp-relay=10.0.0.1')
+assert ippfix.choose_relay_queue(clash, '10.0.0.1')[0] is None
+try:
+    ippfix.parse_queue('a=ipp://p/ipp/print?snmp-relay=nonsense')
+except ValueError:
+    pass
+else:
+    raise AssertionError('an unparseable listen address must not be accepted')
+PY2
+
+echo 'snmp relay'
+python3 - <<'PY2' && ok 'the relay answers only what it promised to' || bad 'snmp relay policy'
+import ipaddress, logging, sys
+sys.path.insert(0, '.')
+logging.disable(logging.CRITICAL)
+import ippfix, snmpmini as snmp
+
+q = ippfix.parse_queue('t=ipp://198.51.100.9/ipp/print')
+relay = ippfix.SnmpRelay(q)
+
+def req(oid, pdu=snmp.GET, version=snmp.V2C):
+    return snmp.encode_request(oid, 'public', pdu, version=version)[1]
+
+# Refused before the printer is ever contacted, so acceptable() is the test:
+# handle() would try to forward and time out.
+assert relay.acceptable(snmp.parse(req('1.3.6.1.2.1.43.10.2.1.4.1.1'))) is None
+assert relay.acceptable(snmp.parse(req('1.3.6.1.2.1.1.1.0'))) is None
+assert relay.acceptable(snmp.parse(req('1.3.6.1.2.1.43.10', snmp.GETNEXT))) is None
+# GETBULK is the amplifier; SET can reset the printer; the rest is not ours.
+assert relay.acceptable(snmp.parse(req('1.3.6.1.2.1.43.10', snmp.GETBULK)))
+assert relay.acceptable(snmp.parse(req('1.3.6.1.2.1.43.5.1.1.3.1', snmp.SET)))
+assert relay.acceptable(snmp.parse(req('1.3.6.1.2.1.2.2.1.6.1')))
+assert relay.acceptable(snmp.parse(req('1.3.6.1.4.1.11.2.3.9.1')))
+assert relay.acceptable(snmp.parse(req('1.3.6.1.2.1.1.1.0', version=3)))
+
+# Malformed input is a non-event, not an incident.
+for junk in (b'', b'\x30', b'\x30\x05\x02\x01', b'\x30\x82\xff\xff junk',
+             b'\x30\x03\x02\x01\x00', bytes(9000)):
+    assert relay.handle(junk, ('192.0.2.1', 1)) is None
+
+# Rate limited per source, and over the limit nothing is sent: answering is
+# the amplification.
+r2 = ippfix.SnmpRelay(q)
+allowed = sum(1 for _ in range(50) if r2.allowed_rate('192.0.2.1'))
+assert allowed == r2.PER_SOURCE_BURST, allowed
+# The per-source table must not grow without bound on spoofed sources.
+r3 = ippfix.SnmpRelay(q)
+for i in range(r3.MAX_SOURCES + 200):
+    r3.allowed_rate('192.0.2.%d' % (i % 250))
+assert len(r3.sources) <= r3.MAX_SOURCES + 1, len(r3.sources)
+
+r4 = ippfix.SnmpRelay(q, [ipaddress.ip_network('10.0.0.0/8')])
+assert r4.permitted_source('10.1.2.3') and not r4.permitted_source('192.0.2.1')
+assert not r4.permitted_source('not-an-address')
+# A dual-stack socket reports an IPv4 peer as ::ffff:10.1.2.3, which matches no
+# IPv4 network an administrator would type -- so --snmp-allow would have
+# blocked everyone while looking correct.
+assert ippfix.client_ip(('::ffff:10.1.2.3', 161)) == '10.1.2.3'
+assert ippfix.client_ip(('2001:db8::1', 161)) == '2001:db8::1'
+assert r4.permitted_source(ippfix.client_ip(('::ffff:10.1.2.3', 161)))
+PY2
+
+python3 - <<'PY2' && ok 'SNMP parsing survives what arrives from a network' || bad 'snmp codec'
+import sys
+sys.path.insert(0, '.')
+import snmpmini as snmp
+
+rid, packet = snmp.encode_request('1.3.6.1.2.1.43.10.2.1.4.1.1', 'secret')
+msg = snmp.parse(packet)
+assert msg.community == 'secret' and msg.pdu_type == snmp.GET
+assert msg.oids == ['1.3.6.1.2.1.43.10.2.1.4.1.1'] and msg.request_id == rid
+assert snmp.decode_oid(snmp.encode_request('1.3.6.1.4.1.99999.1')[1][-13:-2]) or True
+
+# Round-tripping an OID with a multi-byte arc, which is where hand-rolled BER
+# usually breaks.
+for text in ('1.3.6.1.2.1.43.10.2.1.4.1.1', '1.3.6.1.4.1.11.2.3.9.1',
+             '1.3.6.1.4.1.2147483647.1', '0.0'):
+    body = snmp.encode_oid(text)
+    assert snmp.decode_oid(body[2:]) == text, text
+
+# Every length is checked against the buffer before it is used.
+for junk in (b'', b'\x30', b'\x30\x84\xff\xff\xff\xff', b'\x30\x80\x00\x00',
+             b'\x30\x02\x02\x7f', b'\x02\x01\x00'):
+    try:
+        snmp.parse(junk)
+    except snmp.SnmpError:
+        continue
+    raise AssertionError(repr(junk))
+try:
+    snmp.parse(bytes(snmp.MAX_DATAGRAM + 1))
+except snmp.SnmpError:
+    pass
+else:
+    raise AssertionError('oversized datagram accepted')
+PY2
+
 echo 'documentation'
 check 'man page renders without warnings' \
       "[ -z \"\$(man --warnings -l ./ippfix.8 2>&1 >/dev/null)\" ]"

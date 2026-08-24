@@ -3,6 +3,7 @@ export LC_ALL=C
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
 SOURCES=(ippfix{,.8,.8.md,.py,.service,.socket} ippfix-convert.socket
+         ippfix-snmp.socket snmpmini.py
          'ippfix-convert@.service' ippfix.tmpfiles.conf ippcodec.py defont
          {install,uninstall}.sh LICENSE
          README.md DEPLOYMENT.md DIAGNOSING.md INTERNALS.md OPEN-QUESTIONS.md)

@@ -195,6 +195,46 @@ document.** `printer_snapshot()` adds what the printer says about itself right
 then — model, firmware, state reasons, marker levels — which is how the
 alternative explanations get ruled out.
 
+`PageCounter` holds the second opinion. It reads `prtMarkerLifeCount` before
+and after each followed job and compares the movement with
+`job-impressions-completed`, which matters because those two numbers come from
+different parts of the printer and only one of them is tied to the marking
+engine.
+
+It has two levels of confidence and they carry different consequences.
+*Trusted* means the printer answers and says (via `prtMarkerCounterUnit`) that
+its counter counts impressions or sheets — enough to print the numbers in a
+report. *Proven* means the counter has been seen to move in step with a job
+that printed — enough to let it contradict the printer's own job accounting and
+raise an alert. That gate is the reason a broken counter cannot cry wolf: it
+must first demonstrate that it works.
+
+Trust is revoked from behaviour: backwards twice, a jump larger than
+`MAX_PLAUSIBLE_JUMP`, `MISS_LIMIT` unanswered reads, or `FROZEN_LIMIT` jobs
+that reported impressions without moving it. The third frozen job also
+*cancels* its own finding — having concluded the instrument is broken, acting
+on its last reading would be incoherent — and the log says outright that
+earlier reports were probably wrong. Nothing is persisted: trust is established
+from what the printer states about itself, which needs no history, and revoked
+from behaviour, which does. So it works on the first job after a restart and
+leaves no state file to go stale.
+
+Forward jumps are never treated as suspicion of a fault. The proxy is not the
+only route to a printer; copies, received faxes and internal pages all advance
+the counter. Only a jump too large to be paper is evidence, and then it is
+evidence about the OID rather than about the job.
+
+`SnmpRelay` is the other direction: answering SNMP for a printer clients cannot
+reach. `snmpmini` parses the request for a policy decision and the datagram is
+then forwarded **verbatim** — re-encoding would mean an encoder whose bugs are
+reachable from the network, to gain nothing, since the bytes already say
+exactly what was asked. The response is parsed again only to check the request
+id and that no OID walked outside the allowlist; a `GETNEXT` that leaves a
+subtree is dropped rather than answered, so a walk stops at the boundary.
+`GETBULK` is refused because `max-repetitions` is the amplification knob;
+measured against the real printer, the worst response inside the allowlist is
+143 bytes for a ~45-byte request.
+
 `gather_evidence()` attaches the documents, and only when `--archive` is on is
 there an original to attach. It attaches two when they differ: the job as the
 client sent it, read back from the archive, and the job as the proxy handed it

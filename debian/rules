@@ -14,7 +14,7 @@ override_dh_auto_test:
 override_dh_auto_install:
 	# Program files.
 	install -d debian/ippfix$(LIB)
-	install -m0644 ippfix.py ippcodec.py debian/ippfix$(LIB)/
+	install -m0644 ippfix.py ippcodec.py snmpmini.py debian/ippfix$(LIB)/
 	install -m0755 defont ippfix debian/ippfix$(LIB)/
 	install -m0755 debian/pkg/ippfix-setup debian/pkg/ippfix-configured \
 		debian/pkg/ippfix-sendalert debian/pkg/ippfix-archive-reminder \
@@ -30,6 +30,8 @@ override_dh_auto_install:
 	# are conditional on the real one appearing. Same arrangement as splitdnsd.
 	install -D -m0644 debian/pkg/ippfix.conf \
 		debian/ippfix/usr/share/doc/ippfix/ippfix.conf.example
+	install -D -m0644 debian/pkg/ippfix-snmp-per-printer.socket.example \
+		debian/ippfix/usr/share/doc/ippfix/ippfix-snmp-per-printer.socket.example
 
 	# Units, with the install path corrected and the command line moved out of
 	# ExecStart into the conffile.
@@ -40,6 +42,7 @@ override_dh_auto_install:
 	done
 	install -m0644 debian/pkg/ippfix.service debian/pkg/ippfix.socket \
 		debian/pkg/ippfix-alert.path debian/pkg/ippfix-alert.service \
+		debian/pkg/ippfix-snmp.socket \
 		debian/ippfix/usr/lib/systemd/system/
 	# See the file: dma's own queue flush kills the delivery agents it forks.
 	install -D -m0644 debian/pkg/dma.service.d/10-ippfix-killmode.conf \
@@ -93,6 +96,19 @@ override_dh_installsystemd:
 	dh_installsystemd -pippfix --name=ippfix-alert ippfix-alert.path
 	dh_installsystemd -pippfix --name=ippfix-alert --no-enable --no-start \
 		ippfix-alert.service
+	# The SNMP relay's socket is shipped but never enabled. It opens a UDP
+	# port to answer questions about the printer, which is a decision about
+	# what the network may see; an administrator makes it, not a postinst.
+	#
+	# All three: never enable it, never start it, and never stop it either.
+	# The other sockets survive an upgrade because ippfix.service Wants= them
+	# and is restarted; this one is deliberately not wanted, so nothing brings
+	# it back -- and --no-restart-after-upgrade still puts a stop in prerm,
+	# which quietly switched off a relay the administrator had turned on and
+	# left it off until the next reboot. Leaving it untouched is correct: a
+	# socket cannot hand its descriptor to a running service anyway.
+	dh_installsystemd -pippfix --name=ippfix-snmp --no-enable --no-start \
+		--no-stop-on-upgrade ippfix-snmp.socket
 	# Only the timer is enabled for the self-build; the oneshot service is
 	# started by the apt hook and by the timer, never on its own.
 	dh_installsystemd -pippfix-selfbuild --no-start ippfix-selfbuild.timer

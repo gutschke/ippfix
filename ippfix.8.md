@@ -7,7 +7,7 @@
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--advertise-hostname NAME] [--also-advertise ADDRESS] [--alert-mail ADDRESS] [--alert-max-attachment MB] [--alert-max-per-hour N] [--alert-timeout SEC] [--archive DIR] [--archive-max N] [--archive-max-bytes MB] [--cert FILE] [--converter PATH] [--key FILE] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--no-ipv6] [--no-advertise] [--no-convert] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--advertise-hostname NAME] [--also-advertise ADDRESS] [--alert-mail ADDRESS] [--alert-max-attachment MB] [--no-page-counter] [--no-snmp-relay] [--snmp-allow CIDR] [--alert-max-per-hour N] [--alert-timeout SEC] [--archive DIR] [--archive-max N] [--archive-max-bytes MB] [--cert FILE] [--converter PATH] [--key FILE] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--no-ipv6] [--no-advertise] [--no-convert] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -70,6 +70,32 @@ tell them apart.
   named `print`. May be repeated to serve several printers from one daemon.
 
 <a name="options"></a>
+
+# Printer options
+
+Settings that belong to one printer travel as a query string on that printer's
+URI, because that is the only place a per-device setting can go without
+inventing a way to name the device it applies to:
+
+```
+ippfix 'Front Desk=ipp://192.0.2.10/ipp/print?page-counter=off'
+```
+
+* `page-counter=on|off`: cross-check this printer against its SNMP page
+  counter. Default on.
+* `community=NAME`: SNMP community for this printer. Default `public`.
+* `snmp-relay=on|off|ADDRESS`: whether the relay speaks for this printer, and
+  on which listener. Unset means "if it is the only one".
+
+  With several printers a wildcard listener is not answered at all, and the
+  journal says why: SNMP carries nothing that names a printer, so answering
+  would mean picking one. Either mark exactly one printer `on`, or give the
+  host an address per printer, run a socket unit bound to each
+  (`ListenDatagram=198.51.100.11:161`), and name that address here. Listeners
+  are matched to printers by the address they bound, not by what the units are
+  called.
+
+An unrecognised option is an error rather than something ignored.
 
 # Options
 
@@ -163,6 +189,57 @@ tell them apart.
 * `--alert-timeout` *SEC*:
   Give up following a job after *SEC* seconds, default 600. A job still
   unfinished then is reported as such.
+
+* `--no-page-counter`:
+  Do not read the printer's page counter over SNMP when judging a job.
+
+  `job-impressions-completed` comes from the same firmware that has just
+  reported success for a job it did not print. The RFC 3805 page counter
+  (`prtMarkerLifeCount`) comes from the marking engine. When the two disagree,
+  the page counter is the one to believe, and a job the printer claims to have
+  printed while its own counter did not move is a failure nothing else here
+  would have noticed.
+
+  It is used by default and checked before it is believed: the printer is asked
+  what its counter counts (`prtMarkerCounterUnit`), and anything but
+  impressions or sheets switches the signal off. After that it is judged on
+  behaviour — backwards twice, an implausible jump during one job, silence, or
+  three failures to move for a job reporting impressions — and switched off
+  with an error saying so, including that earlier reports relying on it were
+  probably wrong. It never raises an alert of its own until it has been seen to
+  move for a job that did print.
+
+  A forward jump is deliberately *not* treated as suspicion. This proxy is not
+  the only way to reach a printer, and copies, received faxes and internal
+  pages all advance the counter; only a jump too large to be paper counts, and
+  then as evidence about the OID rather than about the job.
+
+* `--no-snmp-relay`:
+  Do not answer SNMP on the printer's behalf. The relay serves `GET` and
+  `GETNEXT` inside the system group, the host-resources device and printer
+  tables, and the Printer MIB. It refuses `GETBULK` (max-repetitions is what
+  turns a small request into a large reply), `SET` (the Printer MIB has
+  writable objects including a reset), SNMPv3, and anything outside those
+  subtrees. A `GETNEXT` that walks off the end of a subtree is not answered.
+  Rate limited per source and overall; over the limit nothing is sent, because
+  answering is the amplification.
+
+  Its socket ships disabled. Enabling it the first time needs this order,
+  because a socket unit cannot hand its descriptor to a service that is already
+  running:
+
+  ```
+  systemctl enable ippfix-snmp.socket
+  systemctl stop ippfix
+  systemctl start ippfix-snmp.socket
+  systemctl start ippfix
+  ```
+
+  The relay speaks for one printer; with several, mark one `?snmp-relay=on`.
+
+* `--snmp-allow` *CIDR*:
+  Answer SNMP only from this network; repeatable. Default is any source,
+  subject to the rate limit.
 
 * `--archive` *DIR*:
   Diagnostic only. Keep a copy of every job exactly as it arrived, before
