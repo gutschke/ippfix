@@ -389,14 +389,35 @@ requires it.
 ./scripts/selftest.sh
 ```
 
-44 checks, all offline: no printer, no network, nothing installed. It compiles
-the sources, round-trips IPP messages, exercises queue parsing and URL
-construction, checks IPv6 address selection against a synthetic
-`/proc/net/if_inet6`, runs `defont` over a PDF that really does embed a font
-(including inside an object stream), asserts the hardening rules above,
-verifies the units with `systemd-analyze`, and checks that the manual page
-renders without warnings and lists exactly the options `--help` does. That last
-check is why the manual page and `build_parser()` have to be changed together.
+64 checks, all offline: no printer, nothing on the network but loopback,
+nothing installed. It compiles the sources, round-trips IPP messages, exercises
+queue parsing and URL construction, checks IPv6 address selection against a
+synthetic `/proc/net/if_inet6`, runs `defont` over a PDF that really does embed
+a font (including inside an object stream), asserts the hardening rules above,
+pins the relay path against a mock printer, verifies the units with
+`systemd-analyze`, and checks that the manual page renders without warnings and
+lists exactly the options `--help` does. That last check is why the manual page
+and `build_parser()` have to be changed together.
+
+`scripts/fakeprinter.py` is the mock: an IPP listener on loopback that answers
+Get-Printer-Attributes from a **captured** reply
+(`scripts/fixtures/get-printer-attributes.b64`, real bytes off a real M283fdw
+with the addresses sanitised), tracks jobs through pending → processing →
+completed, refuses a second concurrent job the way a printer reporting
+`multiple-document-jobs-supported = false` does, and can be told to fail: abort
+the job, hold it with `media-empty`, refuse connections, or take the whole
+document and then drop the connection without answering. That last one is the
+only way to test that a job whose reply was lost is not submitted twice.
+
+Two things make it usable. Its clock is virtual, so `watch_job()`'s five-second
+polls and the eight-second settle cost nothing and happen in a fixed order
+rather than whenever the machine got round to them. And it is a context
+manager that bounds its job history and joins its threads, because a test
+harness that leaves something running is the same bug as a daemon that does.
+
+The relay tests exist because the job-splitting work rewrites exactly that
+code. Behaviour that looks wrong is pinned as it is, with a comment saying so:
+changing behaviour and pinning it in one commit makes both unreviewable.
 
 `scripts/fidelity-check.py` is the test that cannot be automated here: it
 rasterises a document before and after conversion with poppler — an

@@ -22,13 +22,15 @@ trap 'rm -rf "$work"' EXIT INT TERM
 echo 'syntax'
 check 'ippfix.py compiles'        'python3 -m py_compile ippfix.py'
 check 'ippcodec.py compiles'      'python3 -m py_compile ippcodec.py'
-rm -rf __pycache__
+check 'fakeprinter.py compiles'   'python3 -m py_compile scripts/fakeprinter.py'
+rm -rf __pycache__ scripts/__pycache__
 for s in defont install.sh uninstall.sh ippfix scripts/selftest.sh; do
   check "$s parses" "bash -n '$s'"
 done
 
 echo 'executables carry the executable bit'
-for f in defont ippfix install.sh uninstall.sh scripts/selftest.sh; do
+for f in defont ippfix install.sh uninstall.sh scripts/selftest.sh \
+         scripts/fakeprinter.py; do
   check "$f is executable" "[ -x '$f' ]"
 done
 
@@ -489,6 +491,601 @@ assert 'application/postscript' not in SAFE_FORMATS
 assert 'application/vnd.hp-PCL' in SAFE_FORMATS
 assert 'application/vnd.hp-PCLXL' in SAFE_FORMATS
 assert 'application/pdf' in SAFE_FORMATS
+PY2
+
+echo 'relay path'
+# The mock the rest of this section runs against. If it stops behaving like the
+# printer it was captured from, every test built on it quietly stops meaning
+# anything, so it is checked first and on its own.
+python3 - <<'PY2' && ok 'the mock printer matches the one that was captured' || bad 'fake printer'
+import sys, threading
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+from fakeprinter import FakePrinter, captured_attributes
+
+raw = captured_attributes()
+# Captured off the wire, so the codec must round-trip it exactly. This is the
+# only IPP message in the tree that no code here produced.
+assert ipp.serialize(ipp.parse(raw)) == raw, 'the fixture does not round-trip'
+group = ipp.parse(raw).group(ipp.PRINTER_ATTRS)
+assert len(group.names()) == 130, len(group.names())
+assert group.get_str('printer-make-and-model') == 'HP ColorLaserJet MFP M282-M285'
+# The whole reason the proxy serialises jobs. If a firmware update ever makes
+# this true, the queue lock stops being a workaround and becomes a bottleneck.
+assert group.get('multiple-document-jobs-supported') == [b'\x00']
+# House rule: no real network detail in the tree. Checked by shape -- anything
+# that looks like a private address, or like the MAC-derived names HP builds --
+# and never against the values that were substituted out, because an assertion
+# naming those would put them straight back into the tree.
+import re
+assert not re.search(rb'\b(?:10|127|192\.168|169\.254|'
+                     rb'172\.(?:1[6-9]|2[0-9]|3[01]))\.[0-9]', raw), 'address'
+assert not re.search(rb'NPI(?!000000)[0-9A-Fa-f]{6}', raw), 'MAC-derived name'
+assert not re.search(rb'\b(?!0{12})[0-9a-f]{12}\b', raw), 'a MAC'
+
+def submit(printer, request_id=1):
+    """One Print-Job, straight at the mock, with no proxy in between."""
+    import http.client
+    msg = ipp.new_request(0x0002, request_id, printer.uri)
+    msg.operation().replace('document-format', ipp.TAG_MIMETYPE,
+                            ['application/pdf'])
+    msg.data = b'%PDF-1.4\n'
+    body = ipp.serialize(msg)
+    conn = http.client.HTTPConnection(printer.host, printer.port, timeout=5)
+    conn.request('POST', printer.path, body=body,
+                 headers={'Content-Type': 'application/ipp',
+                          'Content-Length': str(len(body))})
+    reply = ipp.parse(conn.getresponse().read())
+    conn.close()
+    return reply
+
+
+before = threading.active_count()
+with FakePrinter() as printer:
+    assert printer.snmp_get('h', '1.3.6.1.2.1.43.10.2.1.3.1.1') == 7
+
+    assert submit(printer, 1).code == 0x0000
+    # A second job while one is active must be an error. A proxy bug that
+    # interleaves jobs then shows up as a red test rather than as ruined paper.
+    assert submit(printer, 2).code == 0x0509, 'a concurrent job was accepted'
+
+    job = printer.jobs[0]
+    assert (job.state, job.impressions) == (3, 0)
+    printer.clock.advance(5)
+    assert (job.state, job.impressions) == (5, 0), 'pending did not become processing'
+    printer.clock.advance(5)
+    assert (job.state, job.impressions) == (9, 1), 'processing did not complete'
+    assert printer.page_counter == 1001, 'the page counter did not follow'
+    assert submit(printer, 3).code == 0x0000, 'a finished job still blocks the queue'
+
+    # Job history is bounded: a long run must not accumulate without end.
+    for n in range(printer.MAX_JOBS * 2):
+        printer.clock.advance(5)
+        printer.clock.advance(5)
+        submit(printer, 10 + n)
+    assert len(printer.jobs) <= printer.MAX_JOBS, len(printer.jobs)
+
+with FakePrinter(mode='hold_job') as printer:
+    assert submit(printer, 1).code == 0x0000
+    for _ in range(4):
+        printer.clock.advance(5)
+    held = printer.jobs[0]
+    assert (held.state, held.reasons) == (3, ['media-empty']), held.reasons
+    printer.release()                      # as refilling the tray would
+    printer.clock.advance(5)
+    printer.clock.advance(5)
+    assert (held.state, held.impressions) == (9, 1)
+
+with FakePrinter(mode='reject_job') as printer:
+    assert submit(printer, 1).code == 0x0000
+    printer.clock.advance(5)
+    assert printer.jobs[0].state == 8, 'a rejected job must end aborted'
+
+with FakePrinter(mode='silent_loss') as printer:
+    assert submit(printer, 1).code == 0x0000
+    printer.clock.advance(5)
+    printer.clock.advance(5)
+    # Completed, and nothing marked: the fault this whole project exists for.
+    assert (printer.jobs[0].state, printer.jobs[0].impressions) == (9, 0)
+    assert printer.page_counter == 1000, 'nothing marked must not move the counter'
+
+# ...and nothing is left running afterwards.
+assert threading.active_count() == before, 'the mock leaked a thread'
+PY2
+
+# What the proxy actually puts on the wire for one Print-Job, byte for byte.
+# Every attribute here is either forwarded untouched, rewritten, or stripped,
+# and this is the only test that would notice a change to which is which. It is
+# also the transcript any job-splitting work has to keep producing for the
+# single-job case.
+python3 - <<'PY2' && ok 'a Print-Job goes upstream byte for byte as pinned' || bad 'Print-Job transcript'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+from fakeprinter import FakePrinter, proxy_for, relay
+
+DOCUMENT = b'%PDF-1.4\n1 0 obj\n<< >>\nendobj\ntrailer\n<< >>\n%%EOF\n'
+
+with FakePrinter() as printer:
+    cfg, queue = proxy_for(printer)
+    msg = ipp.new_request(0x0002, 4242, 'ipp://192.0.2.10/ipp/office')
+    op = msg.operation()
+    op.replace('requesting-user-name', ipp.TAG_NAME, ['tester'])
+    op.replace('job-name', ipp.TAG_NAME, ['transcript'])
+    op.replace('document-format', ipp.TAG_MIMETYPE, ['application/pdf'])
+    # Both of these must not survive: they would make the printer fetch a
+    # resource of the sender's choosing.
+    op.replace('job-uri', ipp.TAG_URI, ['ipp://192.0.2.10/ipp/office/9'])
+    op.replace('document-uri', ipp.TAG_URI, ['http://attacker.example/x'])
+    msg.data = DOCUMENT
+
+    answer = relay(cfg, msg)
+    assert answer.status == '200 OK', answer.status
+    assert answer.headers['content-type'] == 'application/ipp'
+
+    sent = printer.requests[-1][1]
+    # The upstream port is whatever the kernel handed out, so it is the one
+    # thing that cannot be a constant. Linux allocates five-digit ephemeral
+    # ports, so blanking it keeps every length prefix below correct.
+    assert 10000 <= printer.port <= 65535, printer.port
+    sent = sent.replace(str(printer.port).encode(), b'00000')
+
+    expected = (
+        b'\x02\x00'                          # version 2.0, as the client sent
+        b'\x00\x02'                          # Print-Job
+        b'\x00\x00\x10\x92'                  # request-id 4242, relayed unchanged
+        b'\x01'                              # operation-attributes-tag
+        b'G\x00\x12attributes-charset\x00\x05utf-8'
+        b'H\x00\x1battributes-natural-language\x00\x05en-us'
+        # Re-addressed to the printer, in the position printer-uri already had.
+        b'E\x00\x0bprinter-uri\x00\x1fipp://127.0.0.1:00000/ipp/print'
+        b'B\x00\x14requesting-user-name\x00\x06tester'
+        b'B\x00\x08job-name\x00\ntranscript'
+        b'I\x00\x0fdocument-format\x00\x0fapplication/pdf'
+        # job-uri and document-uri are gone; nothing else was added or moved.
+        b'\x03'                              # end-of-attributes-tag
+        + DOCUMENT)                          # the document, byte for byte
+    if sent != expected:
+        for i, (a, b) in enumerate(zip(sent, expected)):
+            if a != b:
+                raise AssertionError(f'transcript differs at byte {i}: '
+                                     f'{sent[i:i + 40]!r} != {expected[i:i + 40]!r}')
+        raise AssertionError(f'transcript length {len(sent)} != {len(expected)}')
+
+    # And what the client is told: the printer's job, wearing this proxy's URIs.
+    job = answer.ipp.group(ipp.JOB_ATTRS)
+    assert answer.ipp.code == 0x0000, hex(answer.ipp.code)
+    assert answer.ipp.request_id == 4242
+    assert job.get_int('job-id') == 101, 'the upstream job id is handed on as-is'
+    assert job.get_str('job-uri') == 'ipp://192.0.2.10/ipp/office/101'
+    assert job.get_str('job-printer-uri') == 'ipp://192.0.2.10/ipp/office'
+PY2
+
+# rewrite_response() edits about a dozen attributes of a reply that carries a
+# hundred and thirty. Nothing asserted any of it, and a slip either way is
+# invisible: writing one attribute too many breaks capability mirroring for
+# every client, and writing one too few leaks the printer's own address to
+# clients that may have no route to it. Diffed here against the captured reply.
+python3 - <<'PY2' && ok 'rewrite_response changes exactly what it should' || bad 'rewrite_response diff'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+import ippfix
+from fakeprinter import captured_attributes
+
+raw = captured_attributes()
+args = ippfix.build_parser().parse_args(
+    ['--advertise', '192.0.2.10', '--no-ipv6',
+     'office=ipp://192.0.2.10/ipp/print'])
+queue = ippfix.parse_queue('office=ipp://192.0.2.10/ipp/print')
+cfg = ippfix.Config(args, [queue])
+
+before, after = ipp.parse(raw), ipp.parse(raw)
+ippfix.rewrite_response(cfg, queue, after)
+old, new = before.group(ipp.PRINTER_ATTRS), after.group(ipp.PRINTER_ATTRS)
+
+# One attribute is removed outright, and every other one keeps its position:
+# clients have been seen to depend on the order a printer states things in.
+assert [n for n in old.names() if n != 'printer-supply-info-uri'] == new.names()
+assert new.index_of('printer-supply-info-uri') < 0
+
+# Exactly these, with exactly these values. Nothing else may differ.
+expect = {
+    'printer-uri-supported': [b'ipp://192.0.2.10/ipp/office',
+                              b'ipps://192.0.2.10/ipp/office'],
+    'printer-name': [b'office'],
+    'printer-dns-sd-name': [b'office'],
+    'printer-more-info': [b'http://192.0.2.10:631/'],
+    # Re-served from this daemon, because clients may have no route to the
+    # printer's own web server.
+    'printer-icons': [b'http://192.0.2.10:631/ipp/office/icon-small.png',
+                      b'http://192.0.2.10:631/ipp/office/icon-large.png'],
+    'printer-strings-uri': [b'http://192.0.2.10:631/ipp/office/strings'],
+    # Deliberately not the printer's own: a client that sees one printer-uuid
+    # on two queues collapses them into one.
+    'printer-uuid': [b'urn:uuid:5bfe0d22-2210-f2b6-05f0-dcfd091b13dc'],
+    # application/postscript, and only that, is withheld. It is interpreted by
+    # exactly the task that fails and cannot be converted the way PDF is.
+    'document-format-supported': [b'image/urf', b'application/PCLm',
+                                  b'application/octet-stream',
+                                  b'application/pdf',
+                                  b'application/vnd.hp-PCL',
+                                  b'application/vnd.hp-PCLXL', b'image/jpeg'],
+}
+changed = {n: new.get(n) for n in new.names() if old.get(n) != new.get(n)}
+assert changed == expect, ('unexpected attribute changes: '
+                           f'{sorted(set(changed) ^ set(expect))}')
+
+# Three more are written and happen to land on what the printer already said.
+# They are listed because "unchanged" here means "agreed with", not "left
+# alone": a printer that answered differently would see them overwritten.
+for name, values in (('uri-security-supported', [b'none', b'tls']),
+                     ('uri-authentication-supported',
+                      [b'requesting-user-name', b'requesting-user-name']),
+                     ('document-format-default', [b'application/pdf'])):
+    assert new.get(name) == values, (name, new.get(name))
+
+# Everything else is passed through untouched, tag for tag and value for
+# value, which is where feature parity and live status come from for free.
+for name in old.names():
+    if name in expect or name == 'printer-supply-info-uri':
+        continue
+    i, j = old.index_of(name), new.index_of(name)
+    assert (old.items[i:i + old.run_length(i)]
+            == new.items[j:j + new.run_length(j)]), name
+
+# The operation group is not touched at all, and no group is added or dropped.
+assert [g.tag for g in before.groups] == [g.tag for g in after.groups]
+assert before.group(ipp.OPERATION_ATTRS).items \
+       == after.group(ipp.OPERATION_ATTRS).items
+assert (before.version, before.code, before.request_id) \
+       == (after.version, after.code, after.request_id)
+
+# NOTE, pinned as it is rather than fixed: printer-supply-info-uri is removed
+# rather than re-served like the icons and strings beside it, so a client loses
+# the supply page entirely instead of getting one it can reach. And the icon
+# and strings URIs are http:// on the IPP port, which --require-tls does not
+# serve -- so with that flag on, they point at nothing. Both look wrong; both
+# are what this code does today.
+PY2
+
+# Job operations as they are relayed today. The upcoming split turns one client
+# job into several upstream jobs, at which point every one of these has to keep
+# meaning what it means here.
+python3 - <<'PY2' && ok 'Cancel-Job, Get-Jobs and Get-Job-Attributes relay as they do today' || bad 'job operation relay'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+OURS = 'ipp://192.0.2.10/ipp/office'
+
+with FakePrinter() as printer:
+    cfg, queue = proxy_for(printer)
+
+    def send(op, request_id, **kw):
+        return relay(cfg, job_request(op, request_id, OURS, **kw))
+
+    first = send(0x0002, 1, document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    assert first.ipp.group(ipp.JOB_ATTRS).get_int('job-id') == 101
+
+    # Get-Job-Attributes. The job id the client holds is the printer's own, and
+    # the request is forwarded with it untouched; only printer-uri is
+    # re-addressed.
+    printer.clock.advance(5)
+    got = send(0x0009, 2, job_id=101)
+    job = got.ipp.group(ipp.JOB_ATTRS)
+    assert got.ipp.code == 0x0000
+    assert job.get_int('job-state') == 5, 'job-state must be relayed untouched'
+    assert job.get_str('job-state-reasons') == 'job-printing'
+    assert job.get_str('job-uri') == OURS + '/101'
+    assert job.get_str('job-printer-uri') == OURS
+    upstream = ipp.parse(printer.requests[-1][1])
+    assert upstream.code == 0x0009 and upstream.request_id == 2
+    assert upstream.operation().get_int('job-id') == 101
+    assert upstream.operation().get_str('printer-uri') == queue.upstream_uri()
+
+    # Get-Jobs. Every job group in the reply is rewritten, not just the first.
+    printer.clock.advance(5)
+    send(0x0002, 3, document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    listed = send(0x000A, 4)
+    groups = [g for g in listed.ipp.groups if g.tag == ipp.JOB_ATTRS]
+    assert len(groups) == 2, len(groups)
+    assert [g.get_str('job-uri') for g in groups] == [OURS + '/101', OURS + '/102']
+    assert all(g.get_str('job-printer-uri') == OURS for g in groups)
+
+    # Cancel-Job, identified the way a print client identifies a job.
+    assert send(0x0008, 5, job_id=102).ipp.code == 0x0000
+    assert printer.job(102).state == 7, 'the cancel did not reach the printer'
+    # Cancelling something already finished is relayed as the printer answers
+    # it, not turned into a success. 0x0404 is client-error-not-possible,
+    # which is what the real printer was measured to answer.
+    assert send(0x0008, 6, job_id=101).ipp.code == 0x0404
+
+    # NOTE, pinned as it is rather than fixed: RFC 8011 lets a client name a
+    # job by job-uri instead of by (printer-uri, job-id), but job-uri is in
+    # FORBIDDEN_ATTRS and is stripped from every request -- so such a client
+    # cannot cancel or query anything, and gets a not-found it can do nothing
+    # about. FORBIDDEN_ATTRS exists to stop the printer being pointed at a
+    # resource of the sender's choosing, which job-uri on a Print-Job would do;
+    # on Cancel-Job it is simply how the job is named. This looks wrong.
+    msg = ipp.new_request(0x0008, 7, OURS)
+    msg.operation().replace('job-uri', ipp.TAG_URI, [OURS + '/101'])
+    assert relay(cfg, msg).ipp.code == 0x0406
+    assert ipp.parse(printer.requests[-1][1]).operation().index_of('job-uri') < 0
+PY2
+
+# The other way a client submits a job: Create-Job, one or more
+# Send-Documents, Close-Job. Job splitting will almost certainly be built on
+# this sequence, so what it does today is worth having written down.
+python3 - <<'PY2' && ok 'a Create-Job sequence relays as it does today' || bad 'create-job sequence'
+import logging, sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)
+import ippcodec as ipp
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+OURS = 'ipp://192.0.2.10/ipp/office'
+DOCUMENT = b'%PDF-1.4\ntwo-step\n'
+
+with FakePrinter() as printer:
+    cfg, queue = proxy_for(printer)
+
+    created = relay(cfg, job_request(
+        0x0005, 1, OURS,
+        document_format=(ipp.TAG_MIMETYPE, ['application/pdf'])))
+    job = created.ipp.group(ipp.JOB_ATTRS)
+    assert created.ipp.code == 0x0000
+    assert job.get_int('job-id') == 101
+    assert job.get_str('job-uri') == OURS + '/101'
+    # A job that is still taking documents does not start printing, so the
+    # clock moving must not advance it.
+    printer.clock.advance(5)
+    assert printer.job(101).state == 3, printer.job(101).state
+
+    send = job_request(0x0006, 2, OURS, job_id=101,
+                       document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    send.operation().replace('last-document', ipp.TAG_BOOLEAN, [b'\x01'])
+    send.data = DOCUMENT
+    answered = relay(cfg, send)
+    assert answered.ipp.code == 0x0000, hex(answered.ipp.code)
+    upstream = ipp.parse(printer.requests[-1][1])
+    assert upstream.data == DOCUMENT, 'the document was not relayed verbatim'
+    assert upstream.operation().get_int('job-id') == 101
+    assert upstream.operation().get('last-document') == [b'\x01']
+    assert upstream.operation().get_str('printer-uri') == queue.upstream_uri()
+
+    assert relay(cfg, job_request(0x003b, 3, OURS, job_id=101)).ipp.code == 0x0000
+    printer.clock.advance(5)
+    printer.clock.advance(5)
+    assert (printer.job(101).state, printer.job(101).impressions) == (9, 1)
+
+    # Send-Document carries the document, so it is the operation that takes the
+    # queue lock -- Create-Job and Close-Job do not, having nothing to transfer.
+    cfg.timeout = 0.05
+    queue.lock.acquire()
+    try:
+        held = relay(cfg, send)
+        assert held.status == '503 Service Unavailable', held.status
+        opened = relay(cfg, job_request(0x0005, 4, OURS))
+        assert opened.status == '200 OK', opened.status
+    finally:
+        queue.lock.release()
+PY2
+
+# A printer that is not there must produce an IPP answer, not a dropped
+# connection: a print system that is told nothing reports nothing to the user,
+# which is the same silence this proxy exists to remove.
+python3 - <<'PY2' && ok 'an unreachable printer answers IPP 0x0502' || bad 'unreachable path'
+import logging, sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)          # this deliberately provokes warnings
+import ippcodec as ipp
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+with FakePrinter(mode='unreachable') as printer:
+    cfg, queue = proxy_for(printer)
+
+    answer = relay(cfg, job_request(0x000B, 77, 'ipp://192.0.2.10/ipp/office'))
+    # HTTP succeeded; the failure is reported inside IPP, where the client
+    # looks. 0x0502 is server-error-service-unavailable.
+    assert answer.status == '200 OK', answer.status
+    assert answer.headers['content-type'] == 'application/ipp'
+    assert answer.ipp.code == 0x0502, hex(answer.ipp.code)
+    assert answer.ipp.request_id == 77, 'the client cannot match up the reply'
+    op = answer.ipp.operation()
+    assert op.get_str('status-message') == 'the printer is not responding'
+    assert op.get_str('attributes-charset') == 'utf-8'
+
+    # The same on the job path, which reaches it from inside the queue lock.
+    # The lock must come back: a printer that is down for a minute must not
+    # wedge the queue for good. The document matters -- a Print-Job carrying
+    # none takes the other branch and never touches the lock at all.
+    job = job_request(0x0002, 78, 'ipp://192.0.2.10/ipp/office',
+                      document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    job.data = b'%PDF-1.4\ndown\n'
+    answer = relay(cfg, job)
+    assert answer.ipp.code == 0x0502, hex(answer.ipp.code)
+    assert queue.lock.acquire(blocking=False), 'the queue lock was not released'
+    queue.lock.release()
+PY2
+
+# The one failure that can cost paper twice: the printer takes the whole job
+# and then says nothing. The job exists upstream, and anything that reacts to
+# the lost answer by sending it again prints it twice.
+python3 - <<'PY2' && ok 'a job whose answer was lost is not sent twice' || bad 'lost response'
+import logging, sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)
+import ippcodec as ipp
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+DOCUMENT = b'%PDF-1.4\nlost\n'
+
+with FakePrinter(mode='accept_then_drop_response') as printer:
+    cfg, queue = proxy_for(printer)
+    msg = job_request(0x0002, 5, 'ipp://192.0.2.10/ipp/office',
+                      document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    msg.data = DOCUMENT
+    answer = relay(cfg, msg)
+
+    # The printer read the whole body and created the job before going quiet.
+    assert len(printer.jobs) == 1, printer.jobs
+    assert printer.jobs[0].size == len(DOCUMENT)
+    # Exactly one Print-Job reached it. No retry, at any level.
+    assert [op for op, _raw in printer.requests] == [0x0002]
+    # The client is told the printer is not responding, which is true and is
+    # all this proxy knows. NOTE: a client that retries on that will print the
+    # job twice, and nothing here can tell it not to -- there is no job-id to
+    # report and no way to ask the printer what it just accepted. Pinned as the
+    # behaviour that exists; anything that adds a retry has to solve this first.
+    assert answer.ipp.code == 0x0502, hex(answer.ipp.code)
+    assert queue.lock.acquire(blocking=False), 'the queue lock was not released'
+    queue.lock.release()
+PY2
+
+# One job at a time, per printer. A second job arriving while one is in flight
+# has to be refused quickly rather than queued behind it, because the client is
+# sitting on a socket waiting.
+python3 - <<'PY2' && ok 'a busy queue is refused rather than left waiting' || bad 'queue contention'
+import logging, sys, time
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)
+import ippcodec as ipp
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+with FakePrinter() as printer:
+    cfg, queue = proxy_for(printer)
+    cfg.timeout = 0.05          # how long a second job waits for the first
+
+    msg = job_request(0x0002, 1, 'ipp://192.0.2.10/ipp/office',
+                      document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    msg.data = b'%PDF-1.4\nbusy\n'
+
+    queue.lock.acquire()        # stand in for a job already being transferred
+    started = time.monotonic()
+    try:
+        answer = relay(cfg, msg)
+    finally:
+        queue.lock.release()
+    # Refused after cfg.timeout, not queued behind the job in flight. The real
+    # clock is the right one here: the point is that a client is not left
+    # holding a socket open for as long as a large job takes to transfer.
+    waited = time.monotonic() - started
+    assert waited < 2, f'waited {waited:.1f}s for a busy queue'
+    assert answer.status == '503 Service Unavailable', answer.status
+    assert answer.body == b'printer busy\n'
+    assert printer.requests == [], 'the second job reached the printer anyway'
+    # NOTE, pinned as it is rather than fixed: this is an HTTP error with a
+    # text body where the client asked a question in IPP, and IPP has 0x0507
+    # server-error-busy for exactly this. CUPS copes; a stricter client is
+    # entitled not to. The unreachable path above answers in IPP, so the two
+    # disagree about how to report a failure.
+
+    # Only the job path takes the lock. A status query during a transfer still
+    # gets through, which is what keeps a client's queue display alive.
+    queue.lock.acquire()
+    try:
+        answer = relay(cfg, job_request(0x000B, 2, 'ipp://192.0.2.10/ipp/office'))
+        assert answer.status == '200 OK', answer.status
+        assert answer.ipp.code == 0x0000
+
+        # NOTE, pinned as it is rather than fixed: the lock is taken only when
+        # the operation carries a document. A Print-Job with an empty body goes
+        # down the other branch -- no conversion, no archive, no lock -- and is
+        # forwarded even while a job is in flight. No print client sends one,
+        # but "one job at a time" is a property of the branch rather than of
+        # the queue, which is worth knowing before that branch is rewritten.
+        empty = job_request(0x0002, 3, 'ipp://192.0.2.10/ipp/office',
+                            document_format=(ipp.TAG_MIMETYPE,
+                                             ['application/pdf']))
+        assert not empty.data
+        answer = relay(cfg, empty)
+        assert answer.status == '200 OK', answer.status
+        assert [op for op, _raw in printer.requests] == [0x000b, 0x0002]
+    finally:
+        queue.lock.release()
+PY2
+
+# Following a job to its end, over a clock the test owns. watch_job() sleeps
+# five seconds a poll and eight more for the last sheet to land; against a real
+# clock this would be a twenty-second test, and against a virtual one it is
+# instant and says the same thing.
+python3 - <<'PY2' && ok 'watch_job reaches a verdict and keeps a working counter' || bad 'watch_job'
+import logging, sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)
+import ippcodec as ipp
+import ippfix
+import snmpmini
+from fakeprinter import (FakePrinter, controlled_clock, proxy_for, relay,
+                         job_request)
+
+
+real_get = snmpmini.get
+
+
+class Recorder:
+    """Stands in for Alerter so nothing tries to send mail."""
+
+    def __init__(self):
+        self.mail = []
+
+    def send(self, subject, body, attachments=()):
+        self.mail.append((subject, body, attachments))
+
+
+def follow(mode):
+    with FakePrinter(mode=mode) as printer:
+        cfg, queue = proxy_for(printer)
+        cfg.alerter = Recorder()
+        # The page-counter cross-check reads SNMP, which this mock answers for
+        # its own counter; without it the counter would switch itself off and
+        # the healthy case below would prove nothing.
+        snmpmini.get = printer.snmp_get
+        try:
+            relay(cfg, job_request(
+                0x0002, 1, 'ipp://192.0.2.10/ipp/office',
+                document_format=(ipp.TAG_MIMETYPE, ['application/pdf'])))
+            with controlled_clock(ippfix, printer.clock):
+                ippfix.watch_job(cfg, queue, 101, 'a job', 'application/pdf',
+                                 b'%PDF-1.4\nwatched\n', 'relayed')
+        finally:
+            snmpmini.get = real_get
+        return cfg, queue, printer
+
+
+# A healthy job: it printed, the counter moved with it, and nobody is told
+# anything. The counter must still be enabled afterwards -- a job that works is
+# how it earns the right to contradict the printer later.
+cfg, queue, printer = follow(None)
+assert printer.jobs[0].state == 9 and printer.jobs[0].impressions == 1
+assert cfg.alerter.mail == [], cfg.alerter.mail
+assert queue.pages.enabled, 'a healthy job switched off the page counter'
+assert queue.pages.trusted and queue.pages.proven, 'the counter never got proven'
+
+# The failure this proxy exists for: completed, and nothing marked. It has to
+# come out as a verdict rather than as silence.
+cfg, queue, printer = follow('silent_loss')
+assert printer.jobs[0].state == 9 and printer.jobs[0].impressions == 0
+assert len(cfg.alerter.mail) == 1, cfg.alerter.mail
+subject, body, _parts = cfg.alerter.mail[0]
+assert subject == 'ippfix: job lost silently on office', subject
+assert 'marked no impressions at all' in body
+assert 'final state:  completed' in body
+assert 'job-completed-successfully' in body     # what the printer said, in order
+assert 'sha256:' in body                        # the document, structurally
+assert 'printer-make-and-model' in body         # the printer, asked just then
+assert queue.pages.enabled, 'one job that marked nothing is not a broken counter'
 PY2
 
 echo 'systemd units'

@@ -92,6 +92,14 @@ for file in "${src}"/scripts/*.py; do
   cp "${file}" "${dst}/scripts/"
   chmod 0755 "${dst}/scripts/${file##*/}"
 done
+# fakeprinter.py reads its captured attribute reply from here, so the fixtures
+# travel with it or it does not run.
+mkdir -m0755 -p "${dst}/scripts/fixtures"
+for file in "${src}"/scripts/fixtures/*; do
+  [ -e "${file}" ] || continue
+  cp "${file}" "${dst}/scripts/fixtures/"
+  chmod 0644 "${dst}/scripts/fixtures/${file##*/}"
+done
 # Not part of the proxy, but the thing that stops --archive being forgotten.
 # It works out its own path, so it does the right thing from here too.
 cp "${src}/debian/pkg/ippfix-archive-reminder" "${dst}/" 2>/dev/null || :

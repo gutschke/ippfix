@@ -66,6 +66,11 @@ override_dh_auto_install:
 	# Diagnostics worth having on the machine that has the problem.
 	install -d debian/ippfix/usr/share/ippfix/scripts
 	install -m0755 scripts/*.py debian/ippfix/usr/share/ippfix/scripts/
+	# fakeprinter.py is glob-matched above and reads its captured attribute
+	# reply from here, so the fixtures travel with it or it does not run.
+	install -d debian/ippfix/usr/share/ippfix/scripts/fixtures
+	install -m0644 scripts/fixtures/* \
+		debian/ippfix/usr/share/ippfix/scripts/fixtures/
 
 # dh_installsysusers is not in this debhelper's default sequence, so it is
 # invoked alongside the helper that is. Without it the accounts the units run
