@@ -127,6 +127,31 @@ fi
 # vanished, not whether counts match. Ghostscript legitimately merges identical
 # objects, so an exact count would raise false alarms; a class disappearing
 # entirely is unambiguous.
+# Look for a pattern anywhere in a PDF, including inside compressed object
+# streams. Ghostscript 10.06 emits PDF 1.7 with object streams by default, so a
+# plain grep no longer sees dictionaries that are certainly there -- and a
+# safety check that silently stops finding what it is looking for is worse than
+# no check at all.
+pdfgrep() {   # $1 = file, $2 = python regex (bytes)
+  python3 -c '
+import re, sys, zlib
+d = open(sys.argv[1], "rb").read()
+pat = sys.argv[2].encode()
+if re.search(pat, d):
+    sys.exit(0)
+for m in re.finditer(rb"/Type\s*/ObjStm.*?stream\r?\n", d, re.S):
+    e = d.find(b"endstream", m.end())
+    if e < 0:
+        continue
+    try:
+        if re.search(pat, zlib.decompress(d[m.end():e].rstrip(b"\r\n"))):
+            sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+' "$1" "$2" 2>/dev/null || LC_ALL=C grep -qa "$3" "$1"
+}
+
 marks() {
   python3 -c '
 import re, sys, zlib
@@ -195,7 +220,7 @@ if [ ! -s "$outfile" ]; then
   emit "$infile" "${2:--}"
   exit 0
 fi
-if grep -qa '/FontFile' "$outfile"; then
+if pdfgrep "$outfile" '/FontFile' '/FontFile'; then
   echo "defont: font programs survived, passing input through" >&2
   emit "$infile" "${2:--}"
   exit 0

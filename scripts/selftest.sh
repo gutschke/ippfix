@@ -198,7 +198,24 @@ showpage
 PS
   gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=pdfwrite -dEmbedAllFonts=true \
      -sOutputFile="$work/in.pdf" "$work/in.ps" >/dev/null 2>&1
-  check 'test input really embeds a font' "grep -qa '/FontFile' '$work/in.pdf'"
+  # Ghostscript 10.06 writes PDF 1.7 with compressed object streams by default,
+  # so the font dictionary is really there but invisible to grep. Look inside.
+  seefonts="python3 -c \"
+import re, sys, zlib
+d = open(sys.argv[1], 'rb').read()
+if b'/FontFile' in d:
+    sys.exit(0)
+for m in re.finditer(rb'/Type\\s*/ObjStm.*?stream\\r?\\n', d, re.S):
+    e = d.find(b'endstream', m.end())
+    if e < 0:
+        continue
+    try:
+        if b'/FontFile' in zlib.decompress(d[m.end():e].rstrip(b'\\r\\n')):
+            sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)\""
+  check 'test input really embeds a font' "$seefonts '$work/in.pdf'"
   ./defont < "$work/in.pdf" > "$work/out.pdf" 2>/dev/null
   check 'removes every font program'  "! grep -qa '/FontFile' '$work/out.pdf'"
   check 'output is still a PDF'       "head -c 5 '$work/out.pdf' | grep -qa '%PDF-'"
