@@ -4,37 +4,73 @@ What is not solved, what is not understood, and what would be worth
 investigating next. Kept separate from `DIAGNOSING.md`, which records what *is*
 established.
 
-## Whether rasterising is the right last resort for an over-large job
+## The raster tier almost never helps, and long documents fall through it
 
-When an outlined PDF exceeds what the printer will accept, the job is
-rasterised. Measured on dense body copy that happens at roughly 90 pages, or
-around 180 at normal density — reachable by a long report.
+Measured on this printer (`pdf-k-octets-supported = 0..75000`, so a 61.4 MB
+working limit) with synthetic body copy at two densities:
 
-An earlier draft of this section suggested a third option — forward the
-**original** unconverted, since it is small and keeps full vector text — on the
-grounds that a document long enough to reach this tier is unlikely to have
-needed conversion anyway. **That reasoning is wrong, and is recorded here so it
-is not proposed again.**
+| | outlined PDF | URF raster 600 dpi | outlining time |
+|---|---|---|---|
+| dense, ~4200 chars/page | 649 KB/page | 2.46 MB/page | 0.51 s/page |
+| report, ~2500 chars/page | 387 KB/page | 1.53 MB/page | 0.31 s/page |
 
-The fault is per page. A long document is not a document of uniformly dull
-pages: it takes one cover page in a display face, one chart with a symbol font,
-one equation, or one quoted passage in another script, and the whole job fails.
-Length says nothing about whether any individual page is risky, and "the
-document got longer" is not a reason to stop converting it.
+Three ceilings apply, and they are much closer together than they look:
 
-The estimator already works this way — it reports the worst page, never an
-average — so a non-zero `--convert-threshold` does not dilute one costly page
-among a hundred cheap ones, wherever in the document it sits. That behaviour is
-pinned by the self-test.
+| ceiling | dense | report |
+|---|---|---|
+| outlined PDF exceeds what the printer accepts | 92 pages | 155 pages |
+| raster exceeds `MAX_CONVERTED` (256 MB) | 109 pages | 175 pages |
+| conversion exceeds `--timeout` / `RuntimeMaxSec` (300 s) | 395 pages | 579 pages |
 
-What remains genuinely open is narrower: whether rasterising is the best last
-resort for an over-large job. It always prints, and gives up some geometry
-precision — a modest loss, since the printer still halftones contone input
-itself. Any alternative has to keep converting every page, so the candidates are
-things like splitting the job, not skipping the work.
+**The raster tier therefore only helps for documents between about 155 and 175
+pages** (92–109 for dense text) — a window under twenty pages wide. Shorter
+documents never reach it. Longer ones produce a raster larger than
+`MAX_CONVERTED`, so conversion is abandoned and the **original is relayed
+unconverted**, which is the one outcome the proxy exists to avoid. Verified by
+lowering the ceiling and watching `convert()` return `relayed (too large)`.
 
-What would settle it: how often real workloads reach the tier at all. That has
-not been measured.
+So a 200-page report is sent to the printer with its fonts intact today. It
+will usually print, because most pages are ordinary — but it is exactly the
+unprotected case, and it is reached by an ordinary document rather than a
+pathological one.
+
+Raising `MAX_CONVERTED` widens the window but does not fix the shape: 500 report
+pages would mean pushing 765 MB of raster at a printer, and the timeout ceiling
+arrives soon after. The tier is the wrong shape for the problem.
+
+**Splitting is the fix that has the right shape.** Convert everything, as now,
+and when the outlined result will not fit, send it as several upstream jobs
+whose pages add up to the original. That keeps vector text, keeps every page
+converted, and has no size ceiling at all. What it costs is in
+[the note below](#splitting-an-over-large-job).
+
+### Splitting an over-large job
+
+Not yet implemented; recorded so the design questions are not rediscovered.
+
+`multiple-document-jobs-supported` is **false** on this printer, so several
+chunks cannot be sent as one job with repeated `Send-Document`. It has to be
+several separate jobs, and the client must not be able to tell:
+
+- **Identity.** The client is told one job id and polls it. The proxy has to map
+  that id onto N upstream ids, and answer `Get-Job-Attributes` by aggregating:
+  the state of the chunk still running, and `job-impressions-completed` summed
+  across those finished.
+- **Cancellation.** `Cancel-Job` on the client's id must cancel every chunk not
+  yet printed, and there is no way to recall what already came out.
+- **Ordering.** Nothing else may interleave, so the queue lock has to be held
+  across the whole sequence rather than around one exchange.
+- **Partial failure.** If chunk three is rejected, chunks one and two are
+  already on paper. The client has to be told the job failed, and the report
+  needs to say how far it got.
+- **Where the split happens.** Splitting a PDF means parsing one, which is
+  deliberately confined to the converter. The cleanest form is a page range
+  passed to the converter (`-dFirstPage`/`-dLastPage`) and called once per
+  chunk, which re-reads a small input rather than inventing a framing protocol
+  for several documents on one socket.
+- **When it triggers.** Only when the outlined result would exceed what the
+  printer declares it accepts. Never on page count, and never as a way to avoid
+  converting.
 
 ## What this proxy does and does not protect against
 

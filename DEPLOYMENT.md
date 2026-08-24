@@ -579,11 +579,21 @@ recovers most but not all of that. It costs transfer size and *saves* CPU
 (0.18 s/page against 0.49 for outlining). It is not the blurry "print as image"
 path — that blur is Chrome encoding the page as JPEG at quality 40.
 
-Measured on dense body copy, outlining costs about **670 KB of PDF per page**,
-so a 61 MB device limit is reached at roughly 90 such pages, or around 180 at
-normal text density. That is a long report, not a pathological document, so
-this tier is worth knowing about rather than treating as unreachable. It is
-logged whenever it fires:
+Measured: outlining costs about **650 KB of PDF per page** on dense body copy
+and **390 KB** on an ordinary report page, so a 61 MB device limit arrives at
+roughly 90 or 155 pages respectively. That is a long report, not a pathological
+document.
+
+**Know the limit of this tier before relying on it.** The raster is 1.5–2.5 MB
+per page, which crosses the proxy's own 256 MB ceiling on converted output at
+around 175 report pages — only twenty pages past where rasterising starts. Past
+that the conversion is abandoned and the original is relayed **unconverted**,
+which is the one outcome this proxy exists to avoid. A 200-page report is
+already in that band. See
+[OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) — splitting the job is the fix, and is
+not yet implemented.
+
+The tier is logged whenever it fires:
 
 ```sh
 journalctl -u ippfix | grep 'rasterising instead'
