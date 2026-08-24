@@ -10,6 +10,13 @@ StartLimitBurst=5
 [Service]
 Type=oneshot
 ExecStart=/usr/lib/ippfix/ippfix-sendalert
+# sendmail(1) does not deliver; it queues, forks a delivery agent and returns.
+# That agent is a child of this unit, so with the default KillMode systemd tears
+# it down the instant ExecStart exits -- mid-SMTP, with no error anywhere. The
+# message stays queued, every retry is killed the same way, and the report this
+# whole unit exists to deliver is lost silently. Which is the exact failure the
+# proxy exists to make visible, reproduced in the thing reporting it.
+KillMode=process
 # Enough to hand a message to the mail system, and nothing else. It reads files
 # the proxy wrote and runs sendmail; it never sees a document, a network
 # connection, or the proxy's TLS key.

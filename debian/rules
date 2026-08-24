@@ -41,6 +41,9 @@ override_dh_auto_install:
 	install -m0644 debian/pkg/ippfix.service debian/pkg/ippfix.socket \
 		debian/pkg/ippfix-alert.path debian/pkg/ippfix-alert.service \
 		debian/ippfix/usr/lib/systemd/system/
+	# See the file: dma's own queue flush kills the delivery agents it forks.
+	install -D -m0644 debian/pkg/dma.service.d/10-ippfix-killmode.conf \
+		debian/ippfix/usr/lib/systemd/system/dma.service.d/10-ippfix-killmode.conf
 	# Users and directories come from debian/ippfix.{sysusers,tmpfiles};
 	# debhelper installs them and adds the snippets that apply them.
 

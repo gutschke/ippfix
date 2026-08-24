@@ -438,6 +438,35 @@ if command -v systemd-analyze >/dev/null 2>&1; then
   check 'proxy has no capabilities'     "grep -q '^CapabilityBoundingSet=\$' ippfix.service"
   check 'proxy never runs the converter itself' \
         "! grep -qE '^ExecStart=.*defont' ippfix.service"
+  # Settings placed in the wrong section are ignored with a log line nobody
+  # reads, so the unit quietly does not do what its own comment says. This has
+  # happened twice: Condition* in [Service], then StartLimit* in [Service],
+  # which left the proxy with the default 5-starts-in-10s limit while claiming
+  # to retry forever.
+  python3 - <<'PY2' && ok 'unit settings are in the section systemd reads' \
+    || bad 'unit section placement'
+import glob, sys
+UNIT_ONLY = ('Condition', 'Assert', 'StartLimit', 'Description=',
+             'Documentation=', 'Requires=', 'Wants=', 'After=', 'Before=')
+bad = []
+for path in glob.glob('*.service') + glob.glob('*.socket') \
+        + glob.glob('debian/pkg/*.service') + glob.glob('debian/pkg/*.socket') \
+        + glob.glob('debian/pkg/*.path') + glob.glob('debian/pkg/selfbuild/*'):
+    section = None
+    for n, line in enumerate(open(path), 1):
+        line = line.strip()
+        if line.startswith('['):
+            section = line
+        elif section and section != '[Unit]' \
+                and any(line.startswith(k) for k in UNIT_ONLY):
+            bad.append(f'{path}:{n}: {line} in {section}')
+assert not bad, '\n'.join(bad)
+PY2
+  # sendmail(1) queues and forks; the delivery agent outlives ExecStart. With
+  # the default KillMode systemd kills it mid-SMTP and the mail is lost with
+  # nothing logged -- the exact failure these reports exist to make visible.
+  check 'the unit that mails reports lets delivery outlive it' \
+        "grep -q '^KillMode=process\$' debian/pkg/ippfix-alert.service"
 else
   echo '  skip  systemd units (systemd-analyze not available)'
 fi

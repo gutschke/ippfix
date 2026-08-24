@@ -10,6 +10,13 @@ ippfix (1.0.1) unstable; urgency=medium
   * DNS-SD publishes the advertised address rather than a .local name, so
     printing no longer depends on multicast DNS reaching this host every time.
     --advertise-hostname restores a name where one is wanted.
+  * Alerts were queued but never delivered. sendmail(1) forks a delivery agent
+    and returns, and the default KillMode killed that agent as soon as the
+    oneshot unit's ExecStart exited -- mid-SMTP, silently. KillMode=process in
+    ippfix-alert.service, and a drop-in for dma.service, which flushes its
+    queue the same way and loses mail for the same reason.
+  * StartLimitIntervalSec was in [Service], where systemd ignores it, so the
+    proxy did not in fact retry indefinitely as its own comment claimed.
   * New ippfix-archive-reminder: schedules a one-shot reminder that --archive
     is still on, and deletes itself once it has run.
 

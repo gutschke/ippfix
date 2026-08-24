@@ -480,6 +480,22 @@ printer said about itself at the time. It needs a local `sendmail`; without one
 the report goes to the journal. See the manual page for the rate limit and the
 timeout.
 
+**A mail system that queues is not a mail system that delivers.** `sendmail(1)`
+returns as soon as the message is queued; a separate agent delivers it. If that
+agent is a child of a `Type=oneshot` unit, the default `KillMode` tears it down
+the instant the foreground command exits — mid-SMTP, with nothing logged. The
+message stays queued, every retry dies the same way, and the report never
+arrives. Both `ippfix-alert.service` and a drop-in for `dma.service` set
+`KillMode=process` for exactly this reason.
+
+It is worth checking after any change to the mail path, because the symptom is
+silence:
+
+```
+dma -bp                    # or mailq: anything sitting here is not delivered
+journalctl -t dma | grep -c 'delivery successful'
+```
+
 The report's `From:` is the address it is addressed to. That address was
 configured to receive these, so it is known to route — where `ippfix@` plus
 whatever the host calls itself often does not, and a bounce that goes nowhere

@@ -1,4 +1,10 @@
 [Unit]
+# Keep restarting indefinitely. This belongs in [Unit], not [Service], where
+# systemd logs "Unknown key" and ignores it: the default limit of 5 starts in
+# 10s would then put the unit in a failed state and stop retrying, which on a
+# print server means the queue silently never comes back after a transient
+# fault.
+StartLimitIntervalSec=0
 Description=IPP font-repair print proxy
 Documentation=man:ippfix(8) https://github.com/gutschke/ippfix
 Requires=ippfix.socket ippfix-convert.socket
@@ -12,12 +18,10 @@ ExecStart=/usr/local/lib/ippfix/venv/bin/ippfix /usr/local/lib/ippfix/ippfix.py 
     printer=ipp://printer.example/ipp/print
 User=ippfix
 Group=ippfix
-# Keep trying indefinitely. The default start limit (5 in 10s) would put
-# the unit in a failed state and stop retrying, which on a print server
-# means the queue silently never comes back after a transient fault.
+# Keep trying indefinitely; the limit that makes this unbounded is
+# StartLimitIntervalSec in [Unit].
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 WorkingDirectory=/run/ippfix
 RuntimeDirectory=ippfix
 RuntimeDirectoryPreserve=yes

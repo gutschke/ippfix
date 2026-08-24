@@ -26,6 +26,15 @@ for f in "$spool"/*.mail; do
         rm -f "$f"
         continue
     fi
+    # A file this cannot read is not a delivery problem and retrying it is
+    # pointless: it will still be unreadable next time. Say so once and move
+    # on, so one bad file does not spend the whole start limit and hold up the
+    # reports behind it. The give-up sweep below still clears it eventually.
+    if [ ! -r "$f" ]; then
+        echo "ippfix-sendalert: cannot read $f; skipping" >&2
+        find "$f" -mmin +1440 -delete 2>/dev/null || :
+        continue
+    fi
     # -f so the envelope sender matches the From: the proxy wrote. Without it
     # the mail system substitutes whoever ran this, and a mismatch between
     # envelope and header is the sort of thing strict receivers reject.

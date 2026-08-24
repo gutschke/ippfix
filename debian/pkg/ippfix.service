@@ -1,4 +1,10 @@
 [Unit]
+# Keep restarting indefinitely. This belongs in [Unit], not [Service], where
+# systemd logs "Unknown key" and ignores it: the default limit of 5 starts in
+# 10s would then put the unit in a failed state and stop retrying, which on a
+# print server means the queue silently never comes back after a transient
+# fault.
+StartLimitIntervalSec=0
 # Nothing here runs until an administrator has written a configuration. The
 # package deliberately ships none, because it cannot know which printers
 # exist; see /usr/share/doc/ippfix/ippfix.conf.example.
@@ -39,12 +45,10 @@ SyslogIdentifier=ippfix
 ExecStart=/bin/sh -c 'eval exec /usr/lib/ippfix/venv/bin/ippfix /usr/lib/ippfix/ippfix.py --converter unix:/run/ippfix/convert.sock "$IPPFIX_ARGS"'
 User=ippfix
 Group=ippfix
-# Keep trying indefinitely. The default start limit (5 in 10s) would put
-# the unit in a failed state and stop retrying, which on a print server
-# means the queue silently never comes back after a transient fault.
+# Keep trying indefinitely; the limit that makes this unbounded is
+# StartLimitIntervalSec in [Unit].
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 WorkingDirectory=/run/ippfix
 RuntimeDirectory=ippfix
 RuntimeDirectoryPreserve=yes
