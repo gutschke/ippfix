@@ -72,6 +72,103 @@ several separate jobs, and the client must not be able to tell:
   printer declares it accepts. Never on page count, and never as a way to avoid
   converting.
 
+### Two costs accepted deliberately
+
+Both were put to the operator and accepted, on the reasoning that they apply
+only to documents past about a hundred pages, which are rare, and that wanting
+several copies of one is rarer still.
+
+- **The queue is held for the whole sequence.** `multiple-document-jobs-supported`
+  is false, so the chunks cannot share a job and nothing else may interleave
+  between them. A 200-page job holds the printer for roughly two minutes, and
+  other clients get `503` for that time rather than being queued.
+- **`copies > 1` is refused rather than split.** Sending each chunk N times
+  yields fragments in the order 1,1,1,2,2,2 instead of collated sets, and
+  collation across separate jobs cannot be verified without printing it.
+
+### What the printer does when it cannot get paper — measured
+
+Asked for A4 while only `na_letter` was loaded, with a valid one-page document
+(2026-08-24, firmware 20251014). No sheet was consumed.
+
+```
+job-state = 6 (processing-stopped)   held for the full 48s observed, indefinitely
+job-state-reasons = printer-stopped
+printer-state-reasons = toner-low-warning, other-error
+SNMP prtInputStatus(tray 1) = 9 -> 48   (offline + critical alert)
+Cancel-Job on the held job -> 0x0000, cleared cleanly
+```
+
+Three consequences for splitting, none of them optional:
+
+1. **It holds; it does not abort.** A chunk can stall forever. A sequencer that
+   waits for chunk *k* before sending *k+1* therefore wedges the queue
+   indefinitely, and with the queue lock held that is a whole-printer outage
+   rather than one stuck job. There must be a bound on how long a chunk may sit
+   in `processing-stopped`, after which the remaining chunks are abandoned and
+   the job reported as failed.
+
+2. **IPP will not tell you why.** `printer-stopped` and `other-error` are all it
+   offers -- no `media-needed`, no `job-media-needed`, and this printer publishes
+   no `job-state-reasons-supported` to enumerate against. The tray state is
+   visible only over SNMP. Reports about a stalled job should say what SNMP saw,
+   because the IPP answer is not actionable on its own.
+
+3. **A client that is configured to retry will retry.** The client sees
+   `processing-stopped`, which is exactly what it should see; the aggregate
+   state must report it faithfully rather than inventing a terminal state to
+   tidy up. Whether the user's client fails or retries is then the client's
+   decision, made on honest information.
+
+Separately measured: `Cancel-Job` on a job that has already reached a terminal
+state returns `0x0404` (client-error-not-possible), and a malformed PDF is
+rejected as `aborted` with `document-format-error` within three seconds -- the
+printer validates before it looks at media.
+
+## Six things in the relay path that look wrong
+
+Found while pinning that path with tests, and deliberately pinned **as they
+are** rather than fixed: changing behaviour and pinning it in one commit makes
+both unreviewable. None is urgent; all are cheap.
+
+1. **`job-uri` is stripped from every request.** It is in `FORBIDDEN_ATTRS`,
+   which `rewrite_request()` applies unconditionally. RFC 8011 lets a client
+   name a job by `job-uri` *instead of* `(printer-uri, job-id)` on Cancel-Job
+   and Get-Job-Attributes, so such a client can never cancel or query anything
+   and gets a not-found it cannot act on. The attribute is genuinely dangerous
+   on Print-Job, where it makes the printer fetch a URL of the sender's
+   choosing; on Cancel-Job it is only how the job is named. The fix is to strip
+   it per operation rather than globally.
+
+2. **`Cancel-Job` has no ownership check.** Any client may cancel any job by id,
+   and ids are sequential. The operation allowlist exists precisely so that LAN
+   hosts do not get administrative control of a printer they cannot otherwise
+   reach, and this went through it. Roughly the exposure a directly connected
+   printer has, which is why it is listed here rather than treated as urgent.
+
+3. **`printer-supply-info-uri` is removed rather than re-served**, unlike
+   `printer-icons` and `printer-strings-uri` beside it, so clients lose the
+   supply page instead of getting one they can reach.
+
+4. **The re-served icon and strings URIs are `http://` on the IPP port.** With
+   `--require-tls` the daemon serves no plaintext, so those URIs point at
+   nothing.
+
+5. **Failures are reported in two different languages.** The busy path answers
+   HTTP 503 with a `text/plain` body; the unreachable path answers in IPP with
+   `0x0502`. The client asked in IPP. The 404, 400 and refused-operation paths
+   have the same split personality.
+
+6. **`watch_job()` forgets what it has seen.** Any poll whose reply carries no
+   job attributes resets `state`, `impressions` and `reasons` to `None`, so a
+   job observed processing for ten minutes is reported as `NO ANSWER` if the
+   last poll before the deadline comes back empty.
+
+Also worth knowing before that code is rewritten: **the queue lock is only taken
+when the operation carries a document.** Create-Job and Close-Job, and a
+Print-Job with an empty body, bypass conversion, archiving and the lock
+entirely. "One job at a time" is a property of that branch, not of the queue.
+
 ## What this proxy does and does not protect against
 
 Three firmware faults have been reproduced on one printer. The proxy addresses
