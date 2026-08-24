@@ -4,7 +4,10 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 
 SOURCES=(ippfix{,.8,.8.md,.py,.service,.socket} ippfix-convert.socket
          'ippfix-convert@.service' ippfix.tmpfiles.conf ippcodec.py defont
-         {install,uninstall}.sh LICENSE README.md DEPLOYMENT.md)
+         {install,uninstall}.sh LICENSE
+         README.md DEPLOYMENT.md DIAGNOSING.md INTERNALS.md OPEN-QUESTIONS.md)
+# The diagnostic tools are copied from ${src}/scripts below. selftest.sh is
+# deliberately not among them: it tests a source tree, not an installation.
 DEP='zeroconf'
 
 trap 'rc="$?"
@@ -78,6 +81,15 @@ echo -n 'Copying source files...'
 mkdir -m0755 -p "${dst}"
 for file in "${SOURCES[@]}"; do
   [ ! -e "${src}/${file}" ] || cp "${src}/${file}" "${dst}/"
+done
+# Globbed against ${src} rather than the working directory, so this does the
+# same thing wherever the installer is run from. The documentation tells people
+# to run these tools; an install without them cannot follow its own advice.
+mkdir -m0755 -p "${dst}/scripts"
+for file in "${src}"/scripts/*.py; do
+  [ -e "${file}" ] || continue
+  cp "${file}" "${dst}/scripts/"
+  chmod 0755 "${dst}/scripts/${file##*/}"
 done
 chmod 0755 "${dst}/ippfix" "${dst}/defont"
 echo ' done.'

@@ -125,9 +125,19 @@ class PDF:
 
 
 def main():
-    out_path = sys.argv[1] if len(sys.argv) > 1 else 'reproducer.pdf'
-    font_path = sys.argv[2] if len(sys.argv) > 2 else find_font()
-    want = int(sys.argv[3]) if len(sys.argv) > 3 else 900
+    # Positional, but --help has to work: the documentation tells people to run
+    # this, and taking '--help' as an output filename writes a 400 kB file named
+    # --help into whatever directory they happened to be in.
+    args = sys.argv[1:]
+    if args and args[0] in ('-h', '--help'):
+        print(__doc__.strip())
+        return
+    out_path = args[0] if args else 'reproducer.pdf'
+    font_path = args[1] if len(args) > 1 else find_font()
+    try:
+        want = int(args[2]) if len(args) > 2 else 900
+    except ValueError:
+        raise SystemExit(f'glyph count must be a number, not {args[2]!r}')
 
     sfnt = open(font_path, 'rb').read()
     mapping = cmap_of(sfnt)

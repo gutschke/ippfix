@@ -105,6 +105,9 @@ def check(path):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
+        print(__doc__.strip())
+        sys.exit(0)
     bad = 0
     for p in sys.argv[1:]:
         try:

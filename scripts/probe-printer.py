@@ -35,7 +35,18 @@ import time
 import urllib.parse
 import urllib.request
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+# ippcodec sits beside the daemon, which is not always beside this script: in a
+# source tree and under install.sh it is one level up, but the package puts the
+# tools in /usr/share and the code in /usr/lib. Look in each place rather than
+# assuming a layout.
+for _candidate in (os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'),
+                   '/usr/lib/ippfix', '/usr/local/lib/ippfix'):
+    if os.path.exists(os.path.join(_candidate, 'ippcodec.py')):
+        sys.path.insert(0, _candidate)
+        break
+else:
+    sys.exit('cannot find ippcodec.py; run this from the source tree, or '
+             'install ippfix')
 import ippcodec as ipp                                              # noqa: E402
 
 # RFC 3805 / RFC 2790. Portable across manufacturers.
