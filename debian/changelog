@@ -24,6 +24,10 @@ ippfix (1.0.2) unstable; urgency=medium
     so, rather than picking one.
   * Per-printer settings now travel as a query string on the printer's URI,
     and an unrecognised one is an error rather than silently ignored.
+  * SNMP strings are stripped of the NUL padding printer firmware adds, and
+    printer status strings are collapsed to one line before they reach a
+    report: an HP M430 answers its console text with an embedded newline, which
+    in a mailed report would forge a line of it.
   * snmpmini.py replaces the SNMP implementation that probe-printer.py carried
     privately, so the daemon and the probe read the counter the same way.
 

@@ -1203,7 +1203,13 @@ def printer_snapshot(queue, timeout=20):
                              if name == 'printer-state' and n in PRINTER_STATES
                              else str(n))
             else:
-                shown.append(v.decode('utf-8', 'replace')[:120])
+                # Collapse whitespace. Printers put newlines in status strings
+                # -- an HP M430 answers its console text as "Bereitschafts-\n
+                # modus ein" -- and this goes into a mailed report where a line
+                # break would forge a line of it.
+                shown.append(' '.join(
+                    v.decode('utf-8', 'replace').replace('\x00', '').split()
+                )[:120])
         text = ', '.join(x for x in shown if x)
         if text:
             out.append(f'{name}: {text}')

@@ -726,6 +726,12 @@ for text in ('1.3.6.1.2.1.43.10.2.1.4.1.1', '1.3.6.1.4.1.11.2.3.9.1',
     body = snmp.encode_oid(text)
     assert snmp.decode_oid(body[2:]) == text, text
 
+# Printer firmware pads strings with NUL and puts newlines in them: an HP M553
+# answers prtMarkerSuppliesDescription NUL-terminated, and an M430 answers its
+# console text with an embedded line break. Neither belongs in a report.
+assert snmp._value(snmp.T_OCTETS, b'Black Cartridge\x00') == 'Black Cartridge'
+assert '\x00' not in snmp._value(snmp.T_OCTETS, b'a\x00b')
+
 # Every length is checked against the buffer before it is used.
 for junk in (b'', b'\x30', b'\x30\x84\xff\xff\xff\xff', b'\x30\x80\x00\x00',
              b'\x30\x02\x02\x7f', b'\x02\x01\x00'):

@@ -219,6 +219,32 @@ from what the printer states about itself, which needs no history, and revoked
 from behaviour, which does. So it works on the first job after a restart and
 leaves no state file to go stale.
 
+Measured across three HP engines, which is what the default rests on:
+
+| | M283fdw | M553 | M430 MFP |
+|---|---|---|---|
+| `prtMarkerCounterUnit` | 7 (impressions) | 7 (impressions) | 7 (impressions) |
+| all 13 probed OIDs answered | yes | yes | yes |
+| page counter over IPP | none | none | none |
+| `hrPrinterStatus` | 3 (idle) | 1 (other, asleep) | 1 (other, asleep) |
+
+Two things follow. The counter is in impressions on all of them, so it compares
+directly with `job-impressions-completed` with no scaling — the sheets case the
+code also accepts has not been seen in the wild. And no HP tested exposes a
+lifetime counter over IPP at all, so SNMP is the only route to it; that is why
+this is worth doing rather than reading another IPP attribute.
+
+`hrPrinterStatus` is *not* used to decide anything. A sleeping printer answers
+`other(1)`, not `idle(3)`, on two of the three — a readiness check built on it
+would call a healthy printer broken. `probe-printer.py` uses IPP
+`printer-state-reasons` instead.
+
+Printer firmware also pads strings with NUL and puts newlines inside them: the
+M553 NUL-terminates `prtMarkerSuppliesDescription`, and the M430 answers its
+console text as `Bereitschafts-\nmodus ein`. `snmpmini` strips NULs, and
+`printer_snapshot()` collapses whitespace, because these strings go into a
+mailed report and a line break in one forges a line of it.
+
 Forward jumps are never treated as suspicion of a fault. The proxy is not the
 only route to a printer; copies, received faxes and internal pages all advance
 the counter. Only a jump too large to be paper is evidence, and then it is

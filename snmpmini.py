@@ -143,7 +143,10 @@ def _value(tag, body):
             return decode_oid(body)
         except SnmpError:
             return None
-    return body.decode('utf-8', 'replace').strip()
+    # NUL-padded strings are common in printer firmware: the M553 answers
+    # prtMarkerSuppliesDescription with a trailing NUL. str.strip() does not
+    # remove it, and it would travel all the way into a mailed report.
+    return body.decode('utf-8', 'replace').replace('\x00', '').strip()
 
 
 class Message:
