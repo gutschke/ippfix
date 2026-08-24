@@ -149,7 +149,7 @@ gap: each print job is followed to its terminal state and judged on what the
 printer says it marked, and a job that completes having marked nothing produces
 a mailed report naming the queue, the job, what conversion did, the document's
 structure, and what the printer said about itself at the time — an empty
-cartridge prints nothing and blames nobody, and that is worth ruling out before
+cartridge prints nothing and blames nobody, and that is worth checking before
 blaming firmware.
 
 ```

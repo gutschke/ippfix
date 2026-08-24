@@ -193,7 +193,12 @@ producer, embedded font programs, shading/pattern/function types, transparency
 groups, soft masks, images, a digest. **No text and no images from the
 document.** `printer_snapshot()` adds what the printer says about itself right
 then — model, firmware, state reasons, marker levels — which is how the
-alternative explanations get ruled out.
+alternative explanations get *raised*, not settled. Supply levels are another
+number the printer reports about itself, and the M283fdw has reported all three
+colour cartridges at 0 for months while continuing to print from them. Read a
+low level as a question worth asking, never as a conclusion; the page counter
+earns more trust than this does because it is checked against behaviour, and
+these values are not checked against anything.
 
 `PageCounter` holds the second opinion. It reads `prtMarkerLifeCount` before
 and after each followed job and compares the movement with
