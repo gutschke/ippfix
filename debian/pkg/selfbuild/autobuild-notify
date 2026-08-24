@@ -1,0 +1,55 @@
+#!/bin/sh
+# Tell the administrator that an unattended rebuild failed. The work happens
+# outside the apt transaction, so nothing else will ever mention it.
+#
+# Delivery goes through /usr/sbin/sendmail, which every mail-transport-agent
+# provides, rather than through mail(1), which is a separate user agent that
+# many minimal installations do not have. Where there is no MTA at all the
+# message still reaches the journal at error priority.
+set -u
+unit="${1:-ippfix-selfbuild.service}"
+to="${IPPFIX_NOTIFY:-root}"
+host="$(hostname -f 2>/dev/null || hostname)"
+# A bare local part is not a valid address in a header. Mail servers reject the
+# whole message for it -- Exim answers "550 header syntax" -- so an unqualified
+# recipient means the failure notice is itself lost, which is the one message
+# that must never go missing. Qualify it and let /etc/aliases do the routing.
+case "$to" in
+  *@*) ;;
+  *)   to="${to}@${host}" ;;
+esac
+
+body() {
+  echo "The unattended rebuild of ippfix's Python environment failed on ${host}."
+  echo
+  echo "ippfix keeps its Python libraries in a virtual environment. apt does not"
+  echo "update them, and the environment stops working altogether when the system"
+  echo "Python moves to a new minor version. This job keeps it current."
+  echo
+  echo "Printing continues on the existing environment for now. It will stop at"
+  echo "the next release upgrade if this is still failing."
+  echo
+  echo "Recent log:"
+  journalctl -u "${unit}" -n 40 --no-pager 2>/dev/null || echo "  (no journal)"
+  echo
+  echo "To retry by hand:"
+  echo "  /usr/lib/ippfix-selfbuild/ippfix-autobuild --force"
+}
+
+if [ -x /usr/sbin/sendmail ]; then
+  {
+    echo "From: ippfix <root@${host}>"
+    echo "To: ${to}"
+    echo "Subject: ippfix: environment rebuild failed on ${host}"
+    echo "Date: $(date -R)"
+    echo "Message-ID: <ippfix-selfbuild-$(date +%s)-$$@${host}>"
+    echo "Auto-Submitted: auto-generated"
+    echo
+    body
+  } | /usr/sbin/sendmail -f "root@${host}" -t -i && exit 0
+  echo "ippfix-autobuild: sendmail rejected the failure notice" | \
+    logger -t ippfix-autobuild -p daemon.err
+fi
+
+# No MTA, or it refused. Say so loudly rather than losing the message.
+body | logger -t ippfix-autobuild -p daemon.err

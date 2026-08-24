@@ -1,0 +1,4 @@
+# The daemon and the document converter are separate accounts on purpose: a
+# flaw in document parsing then reaches neither the TLS key nor the archive.
+u ippfix - "IPP font-repair print proxy" /etc/ippfix /usr/sbin/nologin
+u ippfix-convert - "ippfix document converter" /nonexistent /usr/sbin/nologin

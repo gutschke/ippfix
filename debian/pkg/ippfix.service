@@ -1,0 +1,88 @@
+[Unit]
+Description=IPP font-repair print proxy
+Documentation=man:ippfix(8) https://github.com/gutschke/ippfix
+Requires=ippfix.socket ippfix-convert.socket
+After=network.target network-online.target ippfix.socket ippfix-convert.socket
+Wants=network-online.target
+
+[Service]
+Type=exec
+# The package cannot know which printers exist, so the command line lives in a
+# conffile rather than here. Editing a unit shipped by a package would be
+# overwritten on upgrade; editing this file is not.
+EnvironmentFile=/etc/ippfix/ippfix.conf
+# Skip quietly when no printer has been configured, rather than failing and
+# restart-looping on a machine where nobody has finished the setup yet.
+ExecCondition=/usr/lib/ippfix/ippfix-configured
+# '+' so the credentials are written before the sandbox drops privileges.
+ExecStartPre=+/usr/lib/ippfix/ippfix-setup
+ExecStart=/usr/lib/ippfix/venv/bin/ippfix /usr/lib/ippfix/ippfix.py --converter unix:/run/ippfix/convert.sock $IPPFIX_ARGS
+User=ippfix
+Group=ippfix
+# Keep trying indefinitely. The default start limit (5 in 10s) would put
+# the unit in a failed state and stop retrying, which on a print server
+# means the queue silently never comes back after a transient fault.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+WorkingDirectory=/run/ippfix
+RuntimeDirectory=ippfix
+RuntimeDirectoryPreserve=yes
+
+# The listening socket arrives from ippfix.socket, already bound by systemd, so
+# this process needs no capability to bind a privileged port -- or any other.
+# Document conversion happens in ippfix-convert@.service, which is confined
+# more tightly still; nothing here ever executes Ghostscript.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+PrivateUsers=true
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateIPC=true
+ReadWritePaths=/var/lib/ippfix /etc/ippfix
+UMask=0077
+
+# Host and kernel state. ProcSubset is deliberately NOT set to pid: publishing
+# IPv6 addresses requires reading /proc/net/if_inet6.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+DevicePolicy=closed
+KeyringMode=private
+
+# Uncomment and adapt to confine egress to the printers and the local network.
+# This is site specific, so it ships disabled rather than wrong.
+#IPAddressDeny=any
+#IPAddressAllow=localhost 192.0.2.0/24 198.51.100.0/24
+
+# AF_NETLINK is required: DNS-SD enumerates local interfaces through
+# getifaddrs(), which uses it.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @obsolete @resources @mount @debug @cpu-emulation @swap @reboot @module
+SystemCallErrorNumber=EPERM
+
+MemoryMax=512M
+TasksMax=64
+LimitNOFILE=1024
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

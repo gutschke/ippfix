@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+
+LIB=/usr/lib/ippfix
+
+build_venv() {
+    rm -rf "$LIB/venv"
+    python3 -m venv "$LIB/venv" || return 1
+    "$LIB/venv/bin/pip3" install --quiet --upgrade pip || return 1
+    "$LIB/venv/bin/pip3" install --quiet zeroconf || return 1
+    # So that ps(1) shows 'ippfix' rather than 'python3'.
+    ln -sf python3 "$LIB/venv/bin/ippfix"
+}
+
+case "$1" in
+  configure)
+    # The Python environment is built here rather than shipped, because a
+    # virtual environment is tied to the interpreter's minor version and would
+    # stop working the moment the system Python moved. Building it needs the
+    # network, which a package installation is not entitled to assume -- so a
+    # failure here is reported and left for later, never fatal.
+    if ! build_venv >/dev/null 2>&1; then
+        echo "ippfix: could not build the Python environment (no network?)." >&2
+        echo "ippfix: the service will not start until it exists. Retry with:" >&2
+        echo "ippfix:     dpkg-reconfigure ippfix" >&2
+        echo "ippfix: or install ippfix-selfbuild, which retries on its own." >&2
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

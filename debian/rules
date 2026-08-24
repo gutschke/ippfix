@@ -1,0 +1,76 @@
+#!/usr/bin/make -f
+# The upstream tree installs itself into /usr/local with a shell script. The
+# package puts the same files under /usr/lib and drives the configuration from
+# a conffile instead of from the unit, so the units are rewritten here rather
+# than duplicated -- one source of truth, and the differences stay visible.
+LIB := /usr/lib/ippfix
+
+%:
+	dh $@
+
+override_dh_auto_build:
+override_dh_auto_test:
+
+override_dh_auto_install:
+	# Program files.
+	install -d debian/ippfix$(LIB)
+	install -m0644 ippfix.py ippcodec.py debian/ippfix$(LIB)/
+	install -m0755 defont ippfix debian/ippfix$(LIB)/
+	install -m0755 debian/pkg/ippfix-setup debian/pkg/ippfix-configured \
+		debian/ippfix$(LIB)/
+	install -d debian/ippfix/usr/bin
+	ln -sf ..$(LIB)/ippfix debian/ippfix/usr/bin/ippfix
+
+	# Conffile: the only thing an administrator has to touch.
+	install -D -m0644 debian/pkg/ippfix.conf debian/ippfix/etc/ippfix/ippfix.conf
+
+	# Units, with the install path corrected and the command line moved out of
+	# ExecStart into the conffile.
+	install -d debian/ippfix/usr/lib/systemd/system
+	for u in ippfix.socket ippfix-convert.socket ippfix-convert@.service; do \
+	  sed -e 's#/usr/local/lib/ippfix#$(LIB)#g' "$$u" \
+	      > debian/ippfix/usr/lib/systemd/system/"$$u"; \
+	done
+	install -m0644 debian/pkg/ippfix.service \
+		debian/ippfix/usr/lib/systemd/system/ippfix.service
+	# Users and directories come from debian/ippfix.{sysusers,tmpfiles};
+	# debhelper installs them and adds the snippets that apply them.
+
+	# --- ippfix-selfbuild ---------------------------------------------------
+	install -d debian/ippfix-selfbuild/usr/lib/ippfix-selfbuild
+	install -m0755 debian/pkg/selfbuild/ippfix-autobuild \
+		debian/pkg/selfbuild/autobuild-notify \
+		debian/ippfix-selfbuild/usr/lib/ippfix-selfbuild/
+	install -d debian/ippfix-selfbuild/usr/lib/systemd/system
+	install -m0644 debian/pkg/selfbuild/ippfix-selfbuild.service \
+		debian/pkg/selfbuild/ippfix-selfbuild.timer \
+		debian/pkg/selfbuild/ippfix-selfbuild-notify@.service \
+		debian/ippfix-selfbuild/usr/lib/systemd/system/
+	install -D -m0644 debian/pkg/selfbuild/80ippfix-selfbuild \
+		debian/ippfix-selfbuild/etc/apt/apt.conf.d/80ippfix-selfbuild
+
+	# Diagnostics worth having on the machine that has the problem.
+	install -d debian/ippfix/usr/share/ippfix/scripts
+	install -m0755 scripts/*.py debian/ippfix/usr/share/ippfix/scripts/
+
+# dh_installsysusers is not in this debhelper's default sequence, so it is
+# invoked alongside the helper that is. Without it the accounts the units run
+# as would simply never be created.
+override_dh_installtmpfiles:
+	dh_installtmpfiles
+	dh_installsysusers
+
+override_dh_installsystemd:
+	# The proxy's sockets are enabled; the service itself is socket-activated
+	# and, in any case, does nothing until a printer is configured.
+	dh_installsystemd -pippfix --name=ippfix-convert --no-start ippfix-convert.socket
+	dh_installsystemd -pippfix --no-start ippfix.socket
+	dh_installsystemd -pippfix --no-enable --no-start ippfix.service
+	# Only the timer is enabled for the self-build; the oneshot service is
+	# started by the apt hook and by the timer, never on its own.
+	dh_installsystemd -pippfix-selfbuild --no-start ippfix-selfbuild.timer
+	dh_installsystemd -pippfix-selfbuild --no-enable --no-start \
+		ippfix-selfbuild.service ippfix-selfbuild-notify@.service
+
+override_dh_installman:
+	dh_installman -pippfix ippfix.8

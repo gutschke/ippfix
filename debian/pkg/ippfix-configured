@@ -1,0 +1,15 @@
+#!/bin/sh
+# ExecCondition: is a printer configured yet?
+#
+# The package cannot know which printers exist, so it ships none. Without this
+# the daemon would exit complaining, and Restart=always would turn that into a
+# restart loop on every freshly installed machine. A failed ExecCondition tells
+# systemd to skip the unit quietly instead, leaving it inactive rather than
+# failed -- which is the honest description of "not configured yet".
+[ -r /etc/ippfix/ippfix.conf ] || exit 1
+. /etc/ippfix/ippfix.conf 2>/dev/null || exit 1
+[ -n "${IPPFIX_ARGS}" ] || {
+  echo "no printer configured; edit /etc/ippfix/ippfix.conf" >&2
+  exit 1
+}
+exit 0

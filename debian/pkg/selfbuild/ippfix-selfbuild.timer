@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly backstop: rebuild ippfix's Python environment if it is stale
+Documentation=man:ippfix(8)
+
+[Timer]
+# The apt hook is the primary trigger and fires as soon as the interpreter is
+# upgraded. This catches the cases it cannot: an upgrade that bypassed the hook,
+# a machine that was offline at the time, or a dependency released since.
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

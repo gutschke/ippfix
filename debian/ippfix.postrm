@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  remove|purge)
+    # Built at install time, so it is ours to remove; dpkg does not know about
+    # the files inside it.
+    rm -rf /usr/lib/ippfix/venv
+    ;;
+esac
+
+case "$1" in
+  purge)
+    # Generated, not shipped: the TLS credentials and anything archived.
+    rm -f /etc/ippfix/ippfix.key /etc/ippfix/ippfix.crt
+    rm -rf /var/lib/ippfix
+    rmdir /etc/ippfix 2>/dev/null || true
+    rmdir /usr/lib/ippfix 2>/dev/null || true
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

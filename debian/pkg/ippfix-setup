@@ -1,0 +1,15 @@
+#!/bin/sh -e
+# Generate the TLS credentials if they are not there yet. Printers ship
+# self-signed certificates of their own, so clients treat this no differently.
+#
+# Done here rather than in a maintainer script so that no key is ever created
+# during package installation, and so restoring /etc from a backup that omitted
+# them repairs itself on the next start.
+conf=/etc/ippfix
+[ -s "$conf/ippfix.key" ] && [ -s "$conf/ippfix.crt" ] && exit 0
+umask 027
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout "$conf/ippfix.key" -out "$conf/ippfix.crt" \
+  -subj "/CN=$(hostname -f 2>/dev/null || hostname)" >/dev/null 2>&1
+chmod 0640 "$conf/ippfix.key"
+chmod 0644 "$conf/ippfix.crt"

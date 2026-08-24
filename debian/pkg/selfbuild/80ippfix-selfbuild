@@ -1,0 +1,9 @@
+// ippfix self-build trigger. After any dpkg operation -- a new python3 minor
+// version above all -- asynchronously check whether the virtual environment
+// needs rebuilding. `--no-block` keeps the rebuild OUT of the apt transaction:
+// it can never delay apt, a failure can never break it, and a machine with no
+// network simply retries on the weekly timer. The service's own change
+// detection makes this a fast no-op unless something actually moved.
+DPkg::Post-Invoke {
+    "if [ -d /run/systemd/system ] && [ -x /usr/lib/ippfix-selfbuild/ippfix-autobuild ]; then systemctl start --no-block ippfix-selfbuild.service >/dev/null 2>&1 || true; fi";
+};

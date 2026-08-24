@@ -1,0 +1,7 @@
+[Unit]
+Description=Report that %i failed (ippfix unattended environment rebuild)
+Documentation=man:ippfix(8)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/ippfix-selfbuild/autobuild-notify %i

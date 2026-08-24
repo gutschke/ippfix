@@ -1,0 +1,52 @@
+Source: ippfix
+Section: net
+Priority: optional
+Maintainer: gutschke <gutschke@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/gutschke/ippfix
+Rules-Requires-Root: no
+
+Package: ippfix
+Architecture: all
+Depends: ${misc:Depends}, python3 (>= 3.9), python3-venv, ghostscript (>= 10.0),
+ openssl, systemd
+Recommends: fonts-dejavu-core
+Suggests: ippfix-selfbuild (= ${binary:Version})
+Description: IPP proxy that removes embedded fonts from print jobs
+ Some HP LaserJet Pro printers silently discard a job whose page embeds too
+ many fonts: the printer accepts it, reports the job completed, warms up, and
+ marks nothing. No error reaches the client and none appears on the panel.
+ .
+ ippfix presents itself as an ordinary IPP Everywhere printer, converts the
+ text of every PDF to vector outlines so that no font program reaches the
+ device, and forwards the job on. Text stays vector, so the printer's own
+ rasteriser still renders it at full device precision. Everything else -- the
+ printer's capabilities, its live status, its job handling -- is relayed
+ untouched, and scanning is not affected.
+ .
+ The network daemon never executes the document converter: documents are
+ handed to a separate, per-connection service that has no network at all.
+ .
+ Configuration is not shipped with any printer defined. Edit
+ /etc/ippfix/ippfix.conf before starting the service.
+
+Package: ippfix-selfbuild
+Architecture: all
+Depends: ${misc:Depends}, init-system-helpers (>= 1.54~), python3-venv
+Recommends: ippfix, default-mta | mail-transport-agent
+Description: unattended rebuild of ippfix's Python environment
+ ippfix runs from a Python virtual environment, so the libraries it depends on
+ are fixed when that environment is created and are not updated by apt -- unlike
+ a distribution package, which picks up a patched library automatically on
+ dist-upgrade. A virtual environment also stops working outright when the
+ system Python moves to a new minor version, which is exactly what happens
+ during a release upgrade.
+ .
+ This package closes both gaps. It rebuilds the environment whenever the Python
+ interpreter changes or a dependency has a newer release (after apt runs, and
+ weekly as a backstop), installing only after the result has been verified
+ against the live configuration, with automatic rollback and mail on failure.
+ .
+ The rebuild runs outside the apt transaction, so it can never delay or break
+ apt, and a machine with no network simply retries later.

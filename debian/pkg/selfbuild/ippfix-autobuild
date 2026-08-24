@@ -1,0 +1,121 @@
+#!/bin/bash
+#
+# Rebuild ippfix's Python virtual environment when it has gone stale.
+#
+# A virtual environment freezes its libraries at creation time, so apt never
+# patches them, and it is bound to the interpreter's minor version, so it stops
+# working outright when the system Python moves -- which is exactly what a
+# release upgrade does. This closes both gaps: it notices, rebuilds, verifies
+# the result before committing to it, and puts the old one back if the new one
+# does not work.
+#
+#   ippfix-autobuild [--force]
+#
+set -u
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+LIB=/usr/lib/ippfix
+VENV="$LIB/venv"
+DEP='zeroconf'
+CACHE="${CACHE_DIRECTORY:-/var/cache/ippfix-selfbuild}"
+
+log() { logger -t ippfix-autobuild -- "$*" 2>/dev/null || true
+        echo "ippfix-autobuild: $*"; }
+# A non-zero exit is what makes systemd run OnFailure= and mail the admin.
+die() { log "ERROR: $*"; exit 1; }
+
+FORCE=no
+[ "${1:-}" = '--force' ] && FORCE=yes
+
+[ -d "$LIB" ] || { log "ippfix is not installed; nothing to do"; exit 0; }
+command -v python3 >/dev/null || die 'no python3'
+python3 -c 'import venv, ensurepip' 2>/dev/null \
+  || die 'python3 venv/ensurepip missing; install python3-venv'
+
+mkdir -p "$CACHE" || die "cannot use $CACHE"
+
+# --- 1. Cheap change detection --------------------------------------------
+# Nothing here talks to the network unless the environment already looks sound,
+# so the common case is a few milliseconds.
+want_py="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+have_py=''
+[ -r "$VENV/pyvenv.cfg" ] &&
+  have_py="$(sed -n 's/^version *= *\([0-9]*\.[0-9]*\).*/\1/p' "$VENV/pyvenv.cfg")"
+
+reason=''
+if [ "$FORCE" = yes ]; then
+  reason='forced'
+elif [ ! -x "$VENV/bin/python3" ]; then
+  reason='no environment'
+elif [ "$have_py" != "$want_py" ]; then
+  reason="interpreter moved $have_py -> $want_py"
+elif ! "$VENV/bin/python3" -c "import ${DEP}" >/dev/null 2>&1; then
+  reason='environment does not import its dependencies'
+else
+  # Only now, with a working environment, is it worth asking the network.
+  outdated="$("$VENV/bin/pip3" list --outdated --format=freeze 2>/dev/null \
+              | cut -d= -f1 | tr '\n' ' ')"
+  case " $outdated " in
+    *" ${DEP} "*) reason="a newer ${DEP} is available" ;;
+  esac
+fi
+
+[ -n "$reason" ] || { log "up to date (python $have_py, ${DEP} present)"; exit 0; }
+log "rebuilding: $reason"
+
+# --- 2. Build into a staging directory -------------------------------------
+# The live environment is not touched until the new one has been shown to work.
+STAGE="$CACHE/venv.new"
+rm -rf "$STAGE"
+python3 -m venv "$STAGE" || die 'could not create the environment'
+"$STAGE/bin/pip3" install --quiet --upgrade pip \
+  || die 'could not update pip (no network?)'
+"$STAGE/bin/pip3" install --quiet "$DEP" \
+  || die "could not install ${DEP} (no network?)"
+ln -sf python3 "$STAGE/bin/ippfix"
+
+# --- 3. Verify before committing -------------------------------------------
+"$STAGE/bin/python3" -c "import ${DEP}" \
+  || die "the new environment cannot import ${DEP}; not installing"
+"$STAGE/bin/ippfix" "$LIB/ippfix.py" --help >/dev/null 2>&1 \
+  || die 'ippfix does not run under the new environment; not installing'
+
+# --- 4. Swap, keeping the old one as the rollback target -------------------
+was_active=no
+systemctl is-active --quiet ippfix.service && was_active=yes
+rm -rf "$CACHE/venv.old"
+[ -d "$VENV" ] && mv "$VENV" "$CACHE/venv.old"
+mv "$STAGE" "$VENV" || {
+  [ -d "$CACHE/venv.old" ] && mv "$CACHE/venv.old" "$VENV"
+  die 'could not install the new environment; the old one is back'
+}
+
+rollback() {
+  log "rolling back to the previous environment"
+  rm -rf "$VENV"
+  [ -d "$CACHE/venv.old" ] && mv "$CACHE/venv.old" "$VENV"
+  [ "$was_active" = yes ] && systemctl restart ippfix.service >/dev/null 2>&1
+  return 0
+}
+
+# --- 5. Health gate --------------------------------------------------------
+if [ "$was_active" = yes ]; then
+  if ! systemctl restart ippfix.service >/dev/null 2>&1; then
+    rollback; die 'ippfix would not restart with the new environment'
+  fi
+  ok=no
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 2
+    systemctl is-active --quiet ippfix.service && { ok=yes; break; }
+  done
+  [ "$ok" = yes ] || { rollback; die 'ippfix did not come back up; rolled back'; }
+else
+  # Not running -- unconfigured, or stopped on purpose. There is nothing to
+  # probe, and a swapped environment cannot have broken what was not running.
+  log 'ippfix was not running; installed without a restart'
+fi
+
+rm -rf "$CACHE/venv.old" "$CACHE/venv.new"
+log "rebuilt for python ${want_py} (${reason})"
+exit 0

@@ -1,0 +1,18 @@
+[Unit]
+Description=Rebuild ippfix's Python environment against the current interpreter
+Documentation=man:ippfix(8)
+After=network-online.target
+Wants=network-online.target
+# Off the apt transaction, so a failure can never break apt or printing. The
+# work is asynchronous, so apt cannot report it -- mail the administrator.
+OnFailure=ippfix-selfbuild-notify@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/ippfix-selfbuild/ippfix-autobuild
+# Be a good citizen on a small print server.
+Nice=15
+IOSchedulingClass=idle
+CPUWeight=20
+TimeoutStartSec=20min
+CacheDirectory=ippfix-selfbuild
