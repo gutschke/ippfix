@@ -65,9 +65,15 @@ override_dh_installtmpfiles:
 override_dh_installsystemd:
 	# The proxy's sockets are enabled; the service itself is socket-activated
 	# and, in any case, does nothing until a printer is configured.
-	dh_installsystemd -pippfix --name=ippfix-convert --no-start ippfix-convert.socket
-	dh_installsystemd -pippfix --no-start ippfix.socket
-	dh_installsystemd -pippfix --no-enable --no-start ippfix.service
+	dh_installsystemd -pippfix --name=ippfix-convert ippfix-convert.socket
+	dh_installsystemd -pippfix ippfix.socket
+	# Enabled, not merely socket-activated. The daemon has to be running to
+	# publish the queue over DNS-SD, and a client cannot connect to something it
+	# cannot discover -- so leaving it to start on the first connection means it
+	# never starts at all after a reboot. Starting a freshly installed,
+	# unconfigured one is harmless: ExecCondition= skips it and it stays inactive
+	# rather than failing.
+	dh_installsystemd -pippfix ippfix.service
 	# Only the timer is enabled for the self-build; the oneshot service is
 	# started by the apt hook and by the timer, never on its own.
 	dh_installsystemd -pippfix-selfbuild --no-start ippfix-selfbuild.timer
