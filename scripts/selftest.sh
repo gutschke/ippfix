@@ -806,17 +806,34 @@ with FakePrinter() as printer:
     # which is what the real printer was measured to answer.
     assert send(0x0008, 6, job_id=101).ipp.code == 0x0404
 
-    # NOTE, pinned as it is rather than fixed: RFC 8011 lets a client name a
-    # job by job-uri instead of by (printer-uri, job-id), but job-uri is in
-    # FORBIDDEN_ATTRS and is stripped from every request -- so such a client
-    # cannot cancel or query anything, and gets a not-found it can do nothing
-    # about. FORBIDDEN_ATTRS exists to stop the printer being pointed at a
-    # resource of the sender's choosing, which job-uri on a Print-Job would do;
-    # on Cancel-Job it is simply how the job is named. This looks wrong.
-    msg = ipp.new_request(0x0008, 7, OURS)
-    msg.operation().replace('job-uri', ipp.TAG_URI, [OURS + '/101'])
-    assert relay(cfg, msg).ipp.code == 0x0406
-    assert ipp.parse(printer.requests[-1][1]).operation().index_of('job-uri') < 0
+    # RFC 8011 lets a client name a job by job-uri instead of by
+    # (printer-uri, job-id). That form is translated into the numeric one
+    # rather than relayed: relaying it would hand the printer a URI the sender
+    # composed, and rewriting it would mean guessing the printer's own job-uri
+    # spelling, which this device zero-pads and others do not.
+    fresh = send(0x0002, 7, document_format=(ipp.TAG_MIMETYPE,
+                                            ['application/pdf']))
+    fresh_id = fresh.ipp.group(ipp.JOB_ATTRS).get_int('job-id')
+    msg = ipp.new_request(0x0008, 8, OURS)
+    msg.operation().replace('job-uri', ipp.TAG_URI, [f'{OURS}/{fresh_id}'])
+    assert relay(cfg, msg).ipp.code == 0x0000
+    sent = ipp.parse(printer.requests[-1][1]).operation()
+    assert sent.index_of('job-uri') < 0, 'the sender-composed URI was relayed'
+    assert sent.get_int('job-id') == fresh_id, sent.get_int('job-id')
+    assert printer.job(fresh_id).state == 7, 'the cancel did not reach the printer'
+
+    # An explicit job-id wins; job-uri is not allowed to contradict it, and a
+    # job-uri with no number in it must not have one invented for it.
+    import ippfix
+    for uri, want in ((f'{OURS}/101', 102), ('ipp://x/ipp/print/none', 102)):
+        m = job_request(0x0008, 9, OURS, job_id=102)
+        m.operation().replace('job-uri', ipp.TAG_URI, [uri])
+        ippfix.rewrite_request(queue, m)
+        assert m.operation().get_int('job-id') == want, uri
+    m = ipp.new_request(0x0008, 10, OURS)
+    m.operation().replace('job-uri', ipp.TAG_URI, ['ipp://x/ipp/print/none'])
+    ippfix.rewrite_request(queue, m)
+    assert m.operation().index_of('job-id') < 0
 PY2
 
 # The other way a client submits a job: Create-Job, one or more
@@ -871,7 +888,10 @@ with FakePrinter() as printer:
     queue.lock.acquire()
     try:
         held = relay(cfg, send)
-        assert held.status == '503 Service Unavailable', held.status
+        # HTTP 200 carrying IPP 0x0507 server-error-busy: in IPP the status is
+        # in the body, and the client asked in IPP.
+        assert held.status == '200 OK', held.status
+        assert held.ipp.code == 0x0507, hex(held.ipp.code)
         opened = relay(cfg, job_request(0x0005, 4, OURS))
         assert opened.status == '200 OK', opened.status
     finally:
@@ -981,14 +1001,14 @@ with FakePrinter() as printer:
     # holding a socket open for as long as a large job takes to transfer.
     waited = time.monotonic() - started
     assert waited < 2, f'waited {waited:.1f}s for a busy queue'
-    assert answer.status == '503 Service Unavailable', answer.status
-    assert answer.body == b'printer busy\n'
+    # An IPP question gets an IPP answer: HTTP 200 carrying 0x0507
+    # server-error-busy, which a print system reads as "try again". The HTTP
+    # 503 with a line of English that used to come back here read as the server
+    # being broken, and disagreed with the unreachable path two tests above,
+    # which always answered in IPP.
+    assert answer.status == '200 OK', answer.status
+    assert answer.ipp.code == 0x0507, hex(answer.ipp.code)
     assert printer.requests == [], 'the second job reached the printer anyway'
-    # NOTE, pinned as it is rather than fixed: this is an HTTP error with a
-    # text body where the client asked a question in IPP, and IPP has 0x0507
-    # server-error-busy for exactly this. CUPS copes; a stricter client is
-    # entitled not to. The unreachable path above answers in IPP, so the two
-    # disagree about how to report a failure.
 
     # Only the job path takes the lock. A status query during a transfer still
     # gets through, which is what keeps a client's queue display alive.

@@ -439,9 +439,17 @@ class Config:
         self.max_pdf_bytes = args.max_pdf_bytes * 1024 * 1024
 
     def base_http(self):
+        """Where this server re-serves the printer's icons and strings.
+
+        https when plaintext is refused: with --require-tls the daemon answers
+        nothing on http, so an http URI here points at a door that does not
+        open, and the client silently shows no icon rather than reporting an
+        error anybody would see.
+        """
         host = (f'[{self.advertise}]' if ':' in self.advertise
                 else self.advertise)
-        return f'http://{host}:{self.port}'
+        scheme = 'https' if self.require_tls else 'http'
+        return f'{scheme}://{host}:{self.port}'
 
     def dnssd_hostname(self):
         """The name to put in the SRV record clients build their URI from.
@@ -2065,11 +2073,23 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
             if v:
                 new_reasons = [x.decode('utf-8', 'replace') if isinstance(x, bytes)
                                else str(x) for x in v]
+        # Keep what was learned. A reply that carries no job attributes -- the
+        # printer has forgotten the job, or answered something unhelpful --
+        # used to reset all three, so a job watched processing for ten minutes
+        # was reported as NO ANSWER because the last poll before the deadline
+        # came back empty. Only a genuine answer may change the verdict.
+        if new_state is None and new_imp is None and not new_reasons:
+            continue
         entry = (ALERT_TERMINAL.get(new_state, new_state), new_imp,
                  ','.join(new_reasons))
         if not history or history[-1] != entry:
             history.append(entry)
-        state, impressions, reasons = new_state, new_imp, ','.join(new_reasons)
+        if new_state is not None:
+            state = new_state
+        if new_imp is not None:
+            impressions = new_imp
+        if new_reasons:
+            reasons = ','.join(new_reasons)
         if new_state in ALERT_TERMINAL:
             break
 
@@ -2211,27 +2231,31 @@ def maybe_watch(cfg, queue, reply, msg, fmt, data, note,
 UPSTREAM_ERRORS = (OSError, http.client.HTTPException)
 
 
-def unreachable(wfile, queue, msg, opname, exc):
-    """Answer a client when the printer cannot be reached.
+def ipp_error(wfile, msg, code, text):
+    """Answer an IPP request with an IPP status.
 
-    Dropping the connection tells the client nothing, and a print system that
-    is told nothing reports nothing to the user -- the same silence this proxy
-    exists to remove. IPP has a status for exactly this, so say it plainly and
-    let the client retry or surface it.
+    The client asked in IPP, so it is told in IPP. Answering an IPP request
+    with an HTTP status and a line of English means the print system sees a
+    transport failure rather than a printer condition, and reports to the user
+    accordingly -- or reports nothing, which is the silence this proxy exists
+    to remove. The HTTP layer stays 200: in IPP the status lives in the body.
     """
+    reply = ipp.Message(code=code, request_id=getattr(msg, 'request_id', 1))
+    reply.groups.append(ipp.Group(ipp.OPERATION_ATTRS, [
+        (ipp.TAG_CHARSET, b'attributes-charset', b'utf-8'),
+        (ipp.TAG_LANGUAGE, b'attributes-natural-language', b'en-us'),
+        (ipp.TAG_TEXT, b'status-message', text),
+    ]))
+    respond(wfile, '200 OK', 'application/ipp', ipp.serialize(reply))
+
+
+def unreachable(wfile, queue, msg, opname, exc):
+    """Answer a client when the printer cannot be reached."""
     log.warning('%s: %s failed, printer unreachable (%s)',
                 queue.name, opname, exc)
     # 0x0502 is server-error-service-unavailable: the right answer for an
     # upstream that is not there, as distinct from one that refused the job.
-    reply = ipp.Message(code=0x0502,
-                        request_id=getattr(msg, 'request_id', 1))
-    reply.groups.append(ipp.Group(ipp.OPERATION_ATTRS, [
-        (ipp.TAG_CHARSET, b'attributes-charset', b'utf-8'),
-        (ipp.TAG_LANGUAGE, b'attributes-natural-language', b'en-us'),
-        (ipp.TAG_TEXT, b'status-message',
-         b'the printer is not responding'),
-    ]))
-    respond(wfile, '200 OK', 'application/ipp', ipp.serialize(reply))
+    ipp_error(wfile, msg, 0x0502, b'the printer is not responding')
 
 
 def converter_header(queue, cfg):
@@ -2453,6 +2477,17 @@ def upstream_http(queue, path, timeout=30):
 # ---------------------------------------------------------------------------
 # attribute rewriting
 # ---------------------------------------------------------------------------
+# Operations where job-uri is how the client names the job it means, rather
+# than something the printer would go and fetch. RFC 8011 section 4.3 lets a
+# client target a job either by job-uri alone or by (printer-uri, job-id); a
+# client that chose the first form used to have its only identifier stripped
+# and got back a not-found it could do nothing about.
+JOB_TARGETED_OPS = frozenset({
+    0x0008,   # Cancel-Job
+    0x0009,   # Get-Job-Attributes
+})
+
+
 def rewrite_request(queue, msg):
     """Address the request to the real printer, and strip what must not pass.
 
@@ -2465,6 +2500,24 @@ def rewrite_request(queue, msg):
     for attr in ('printer-uri', 'job-printer-uri'):
         if group.index_of(attr) >= 0:
             group.replace(attr, ipp.TAG_URI, [queue.upstream_uri()])
+
+    # A job-uri that names a job is translated into the (printer-uri, job-id)
+    # form rather than relayed. Relaying it would mean handing the printer a URI
+    # the sender composed, and rewriting it would mean guessing the printer's
+    # own job-uri spelling -- this one zero-pads the id, others do not. The
+    # numeric form is the one already known to work, and printer-uri above has
+    # already been pointed at the real device.
+    if msg.code in JOB_TARGETED_OPS and group.index_of('job-uri') >= 0:
+        if group.index_of('job-id') < 0:
+            wanted = group.get('job-uri')[0].decode('utf-8', 'replace')
+            tail = wanted.rstrip('/').rsplit('/', 1)[-1]
+            if tail.isdigit():
+                group.replace('job-id', ipp.TAG_INTEGER,
+                              [ipp.i32(int(tail))])
+            else:
+                log.warning('%s: cannot read a job id out of %r; the request '
+                            'will not name a job', queue.name, wanted[:120])
+
     for attr in FORBIDDEN_ATTRS:
         group.remove(attr)
 
@@ -2812,8 +2865,11 @@ class Handler(socketserver.BaseRequestHandler):
         if msg.code not in ALLOWED_OPS:
             log.warning('refused operation %s from %s', name,
                         self.client_address[0])
-            respond(wfile, '400 Bad Request', 'text/plain',
-                    b'operation not permitted\n')
+            # 0x0501 is server-error-operation-not-supported. The request
+            # parsed and was understood; it is this proxy that will not relay
+            # it, which is a different thing from a malformed request.
+            ipp_error(wfile, msg, 0x0501,
+                      b'this operation is not relayed')
             return
         note = ''
         fmt = None
@@ -2850,8 +2906,11 @@ class Handler(socketserver.BaseRequestHandler):
             payload = ipp.serialize(msg)
             if not queue.lock.acquire(timeout=cfg.timeout):
                 log.warning('%s: busy, refusing job', queue.name)
-                respond(wfile, '503 Service Unavailable', 'text/plain',
-                        b'printer busy\n')
+                # 0x0507 is server-error-busy, which a print system understands
+                # as "try again" -- where an HTTP 503 with a line of English
+                # reads as the server being broken.
+                ipp_error(wfile, msg, 0x0507,
+                          b'the printer is busy with another job')
                 return
             failure = None
             try:

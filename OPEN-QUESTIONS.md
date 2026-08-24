@@ -125,49 +125,54 @@ state returns `0x0404` (client-error-not-possible), and a malformed PDF is
 rejected as `aborted` with `document-format-error` within three seconds -- the
 printer validates before it looks at media.
 
-## Six things in the relay path that look wrong
+## Two things in the relay path left alone, deliberately
 
-Found while pinning that path with tests, and deliberately pinned **as they
-are** rather than fixed: changing behaviour and pinning it in one commit makes
-both unreviewable. None is urgent; all are cheap.
+Four of the six problems found while pinning that path are fixed. These two are
+not, and the reasoning is here so it is not relitigated from scratch.
 
-1. **`job-uri` is stripped from every request.** It is in `FORBIDDEN_ATTRS`,
-   which `rewrite_request()` applies unconditionally. RFC 8011 lets a client
-   name a job by `job-uri` *instead of* `(printer-uri, job-id)` on Cancel-Job
-   and Get-Job-Attributes, so such a client can never cancel or query anything
-   and gets a not-found it cannot act on. The attribute is genuinely dangerous
-   on Print-Job, where it makes the printer fetch a URL of the sender's
-   choosing; on Cancel-Job it is only how the job is named. The fix is to strip
-   it per operation rather than globally.
+### Cancel-Job has no ownership check
 
-2. **`Cancel-Job` has no ownership check.** Any client may cancel any job by id,
-   and ids are sequential. The operation allowlist exists precisely so that LAN
-   hosts do not get administrative control of a printer they cannot otherwise
-   reach, and this went through it. Roughly the exposure a directly connected
-   printer has, which is why it is listed here rather than treated as urgent.
+Any client may cancel any job by id, and ids are sequential.
 
-3. **`printer-supply-info-uri` is removed rather than re-served**, unlike
-   `printer-icons` and `printer-strings-uri` beside it, so clients lose the
-   supply page instead of getting one they can reach.
+The fix that suggests itself -- refuse Cancel-Job for jobs this proxy did not
+create -- is worse than the problem. "Ownership" needs authentication, and there
+is none: `requesting-user-name` is a string the sender chooses. Tracking the ids
+this proxy issued would break the cases that matter (cancelling across a proxy
+restart, or from a second device) while stopping nobody who can send one more
+packet, and would read as an access control that is not one.
 
-4. **The re-served icon and strings URIs are `http://` on the IPP port.** With
-   `--require-tls` the daemon serves no plaintext, so those URIs point at
-   nothing.
+What is worth doing, and is part of the splitting work rather than a fix here,
+is narrower and well defined: once a job is several upstream jobs, refuse to
+relay a Cancel-Job aimed at a *chunk* id. Those ids are the proxy's business,
+not the client's, and cancelling the middle of somebody's document is a fault
+with no legitimate form.
 
-5. **Failures are reported in two different languages.** The busy path answers
-   HTTP 503 with a `text/plain` body; the unreachable path answers in IPP with
-   `0x0502`. The client asked in IPP. The 404, 400 and refused-operation paths
-   have the same split personality.
+The exposure meanwhile is roughly what a directly reachable printer has, on a
+network where the alternative is that anyone can also just print.
 
-6. **`watch_job()` forgets what it has seen.** Any poll whose reply carries no
-   job attributes resets `state`, `impressions` and `reasons` to `None`, so a
-   job observed processing for ten minutes is reported as `NO ANSWER` if the
-   last poll before the deadline comes back empty.
+### printer-supply-info-uri is removed rather than re-served
 
-Also worth knowing before that code is rewritten: **the queue lock is only taken
-when the operation carries a document.** Create-Job and Close-Job, and a
-Print-Job with an empty body, bypass conversion, archiving and the lock
-entirely. "One job at a time" is a property of that branch, not of the queue.
+The apparent inconsistency is with `printer-icons` and `printer-strings-uri`,
+which are re-served from this daemon a few lines away. The difference is what
+sits behind them. Icons and strings are small static files that can be fetched
+and handed on. `printer-supply-info-uri` points at the device's own web
+interface -- a page of vendor HTML and JavaScript, sometimes behind
+authentication, on a host the client deliberately cannot route to. Re-serving it
+means proxying arbitrary device HTML, which is a much larger surface than the
+whole rest of this program and defeats the isolation the proxy exists to
+provide.
+
+Clients that want supply levels have them: `marker-levels` and `marker-names`
+travel over IPP and are relayed untouched. Removing a link nobody can follow is
+the honest answer; a dead link would be worse, and a proxied admin page worse
+still.
+
+## Also worth knowing
+
+**The queue lock is only taken when the operation carries a document.**
+Create-Job and Close-Job, and a Print-Job with an empty body, bypass conversion,
+archiving and the lock entirely. "One job at a time" is a property of that
+branch, not of the queue -- which matters before that branch is rewritten.
 
 ## What this proxy does and does not protect against
 
