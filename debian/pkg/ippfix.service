@@ -16,7 +16,17 @@ EnvironmentFile=/etc/ippfix/ippfix.conf
 ExecCondition=/usr/lib/ippfix/ippfix-configured
 # '+' so the credentials are written before the sandbox drops privileges.
 ExecStartPre=+/usr/lib/ippfix/ippfix-setup
-ExecStart=/usr/lib/ippfix/venv/bin/ippfix /usr/lib/ippfix/ippfix.py --converter unix:/run/ippfix/convert.sock $IPPFIX_ARGS
+# Run through a shell so that quoting in the conffile is honoured. systemd
+# splits $IPPFIX_ARGS on whitespace and does not remove quotes, which would
+# turn a printer named "Front Desk" into two broken arguments; 'eval' gives
+# the ordinary shell rules an administrator will expect. 'exec' replaces the
+# shell, so no extra process remains and ps still shows ippfix. The file is
+# root-owned and only an administrator can edit it, so eval grants nothing
+# that editing the unit would not.
+# systemd takes the journal identifier from the process it spawns, which is
+# the shell, so without this every line is logged as sh[1234].
+SyslogIdentifier=ippfix
+ExecStart=/bin/sh -c 'eval exec /usr/lib/ippfix/venv/bin/ippfix /usr/lib/ippfix/ippfix.py --converter unix:/run/ippfix/convert.sock "$IPPFIX_ARGS"'
 User=ippfix
 Group=ippfix
 # Keep trying indefinitely. The default start limit (5 in 10s) would put

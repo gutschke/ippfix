@@ -19,7 +19,9 @@ override_dh_auto_install:
 	install -m0755 debian/pkg/ippfix-setup debian/pkg/ippfix-configured \
 		debian/ippfix$(LIB)/
 	install -d debian/ippfix/usr/bin
-	ln -sf ..$(LIB)/ippfix debian/ippfix/usr/bin/ippfix
+	# Relative, and relative to /usr/bin -- not to the root. '..$(LIB)' would
+	# resolve to /usr/usr/lib/ippfix and dangle.
+	ln -sf ../lib/ippfix/ippfix debian/ippfix/usr/bin/ippfix
 
 	# Conffile: the only thing an administrator has to touch.
 	install -D -m0644 debian/pkg/ippfix.conf debian/ippfix/etc/ippfix/ippfix.conf
