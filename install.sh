@@ -7,8 +7,9 @@ SOURCES=(ippfix{,.8,.8.md,.py,.service,.socket} ippfix-convert.socket
          'ippfix-convert@.service' ippfix.tmpfiles.conf ippcodec.py defont
          {install,uninstall}.sh LICENSE
          README.md DEPLOYMENT.md DIAGNOSING.md INTERNALS.md OPEN-QUESTIONS.md)
-# The diagnostic tools are copied from ${src}/scripts below. selftest.sh is
-# deliberately not among them: it tests a source tree, not an installation.
+# The diagnostic tools are copied from ${src}/scripts below. The selftest
+# scripts are deliberately not among them: they test a source tree, not an
+# installation.
 DEP='zeroconf'
 
 trap 'rc="$?"

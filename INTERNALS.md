@@ -115,6 +115,22 @@ version is that four models were fitted and all four were falsified.
 
 **The converter is told what the printer accepts**, because it cannot ask: a
 one-line `%%ippfix device=… colorspace=… dpi=… maxpdf=…` header precedes the
+document. Two more fields exist for splitting an oversized job. `first=N last=N`
+asks for one range of pages, 1-based and **inclusive at both ends** — the same
+convention as Ghostscript's `-dFirstPage`/`-dLastPage`, so that no conversion
+happens anywhere along the path and there is exactly one place an off-by-one
+could live. `report=1` asks the converter to answer with a leading
+`%%ippfix-out pages=N` line giving the *input* document's page count, which is
+the only honest way to plan a split: counting pages here would mean parsing a
+PDF outside the sandbox that exists to contain precisely that.
+
+A bad range is fatal to the conversion rather than ignored. Every other field
+falls back to a default when it makes no sense, but falling back on a range
+would mean converting the whole document in answer to a request for part of one
+— and the caller would print the entire job in the middle of itself. For the
+same reason, the pass-through fail-safes do not apply in range mode: a chunk
+request that trips one fails instead of returning the whole document. The
+converter's exit codes carry that distinction, and only zero ever writes a
 document. `defont` validates every field of that header rather than trusting
 it — the device name reaches a Ghostscript command line, and Ghostscript has
 devices that have been used to defeat `-dSAFER`, so only the raster devices

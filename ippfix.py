@@ -2258,7 +2258,7 @@ def unreachable(wfile, queue, msg, opname, exc):
     ipp_error(wfile, msg, 0x0502, b'the printer is not responding')
 
 
-def converter_header(queue, cfg):
+def converter_header(queue, cfg, first=None, last=None, report=False):
     """Tell the converter what this particular printer will accept.
 
     The converter runs with no network at all, deliberately, so it cannot ask
@@ -2266,6 +2266,11 @@ def converter_header(queue, cfg):
     document: which raster format and colour space to fall back to, at what
     resolution, and how large a PDF the printer will take. A converter that
     receives no header keeps its built-in defaults.
+
+    `first` and `last` ask for one range of pages, 1-based and inclusive at both
+    ends. `report` asks the converter to say how many pages the input has, which
+    is the only honest way to plan a split -- counting them here would mean
+    parsing a PDF outside the sandbox that exists to contain exactly that.
     """
     queue.learn()          # a no-op once it has succeeded; retries if it has not
     if not queue.raster_format:
@@ -2276,7 +2281,39 @@ def converter_header(queue, cfg):
                   f'dpi={queue.raster_dpi}']
     limit = queue.max_pdf_bytes or cfg.max_pdf_bytes
     fields.append(f'maxpdf={limit}')
+    if first is not None:
+        fields.append(f'first={int(first)}')
+    if last is not None:
+        fields.append(f'last={int(last)}')
+    if report:
+        fields.append('report=1')
     return ('%%ippfix ' + ' '.join(fields) + '\n').encode()
+
+
+CONVERTER_REPORT = b'%%ippfix-out '
+
+
+def read_converter_report(out):
+    """Split the converter's report line off the document it precedes.
+
+    Returns (pages, document). `pages` is None when there was no report, which
+    is what a converter older than this asks-and-answers protocol does. A caller
+    that gets None must not assume it may split: it does not know how many pages
+    there are, and guessing is how a chunk ends up covering the wrong ones.
+    """
+    if not out.startswith(CONVERTER_REPORT):
+        return None, out
+    line, sep, rest = out.partition(b'\n')
+    if not sep:
+        return None, out
+    pages = None
+    for field in line.split()[1:]:
+        key, _, value = field.partition(b'=')
+        if key == b'pages' and value.isdigit():
+            pages = int(value)
+    # pages=0 is the converter saying "not a PDF I can count", which is not the
+    # same as not having answered.
+    return pages, rest
 
 
 def convert_over_socket(path, data, timeout):

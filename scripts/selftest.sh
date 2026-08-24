@@ -1430,6 +1430,46 @@ else:
     raise AssertionError('oversized datagram accepted')
 PY2
 
+python3 - <<'PY2' && ok 'the converter is asked for a range, and answers with a count' || bad 'converter page-range contract'
+import sys
+sys.path.insert(0, '.')
+import ippfix
+
+args = ippfix.build_parser().parse_args(['t=ipp://p.example/ipp/print'])
+queue = ippfix.parse_queue('t=ipp://p.example/ipp/print')
+cfg = ippfix.Config(args, [queue])
+queue.learned = True          # do not go to the network for this
+
+plain = ippfix.converter_header(queue, cfg)
+assert b'first=' not in plain and b'report=' not in plain, plain
+# Asking for one range, 1-based and inclusive at both ends. An off-by-one here
+# duplicates or drops a page at every seam, and neither is visible until
+# somebody reads the paper.
+ranged = ippfix.converter_header(queue, cfg, first=4, last=6, report=True)
+assert b'first=4' in ranged and b'last=6' in ranged and b'report=1' in ranged
+
+# The count comes back ahead of the document. A converter that predates this
+# says nothing, and None must not be read as a page count.
+cases = [(b'%%ippfix-out pages=9\n%PDF-1.4\nx', (9, b'%PDF-1.4\nx')),
+         (b'%PDF-1.4\nx', (None, b'%PDF-1.4\nx')),
+         (b'%%ippfix-out pages=0\n%PDF', (0, b'%PDF')),
+         (b'%%ippfix-out pages=x\n%PDF', (None, b'%PDF')),
+         (b'%%ippfix-out pages=3', (None, b'%%ippfix-out pages=3'))]
+for raw, want in cases:
+    assert ippfix.read_converter_report(raw) == want, raw
+PY2
+
+# The page-range suite is its own file: it needs Ghostscript and takes about
+# twenty seconds, and keeping it separate means it can be run on its own while
+# working on the converter. There is still one entry point.
+if [ -x ./scripts/selftest-pagerange.sh ]; then
+  echo
+  ./scripts/selftest-pagerange.sh || fail=$((fail+1))
+  echo
+else
+  bad 'scripts/selftest-pagerange.sh is missing or not executable'
+fi
+
 echo 'documentation'
 check 'man page renders without warnings' \
       "[ -z \"\$(man --warnings -l ./ippfix.8 2>&1 >/dev/null)\" ]"
