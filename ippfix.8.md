@@ -7,7 +7,7 @@
 # Synopsis
 
 ```
-ippfix [-a|--advertise ADDRESS] [--also-advertise ADDRESS] [--alert-mail ADDRESS] [--alert-max-per-hour N] [--alert-timeout SEC] [--archive DIR] [--archive-max N] [--archive-max-bytes MB] [--cert FILE] [--converter PATH] [--key FILE] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--no-ipv6] [--no-advertise] [--no-convert] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
+ippfix [-a|--advertise ADDRESS] [--advertise-hostname NAME] [--also-advertise ADDRESS] [--alert-mail ADDRESS] [--alert-max-per-hour N] [--alert-timeout SEC] [--archive DIR] [--archive-max N] [--archive-max-bytes MB] [--cert FILE] [--converter PATH] [--key FILE] [--list [URL]] [--max-connections N] [--idle-timeout SECONDS] [--require-tls] [--convert-threshold N] [--max-pdf-bytes MB] [--all-formats] [--fail-closed] [--no-ipv6] [--no-advertise] [--no-convert] [-p|--port PORT] [--timeout SECONDS] [-v|--verbose] [NAME=]URI...
 ```
 
 <a name="description"></a>
@@ -76,6 +76,27 @@ tell them apart.
 * `-a`, `--advertise` *ADDRESS*:
   Address that clients should use to reach this server. Autodetected by default,
   which is wrong on hosts with several addresses.
+
+* `--advertise-hostname` *NAME*:
+  Host name to publish in the DNS-SD SRV record. Clients build the URI they
+  remember out of this name, so it is used every time they print, not only
+  while they are discovering the printer.
+
+  The default is the `--advertise` address itself rather than a `.local` name.
+  A `.local` name has to be resolved by multicast DNS on every print, and
+  multicast does not cross a VPN, a routed subnet, or a wireless network with
+  client isolation: the printer is found once and then quietly stops working
+  from anywhere else. An address literal needs no resolution at all. The cost
+  is that the address becomes part of what clients remember, so it should be
+  reserved or static -- which is already true of `--advertise`, since every URI
+  this proxy hands out is built from it.
+
+  Give a name to publish one instead, or `auto` for this system's `.local`
+  name. An IPv6 literal is never used by default: clients paste the name
+  straight into `ipp://HOST:PORT/...`, where a bare IPv6 address needs square
+  brackets they do not add, so a v6-only `--advertise` falls back to the system
+  name. AAAA records are published either way; this setting only decides which
+  name clients are handed.
 
 * `--also-advertise` *ADDRESS*:
   Additional address to publish in the DNS-SD records; may be repeated. By

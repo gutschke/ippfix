@@ -129,6 +129,15 @@ Leave `_uscan` and `_uscans` alone, or scanning breaks.
 **[DEPLOYMENT.md](DEPLOYMENT.md)** walks through the ways to do it, from one
 setting on the printer to full network isolation, and how to verify the result.
 
+Clients build the URI they remember out of the DNS-SD SRV record, and by
+default that is the `--advertise` address rather than a `.local` name. The
+distinction shows up after discovery, not during it: a `.local` name has to be
+resolved by multicast DNS on *every* print, and multicast does not cross a VPN,
+a routed subnet, or a wireless network with client isolation — so the printer
+is found once and then quietly stops working from anywhere else. Use
+`--advertise-hostname` to publish a name instead, or `auto` for this system's
+`.local` name.
+
 If another mDNS responder already holds UDP port 5353 the queues never appear
 at all. With `systemd-resolved` that means setting `MulticastDNS=no` in
 `/etc/systemd/resolved.conf` and restarting it.

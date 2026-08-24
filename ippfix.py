@@ -356,6 +356,7 @@ class Config:
         else:
             # Only this interface's addresses: see interface_of().
             self.extra_addresses = global_ipv6(interface_of(self.advertise))
+        self.advertise_hostname = args.advertise_hostname
         self.cert = args.cert
         self.key = args.key
         self.convert = not args.no_convert
@@ -389,6 +390,37 @@ class Config:
         host = (f'[{self.advertise}]' if ':' in self.advertise
                 else self.advertise)
         return f'http://{host}:{self.port}'
+
+    def dnssd_hostname(self):
+        """The name to put in the SRV record clients build their URI from.
+
+        By default this is the advertised IPv4 address, not a .local name. The
+        distinction matters after discovery, not during it: a client stores the
+        URI it was given and uses it every time it prints from then on. A
+        .local name has to be resolved by multicast DNS on each of those
+        occasions, and multicast does not cross a VPN, a routed subnet, or a
+        wireless network with client isolation -- so the printer is found once
+        and then quietly stops working from anywhere else. An address literal
+        needs no resolution at all, which is one fewer thing to be somewhere
+        it does not work.
+
+        The cost is that the address becomes part of what clients remember, so
+        it should be a reserved or static one. That is already true of
+        --advertise, which every URI this proxy hands out is built from.
+
+        An IPv6 literal is deliberately not used: clients paste the SRV target
+        straight into ipp://HOST:PORT/..., where a bare v6 address needs square
+        brackets that they do not add. So a v6-only --advertise falls back to
+        the system name, which resolves to both families. AAAA records are
+        published either way; this only decides which name clients are handed.
+        """
+        name = self.advertise_hostname
+        if not name:
+            name = (self.advertise if '.' in self.advertise
+                    else f'{socket.gethostname()}.local')
+        elif name == 'auto':
+            name = f'{socket.gethostname()}.local'
+        return name if name.endswith('.') else name + '.'
 
     def published_addresses(self):
         """Addresses to put in the DNS-SD records.
@@ -1989,7 +2021,7 @@ def advertise(cfg):
                 addresses=None,
                 port=cfg.port,
                 properties=props,
-                server=f'{socket.gethostname()}.local.',
+                server=cfg.dnssd_hostname(),
                 parsed_addresses=cfg.published_addresses(),
             )
             zc.register_service(info)
@@ -2070,6 +2102,14 @@ def build_parser():
     parser.add_argument('-a', '--advertise', default=None,
                         help='address clients should use in URIs '
                              '(default: autodetect)')
+    parser.add_argument('--advertise-hostname', default=None, metavar='NAME',
+                        help='the host name to publish in the DNS-SD SRV '
+                             'record, which is what clients build the URI they '
+                             'remember out of. Defaults to the --advertise '
+                             'address itself, so that printing does not depend '
+                             'on multicast DNS still reaching this host. Pass a '
+                             'name to use one instead, or "auto" for this '
+                             'system\'s .local name')
     parser.add_argument('--also-advertise', action='append', metavar='ADDRESS',
                         help='additional address to publish in the DNS-SD '
                              'records, repeatable. Defaults to the stable '

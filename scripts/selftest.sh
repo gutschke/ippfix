@@ -107,7 +107,8 @@ args = ippfix.build_parser().parse_args(['x=ipp://printer.example/ipp/print'])
 cfg = ippfix.Config(args, [ippfix.parse_queue('x=ipp://printer.example/ipp/print')])
 for attr in ('port', 'advertise', 'cert', 'key', 'convert', 'converter',
              'timeout', 'archive', 'archive_max', 'max_connections',
-             'idle_timeout', 'require_tls', 'extra_addresses'):
+             'idle_timeout', 'require_tls', 'extra_addresses',
+             'advertise_hostname'):
     assert hasattr(cfg, attr), attr
 PY2
 
@@ -139,6 +140,18 @@ a = ippfix.build_parser().parse_args(
 c3 = ippfix.Config(a, qs)
 assert c3.our_uri(qs[0]) == 'ipp://[2001:db8::1]/ipp/office', c3.our_uri(qs[0])
 assert c3.base_http() == 'http://[2001:db8::1]:631'
+
+# What clients build their remembered URI from. An address literal by default,
+# because a .local name has to be resolved by multicast DNS on every print and
+# multicast does not survive a VPN or a routed subnet.
+assert c.dnssd_hostname() == '192.0.2.10.', c.dnssd_hostname()
+# An IPv6 literal must never be handed over: clients paste it into
+# ipp://HOST:PORT/ without the brackets a bare v6 address needs.
+assert c3.dnssd_hostname().endswith('.local.'), c3.dnssd_hostname()
+c5, _ = cfg(extra=('--advertise-hostname', 'auto'))
+assert c5.dnssd_hostname().endswith('.local.'), c5.dnssd_hostname()
+c6, _ = cfg(extra=('--advertise-hostname', 'printer.example.com'))
+assert c6.dnssd_hostname() == 'printer.example.com.', c6.dnssd_hostname()
 
 # Addresses get typed from memory, so resolution is deliberately lax.
 c4, qs4 = cfg(queues=('office=ipp://p/ipp/print', 'studio=ipp://q/ipp/print'))
