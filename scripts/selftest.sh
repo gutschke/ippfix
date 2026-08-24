@@ -432,9 +432,15 @@ fi
 echo 'documentation'
 check 'man page renders without warnings' \
       "[ -z \"\$(man --warnings -l ./ippfix.8 2>&1 >/dev/null)\" ]"
+# Compare the options the manual declares with the options the program accepts.
+# Only the .B/.BR header lines inside .SH OPTIONS count: scanning the whole page
+# meant the manual could not mention any other program's long option -- naming
+# 'defont --selfcheck' in prose was reported as a missing option.
 check 'man page and --help list the same options' \
       "diff <(python3 ippfix.py --help 2>/dev/null | grep -oE -- '--[a-z0-9-]+' | grep -v '^--help$' | sort -u) \
-            <(sed -e 's/\\\\f[BIRP]//g' -e 's/\\\\-/-/g' ippfix.8 | grep -oE -- '--[a-z0-9-]+' | sort -u)"
+            <(sed -e 's/\\\\f[BIRP]//g' -e 's/\\\\-/-/g' ippfix.8 \
+              | awk '/^\\.SH OPTIONS/{f=1;next} /^\\.SH /{f=0} f' \
+              | grep -E '^\\.BR? ' | grep -oE -- '--[a-z0-9-]+' | sort -u)"
 check 'README references DEPLOYMENT.md' "grep -q 'DEPLOYMENT.md' README.md"
 check 'no absolute home paths leaked' \
       "! grep -rqE '/home/[a-z]+/' --exclude-dir=.git --exclude-dir=__pycache__ ."

@@ -354,9 +354,8 @@ the command line in a conffile; `install.sh` installs under
   installation directory. Edit `ExecStart` to configure the printers.
 
 * `/usr/lib/ippfix/defont`:
-  PDF conversion helper, run as its own confined service. May be run by hand for
-  diagnosis; asked to self-check, it reports whether the installed Ghostscript
-  preserves function-based shadings. See `DIAGNOSING.md`.
+  PDF conversion helper, run as its own confined service. May be run by hand for diagnosis; `defont --selfcheck` reports whether the
+installed Ghostscript preserves function-based shadings. See `DIAGNOSING.md`.
 
 * `/etc/ippfix/ippfix.crt`, `/etc/ippfix/ippfix.key`:
   Self-signed TLS credentials, generated on first start if absent.

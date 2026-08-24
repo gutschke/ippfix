@@ -433,8 +433,17 @@ to configure the printers.
 .TP
 .I /usr/lib/ippfix/defont
 PDF conversion helper, run as its own confined service. May be run by hand for
-diagnosis; asked to self\-check, it reports whether the installed Ghostscript
-preserves function\-based shadings. See
+diagnosis:
+.IP
+.EX
+defont \-\-selfcheck
+.EE
+.IP
+reports whether the installed Ghostscript preserves function\-based shadings,
+which is how browsers emit conic and repeating CSS gradients. Releases before
+10.05 discard them; a conversion that loses one is thrown away in favour of the
+original, so such a document keeps its appearance and forgoes only the font fix.
+See
 .IR DIAGNOSING.md .
 .TP
 .I /etc/ippfix/ippfix.crt\fR, \fI/etc/ippfix/ippfix.key
