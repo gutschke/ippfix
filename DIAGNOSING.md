@@ -12,16 +12,25 @@ an affected printer:
 python3 scripts/make-reproducer.py repro.pdf /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf 900
 ```
 
-One page, 900 distinct glyphs, one embedded hinted font. Send it to the printer
-and compare the page counter before and after:
+One page, 900 distinct glyphs, one embedded hinted font. Send it with:
 
 ```sh
-snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.10.2.1.4.1.1
+python3 scripts/probe-printer.py ipp://PRINTER/ipp/print repro.pdf
 ```
 
 **Do not trust the print system.** An affected printer accepts the job, runs its
 warm-up, reports `job-state = completed`, and marks nothing. Every layer above
-it repeats that success. The page counter is the only honest signal.
+it repeats that success. The page counter is the only honest signal, so
+`probe-printer.py` reads it over SNMP (RFC 3805, so any manufacturer) and
+judges the job on that rather than on what IPP claims:
+
+```
+  before: printer-state=3 (toner-low-warning)  pages=10130
+  submitted: job 226
+    completed impressions=0 reasons=job-completed-successfully
+  after:  printer-state=3 (toner-low-warning)  pages=10130 (+0)
+  VERDICT: SILENT-NO-OUTPUT  job reported completed but the page counter did not move
+```
 
 An affected printer costs nothing to test, because a job that provokes the fault
 marks no paper. Only an unaffected printer costs a sheet.
@@ -175,12 +184,15 @@ that as a font failure. That single wrong data point was then used to fit three
 different models, and it took a deliberately extreme test to expose it.
 
 **Always record the printer's state before and after**, and treat any job where
-the printer was not ready as saying nothing at all:
+the printer was not ready as saying nothing at all. `probe-printer.py` does
+this: it refuses to judge a document when the printer was not ready beforehand,
+reporting INCONCLUSIVE and naming the panel text, and it distinguishes an
+advisory `-warning` severity from a genuinely blocking condition so that a
+merely low tray does not discard good measurements.
 
-```sh
-snmpget -v2c -c public PRINTER 1.3.6.1.2.1.25.3.5.1.1.1   # hrPrinterStatus
-snmpget -v2c -c public PRINTER 1.3.6.1.2.1.43.16.5.1.2.1.1  # panel text
-```
+That distinction is the whole lesson. A run where the printer could not print
+is not a data point about the document, and filing it as one is how three
+successive models came to be fitted to a measurement that meant nothing.
 
 Results near the boundary are not reproducible run to run. Measure well inside
 the failing region — 900 glyphs of a hinted font, not 530 — or the data will be
