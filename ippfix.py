@@ -207,11 +207,12 @@ class Queue:
         self.raster_dpi = None
         self.max_pdf_bytes = None
         self.learned = False
+        self.learn_failed_at = None    # monotonic time of the last failure
         self._warned_formats = False
         if not self.host:
             raise ValueError(f'{name}: no host in {uri!r}')
 
-    def learn(self, timeout=20):
+    def learn(self, timeout=20, retry_after=60):
         """Ask the printer what it can actually take, once.
 
         Everything the raster fallback needs varies by model: which raster
@@ -222,7 +223,16 @@ class Queue:
         """
         if self.learned:
             return
-        self.learned = True
+        # A printer that was down when this daemon started must not stay
+        # degraded for the daemon's lifetime: marking the attempt done before
+        # making it meant one unlucky boot disabled the raster fallback until
+        # the next restart. Only success is final. Failure is retried, but not
+        # before retry_after has passed, so an unreachable printer costs one
+        # stalled request per minute rather than one per job.
+        now = time.monotonic()
+        if self.learn_failed_at is not None \
+                and now - self.learn_failed_at < retry_after:
+            return
         try:
             request = ipp.new_request(0x000B, 1, self.upstream_uri())
             request.operation().replace(
@@ -237,9 +247,13 @@ class Queue:
             if group is None:
                 raise ValueError('no printer attributes')
         except Exception as exc:
+            self.learn_failed_at = now
             log.warning('%s: could not read capabilities (%s); the raster '
-                        'fallback is disabled for this printer', self.name, exc)
+                        'fallback is unavailable until the printer answers',
+                        self.name, exc)
             return
+        self.learned = True
+        self.learn_failed_at = None
 
         formats = [f.decode('utf-8', 'replace')
                    for f in (group.get('document-format-supported') or [])]
@@ -870,6 +884,37 @@ def prune_archive(cfg):
 MAX_CONVERTED = 256 * 1024 * 1024   # outlining inflates; bound it anyway
 
 
+# What a failure to reach the printer actually looks like. socket errors are
+# OSError, but a printer that answers with a malformed HTTP response raises
+# http.client.HTTPException instead -- BadStatusLine, IncompleteRead and
+# LineTooLong are not OSError subclasses, and letting one of those escape drops
+# the client's connection with no explanation at all.
+UPSTREAM_ERRORS = (OSError, http.client.HTTPException)
+
+
+def unreachable(wfile, queue, msg, opname, exc):
+    """Answer a client when the printer cannot be reached.
+
+    Dropping the connection tells the client nothing, and a print system that
+    is told nothing reports nothing to the user -- the same silence this proxy
+    exists to remove. IPP has a status for exactly this, so say it plainly and
+    let the client retry or surface it.
+    """
+    log.warning('%s: %s failed, printer unreachable (%s)',
+                queue.name, opname, exc)
+    # 0x0502 is server-error-service-unavailable: the right answer for an
+    # upstream that is not there, as distinct from one that refused the job.
+    reply = ipp.Message(code=0x0502,
+                        request_id=getattr(msg, 'request_id', 1))
+    reply.groups.append(ipp.Group(ipp.OPERATION_ATTRS, [
+        (ipp.TAG_CHARSET, b'attributes-charset', b'utf-8'),
+        (ipp.TAG_LANGUAGE, b'attributes-natural-language', b'en-us'),
+        (ipp.TAG_TEXT, b'status-message',
+         b'the printer is not responding'),
+    ]))
+    respond(wfile, '200 OK', 'application/ipp', ipp.serialize(reply))
+
+
 def converter_header(queue, cfg):
     """Tell the converter what this particular printer will accept.
 
@@ -879,6 +924,7 @@ def converter_header(queue, cfg):
     resolution, and how large a PDF the printer will take. A converter that
     receives no header keeps its built-in defaults.
     """
+    queue.learn()          # a no-op once it has succeeded; retries if it has not
     if not queue.raster_format:
         fields = ['raster=none']
     else:
@@ -1486,13 +1532,26 @@ class Handler(socketserver.BaseRequestHandler):
                 respond(wfile, '503 Service Unavailable', 'text/plain',
                         b'printer busy\n')
                 return
+            failure = None
             try:
                 status, raw = upstream_ipp(queue, payload, cfg.timeout)
+            except UPSTREAM_ERRORS as exc:
+                failure = exc
             finally:
+                # Release before answering. Writing to a client can block for as
+                # long as that client cares to take, and holding the queue lock
+                # across it would let one slow reader stall every other job.
                 queue.lock.release()
+            if failure is not None:
+                unreachable(wfile, queue, msg, name, failure)
+                return
         else:
             rewrite_request(queue, msg)
-            status, raw = upstream_ipp(queue, ipp.serialize(msg), cfg.timeout)
+            try:
+                status, raw = upstream_ipp(queue, ipp.serialize(msg), cfg.timeout)
+            except UPSTREAM_ERRORS as exc:
+                unreachable(wfile, queue, msg, name, exc)
+                return
 
         try:
             reply = ipp.parse(raw)

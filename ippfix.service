@@ -12,8 +12,12 @@ ExecStart=/usr/local/lib/ippfix/venv/bin/ippfix /usr/local/lib/ippfix/ippfix.py 
     printer=ipp://printer.example/ipp/print
 User=ippfix
 Group=ippfix
+# Keep trying indefinitely. The default start limit (5 in 10s) would put
+# the unit in a failed state and stop retrying, which on a print server
+# means the queue silently never comes back after a transient fault.
 Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
 WorkingDirectory=/run/ippfix
 RuntimeDirectory=ippfix
 RuntimeDirectoryPreserve=yes
