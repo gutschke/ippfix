@@ -18,8 +18,13 @@ GS="${GS:-gs}"
 # Outlining a page inlines a full outline at every glyph occurrence, so a long
 # document can grow past what the printer will accept as a PDF at all -- HP
 # LaserJet Pro devices advertise pdf-k-octets-supported of 0-75000. Past this
-# size the page is rasterised instead: lower fidelity, but it prints, and a
-# job that prints imperfectly beats one the printer rejects outright.
+# size the page is rasterised instead. That costs less than it sounds: the
+# raster is contone at the device's own resolution, so the printer still does
+# its own halftoning and edge processing, and only geometry precision is given
+# up -- edges land on the 600 dpi grid instead of wherever the RIP would have
+# put them. It is not the blurry "print as image" path, which is blurry from
+# JPEG quality 40 rather than from rastering. A job that prints slightly less
+# precisely beats one the printer rejects outright.
 MAX_PDF_BYTES="${MAX_PDF_BYTES:-60000000}"
 RASTER_DPI="${RASTER_DPI:-600}"
 # 19 = SRGB24, the colour space these printers advertise first. 18 is W8 grey,

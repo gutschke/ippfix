@@ -130,9 +130,26 @@ could carry a line that looks like one.
 | text outlined | the normal path for every PDF |
 | rasterised | only when the outlined PDF would exceed what the printer accepts |
 
-The raster tier is chosen from the document's size before the job is sent.
-Nothing anywhere reacts to what the printer does with a job afterwards — see
-the structural limit in [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
+The raster tier is chosen from the outlined document's size before the job is
+sent, never from a rejection: by the time a printer refuses a job there is
+nothing left to fall back with. Measured on dense body copy, outlining costs
+about 670 KB of PDF per page, so a 61 MB device cap is reached around 90 such
+pages — reachable by a long report, not only by a pathological document.
+
+What that tier costs is smaller than "rasterised" suggests. The raster is
+contone at the device's own resolution — the printer's raster interface is
+8 bits per channel with no 1-bit mode — so the printer still performs its own
+halftoning and edge processing. Only geometry precision is given up: edges land
+on the 600 dpi grid rather than wherever the RIP would have placed them, and
+antialiasing recovers most of that as sub-pixel coverage. It costs transfer
+size and saves CPU (0.18 s/page against 0.49 for outlining). Do not describe it
+as equivalent to "print as image"; that path is blurry because Chrome encodes
+the page as JPEG at a hardcoded quality of 40, which is a different problem.
+
+The proxy observes what the printer does with a job — see *Following a job* —
+but nothing *reacts* to it: there is no retry, no re-conversion and no change of
+tier based on an outcome. See the structural limit in
+[OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
 
 **Every conversion is checked before it is used.** `defont` discards its own
 output and passes the original through if the output is empty, if any

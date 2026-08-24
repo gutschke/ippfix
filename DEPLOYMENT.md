@@ -566,8 +566,36 @@ from `--alert-mail` unless one is given.
 
 **Large jobs.** Outlining inlines a full path at every glyph occurrence, so a
 long document can grow past what the printer will accept as a PDF. When that
-happens the job is rasterised instead — lower fidelity, but it prints rather
-than being rejected. The limit comes from the printer's own
+happens the job is rasterised instead — a modest loss of fidelity, but it prints
+rather than being rejected.
+
+Modest is meant literally, and this is worth being accurate about because it is
+easy to assume the worst. Rasterising here is 600 dpi contone at the device's
+own resolution. The printer's raster interface is 8 bits per channel with no
+1-bit mode, so the printer still does its own halftoning and edge processing —
+it is not handed pre-screened dots. What is lost is geometry precision: edges
+are quantised to the 600 dpi grid before the RIP sees them, and antialiasing
+recovers most but not all of that. It costs transfer size and *saves* CPU
+(0.18 s/page against 0.49 for outlining). It is not the blurry "print as image"
+path — that blur is Chrome encoding the page as JPEG at quality 40.
+
+Measured on dense body copy, outlining costs about **670 KB of PDF per page**,
+so a 61 MB device limit is reached at roughly 90 such pages, or around 180 at
+normal text density. That is a long report, not a pathological document, so
+this tier is worth knowing about rather than treating as unreachable. It is
+logged whenever it fires:
+
+```sh
+journalctl -u ippfix | grep 'rasterising instead'
+```
+
+Two things follow. Documents that hit it give up the vector-text advantage the
+proxy otherwise preserves — a real cost, if a small one. And they are also the
+documents *least* likely to have needed conversion in the first place: the fault depends on distinct glyphs
+per page, and a hundred-page report drawing the same ninety-odd characters
+throughout is nowhere near it. A site that prints long documents routinely
+should consider `--convert-threshold`, which skips conversion for pages that
+draw few glyphs and so avoids reaching the raster tier at all. The limit comes from the printer's own
 `pdf-k-octets-supported` (the daemon uses 80% of what the device reports, and
 logs the figure at startup); `--max-pdf-bytes` supplies a limit only for a
 device that declares none. To see what yours declares:

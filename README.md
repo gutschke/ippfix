@@ -58,16 +58,46 @@ reasons, this proxy will not help, and
 Every PDF is run through Ghostscript's `-dNoOutputFonts`, which converts each
 glyph to a filled path. Text stays **vector**, so the printer's own rasteriser
 still renders it at full device precision and its edge enhancement still
-applies. That is the important difference from printing "as an image", which
-commits the geometry to the device grid before the printer sees it, forfeits
-the printer's halftoning, and inflates a small job into tens of megabytes.
+applies. That is the difference from printing "as an image", which commits the
+geometry to the device grid before the printer sees it.
 
-Every PDF is converted. There is no threshold and no attempt to guess which
-documents need it: four cost models were fitted to measured outcomes and every
-one was falsified, so predicting the printer's limit from the file was
-abandoned. Converting unconditionally costs about a third of a second per job.
-Converted files are often *smaller* than the originals, because a subsetted
-font program is bulkier than the outlines actually drawn from it.
+Every PDF is converted. There is no threshold by default and no attempt to
+guess which documents need it: four cost models were fitted to measured
+outcomes and every one was falsified, so predicting the printer's limit from
+the file was abandoned. Converting unconditionally costs about a third of a
+second per job. (`--convert-threshold` exists for a site that has measured its
+own workload, and is off unless set.)
+
+The result is used unless it would be worse than the original. If the
+conversion comes back empty, still carrying font programs, or missing a class
+of drawing the input had, the original is forwarded instead and the reason is
+logged — a job that might not print beats one that prints something wrong.
+
+**Two things this costs.** Outlining inlines a path at every glyph
+*occurrence*, so size follows how much text there is. A page drawing a few
+hundred glyphs from a large embedded font gets *smaller* (the reproducer here
+goes 394 KB → 192 KB, because the font program outweighs the outlines drawn
+from it), but dense body copy runs about 670 KB of outlined PDF per page.
+
+Printers cap the size of a PDF they will accept — 61 MB on the printer this was
+built for — and past that the job is **rasterised** rather than refused. That is
+roughly 90 pages of dense text, or twice that at normal density, so a long
+report can reach it. The journal says so whenever it happens.
+
+That is a smaller loss than it sounds, and it is **not** what ChromeOS does when
+you tick "print as image". Rasterising here means 600 dpi contone at the
+device's own resolution: the printer's raster interface is 8 bits per channel
+with no 1-bit mode at all, so the printer still runs its own halftoning and edge
+processing on what it receives. The blur you may have seen from "print as image"
+comes from Chrome encoding the page as JPEG at a hardcoded quality of 40, not
+from rasterising as such.
+
+What is genuinely lost is geometry precision: glyph edges are quantised to the
+600 dpi grid before the printer's RIP sees them, where vector input would let it
+place them at whatever internal precision it uses. Antialiasing encodes the
+sub-pixel coverage as grey levels and recovers most of that, but it is a
+reconstruction of something that was thrown away. It also costs transfer size —
+though *less* CPU than outlining, 0.18 s/page against 0.49.
 
 If anything about the conversion looks wrong — Ghostscript fails, a font
 program survives, or a class of drawing construct disappeared — the original

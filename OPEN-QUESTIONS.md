@@ -4,6 +4,30 @@ What is not solved, what is not understood, and what would be worth
 investigating next. Kept separate from `DIAGNOSING.md`, which records what *is*
 established.
 
+## Whether the raster tier is the right last resort
+
+When an outlined PDF exceeds what the printer will accept, the job is
+rasterised. Measured on dense body copy that happens at roughly 90 pages, or
+around 180 at normal density — reachable by a long report.
+
+There is a third option that has not been evaluated: forward the **original**
+PDF unconverted. It is small (the growth is all in the outlining), it keeps
+full vector text, and the documents that reach this tier are the ones least
+likely to have needed conversion at all — the fault depends on distinct glyphs
+per page, and a long report drawing the same ninety-odd characters throughout is
+nowhere near the threshold.
+
+The trade is quality against the fault the proxy exists to prevent. Rasterising
+always prints and gives up some geometry precision (a modest loss -- the printer
+still halftones contone input itself); relaying the original keeps full fidelity
+and reintroduces the risk. That risk is now *visible* rather than silent, since
+the page-counter cross-check reports a job the printer claims to have printed
+and did not, which is an argument for reconsidering the order.
+
+What would settle it: how often real workloads reach the tier at all, and
+whether any document large enough to reach it has ever provoked the fault.
+Neither has been measured.
+
 ## What this proxy does and does not protect against
 
 Three firmware faults have been reproduced on one printer. The proxy addresses
