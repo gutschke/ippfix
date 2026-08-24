@@ -53,6 +53,7 @@ colour modes and live supply and error state are always exactly right and
 there is nothing to maintain by hand as firmware changes.
 """
 import argparse
+import email.utils
 import hashlib
 import http.client
 import json
@@ -361,6 +362,15 @@ class Config:
                                  if args.converter.startswith('unix:') else None)
         self.timeout = args.timeout
         self.archive = args.archive
+        # Following jobs to see whether they printed. Off unless an address is
+        # given: on a printer that does not report impressions honestly this
+        # would report every job as lost.
+        self.alert_timeout = args.alert_timeout
+        self.alert_max_watchers = 32
+        self.watching = 0
+        self.watch_lock = threading.Lock()
+        self.alerter = (Alerter(args.alert_mail, args.alert_max_per_hour)
+                        if args.alert_mail else None)
         self.archive_max = args.archive_max
         self.max_connections = args.max_connections
         self.idle_timeout = args.idle_timeout
@@ -884,6 +894,277 @@ def prune_archive(cfg):
 MAX_CONVERTED = 256 * 1024 * 1024   # outlining inflates; bound it anyway
 
 
+# ---------------------------------------------------------------------------
+# Watching what the printer actually did with a job.
+#
+# The failures this proxy exists for are silent: the printer accepts the job,
+# reports it completed, and marks nothing. Everything above it repeats that
+# success, so nobody finds out. Outlining prevents one such fault, but not the
+# others -- and a fault that reports success is invisible to a fallback that
+# triggers on rejection.
+#
+# So the job is followed to its terminal state and judged on what the printer
+# says it marked, not on whether the request succeeded. IPP reports this
+# itself: a job that completes having marked nothing gives
+# job-impressions-completed = 0, which is exactly what a lost job looks like.
+# No SNMP and no extra protocol is needed.
+#
+# This is off unless an address is configured, because on a printer that does
+# not report impressions honestly it would cry wolf on every job.
+# ---------------------------------------------------------------------------
+
+ALERT_TERMINAL = {7: 'canceled', 8: 'aborted', 9: 'completed'}
+
+
+class Alerter:
+    """Rate-limited delivery of 'that job did not print' reports."""
+
+    def __init__(self, address, max_per_hour, sender=None):
+        self.address = address
+        self.max_per_hour = max_per_hour
+        self.sender = sender or f'ippfix@{socket.getfqdn()}'
+        self.sent = []                      # monotonic timestamps
+        self.suppressed = 0
+        self.lock = threading.Lock()
+
+    def _allow(self):
+        """True if we may send now. Keeps a bounded window, not a counter."""
+        now = time.monotonic()
+        with self.lock:
+            self.sent = [t for t in self.sent if now - t < 3600]
+            if len(self.sent) >= self.max_per_hour:
+                self.suppressed += 1
+                return False
+            self.sent.append(now)
+            held, self.suppressed = self.suppressed, 0
+        self.held = held
+        return True
+
+    def send(self, subject, body):
+        if not self._allow():
+            log.warning('alert suppressed (%d in the last hour already): %s',
+                        self.max_per_hour, subject)
+            return
+        held = getattr(self, 'held', 0)
+        if held:
+            body += (f'\n{held} further alert(s) were suppressed by the rate '
+                     f'limit before this one. Raise --alert-max-per-hour, or '
+                     f'treat the rate itself as the finding.\n')
+        host = socket.getfqdn()
+        to = self.address if '@' in self.address else f'{self.address}@{host}'
+        message = (
+            f'From: ippfix <{self.sender}>\n'
+            f'To: {to}\n'
+            f'Subject: {subject}\n'
+            f'Date: {email.utils.formatdate(localtime=True)}\n'
+            f'Message-ID: {email.utils.make_msgid(domain=host)}\n'
+            f'Auto-Submitted: auto-generated\n'
+            f'\n{body}')
+        try:
+            proc = subprocess.run(
+                ['/usr/sbin/sendmail', '-f', self.sender, '-t', '-i'],
+                input=message.encode('utf-8', 'replace'),
+                capture_output=True, timeout=60)
+            if proc.returncode == 0:
+                log.info('alert sent to %s: %s', to, subject)
+                return
+            log.error('sendmail refused the alert (%s); logging it instead',
+                      proc.stderr.decode('utf-8', 'replace').strip()[:200])
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.error('could not send the alert (%s); logging it instead', exc)
+        # Losing the report is worse than the noise of printing it.
+        for line in body.splitlines():
+            log.error('  %s', line)
+
+
+def describe_document(data, fmt):
+    """Structural facts about a document, for a report.
+
+    Deliberately no text and no images: this goes in an email, and the point is
+    to make a fault reproducible, not to copy what somebody printed.
+    """
+    out = [f'format: {fmt}', f'size: {len(data):,} bytes',
+           f'sha256: {hashlib.sha256(data).hexdigest()[:32]}']
+    if not data.startswith(b'%PDF-'):
+        return out
+    out.append(f'pdf version: {data[:8].decode("latin1", "replace")}')
+    blobs = [data]
+    for m in re.finditer(rb'/Type\s*/ObjStm.*?stream\r?\n', data, re.S):
+        e = data.find(b'endstream', m.end())
+        if e < 0:
+            continue
+        try:
+            blobs.append(zlib.decompress(data[m.end():e].rstrip(b'\r\n')))
+        except Exception:
+            pass
+    joined = b'\n'.join(blobs)
+
+    prod = re.search(rb'/Producer\s*\(([^)]{0,120})\)', joined)
+    if prod:
+        out.append('producer: '
+                   + prod.group(1).decode('latin1', 'replace'))
+    fonts = {}
+    for tag in (b'FontFile', b'FontFile2', b'FontFile3'):
+        n = len(re.findall(b'/' + tag + rb'[^\d]', joined))
+        if n:
+            fonts[tag.decode()] = n
+    out.append('embedded font programs: '
+               + (', '.join(f'{k}={v}' for k, v in fonts.items()) or 'none'))
+    for label, pat in (('shading types', rb'/ShadingType\s*(\d+)'),
+                       ('pattern types', rb'/PatternType\s*(\d+)'),
+                       ('function types', rb'/FunctionType\s*(\d+)')):
+        found = sorted({int(x) for x in re.findall(pat, joined)})
+        if found:
+            out.append(f'{label}: {found}')
+    for label, pat in (('transparency groups', rb'/S\s*/Transparency'),
+                       ('soft masks', rb'/SMask\s*<<'),
+                       ('images', rb'/Subtype\s*/Image')):
+        n = len(re.findall(pat, joined))
+        if n:
+            out.append(f'{label}: {n}')
+    return out
+
+
+def watch_job(cfg, queue, job_id, jobname, fmt, data, note):
+    """Follow one job to its end and report if the printer marked nothing."""
+    deadline = time.monotonic() + cfg.alert_timeout
+    state = impressions = None
+    reasons = ''
+    history = []
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        try:
+            req = ipp.new_request(0x0009, 2, queue.upstream_uri())
+            g = req.operation()
+            g.items.append((ipp.TAG_INTEGER, b'job-id', ipp.i32(job_id)))
+            for want in (b'job-state', b'job-state-reasons',
+                         b'job-impressions-completed'):
+                g.items.append((ipp.TAG_KEYWORD, b'requested-attributes', want))
+            _st, raw = upstream_ipp(queue, ipp.serialize(req), 30)
+            reply = ipp.parse(raw)
+        except Exception:
+            continue
+        new_state = new_imp = None
+        new_reasons = []
+        for gr in reply.groups:
+            v = gr.get('job-state')
+            if v:
+                new_state = struct.unpack('>i', v[0])[0] if len(v[0]) == 4 else v[0]
+            v = gr.get('job-impressions-completed')
+            if v:
+                new_imp = struct.unpack('>i', v[0])[0] if len(v[0]) == 4 else v[0]
+            v = gr.get('job-state-reasons')
+            if v:
+                new_reasons = [x.decode('utf-8', 'replace') if isinstance(x, bytes)
+                               else str(x) for x in v]
+        entry = (ALERT_TERMINAL.get(new_state, new_state), new_imp,
+                 ','.join(new_reasons))
+        if not history or history[-1] != entry:
+            history.append(entry)
+        state, impressions, reasons = new_state, new_imp, ','.join(new_reasons)
+        if new_state in ALERT_TERMINAL:
+            break
+
+    # Judge. Only complain about things that are actually wrong: a job that
+    # completed having marked pages is the ordinary case and says nothing.
+    if state == 9 and impressions:
+        return
+    if state is None:
+        verdict = 'NO ANSWER'
+        detail = (f'the printer stopped answering questions about this job '
+                  f'within {cfg.alert_timeout}s')
+    elif state == 9 and not impressions:
+        verdict = 'LOST SILENTLY'
+        detail = ('the printer reported the job completed successfully and '
+                  'marked no impressions at all. This is the failure this '
+                  'proxy exists for, and it means something got through it.')
+    elif state == 8:
+        verdict = 'REJECTED'
+        detail = ('the printer aborted the job. Unlike a silent loss the '
+                  'client was told, so the user may already know.')
+    elif state == 7:
+        verdict = 'CANCELED'
+        detail = 'the job was canceled. This may simply have been the user.'
+    else:
+        verdict = 'DID NOT FINISH'
+        detail = (f'the job never reached a terminal state within '
+                  f'{cfg.alert_timeout}s')
+
+    lines = [detail, '',
+             f'queue:        {queue.name}',
+             f'printer:      {queue.upstream_uri()}',
+             f'job id:       {job_id}',
+             f'job name:     {jobname or "(none)"}',
+             f'conversion:   {note or "relayed unconverted"}',
+             f'final state:  {ALERT_TERMINAL.get(state, state)}'
+             + (f' ({reasons})' if reasons else ''),
+             f'impressions:  {impressions}',
+             '', 'What the printer said, in order:']
+    lines += [f'  {st} impressions={im} reasons={rs or "none"}'
+              for st, im, rs in history]
+    lines += ['', 'The document, structurally:']
+    lines += [f'  {x}' for x in describe_document(data, fmt)]
+    lines += ['', 'To investigate:', '']
+    if verdict == 'LOST SILENTLY':
+        lines += [
+            '  A job that the printer says succeeded but did not print is the',
+            '  whole point of this proxy, so this is worth chasing.',
+            '',
+            '  1. If --archive was on, the document is in the archive directory',
+            '     under this job name. That copy is the single most useful',
+            '     thing to keep; everything else can be derived from it.',
+            '  2. Check it for a malformed soft mask, a known cause that',
+            '     conversion cannot repair:',
+            '         python3 scripts/check-softmask.py FILE.pdf',
+            '  3. Re-send it directly to the printer and through this proxy:',
+            '         python3 scripts/probe-printer.py ipp://PRINTER/ipp/print FILE.pdf',
+            '     If it fails both ways, conversion is not the answer for it.',
+            '  4. See OPEN-QUESTIONS.md for the faults already known.']
+    else:
+        lines += ['  See DIAGNOSING.md, and keep the document if you can.']
+    if not cfg.archive:
+        lines += ['',
+                  '  --archive is off, so no copy of this document was kept.',
+                  '  Turning it on captures the next one -- but it stores what',
+                  '  people print, so turn it off again afterwards.']
+    cfg.alerter.send(f'ippfix: job {verdict.lower()} on {queue.name}',
+                     '\n'.join(lines) + '\n')
+
+
+def maybe_watch(cfg, queue, reply, msg, fmt, data, note):
+    """Start following a print job, if alerting is configured."""
+    if not cfg.alerter:
+        return
+    job_id = None
+    for gr in reply.groups:
+        v = gr.get('job-id')
+        if v:
+            job_id = struct.unpack('>i', v[0])[0] if len(v[0]) == 4 else v[0]
+            break
+    if not job_id:
+        return
+    op = msg.operation()
+    jobname = op.get_str('job-name') if op else None
+    with cfg.watch_lock:
+        if cfg.watching >= cfg.alert_max_watchers:
+            log.warning('not following job %s: already watching %d',
+                        job_id, cfg.watching)
+            return
+        cfg.watching += 1
+
+    def run():
+        try:
+            watch_job(cfg, queue, job_id, jobname, fmt, data, note)
+        except Exception as exc:
+            log.error('while following job %s: %s', job_id, exc)
+        finally:
+            with cfg.watch_lock:
+                cfg.watching -= 1
+
+    threading.Thread(target=run, daemon=True,
+                     name=f'watch-{job_id}').start()
+
+
 # What a failure to reach the printer actually looks like. socket errors are
 # OSError, but a printer that answers with a malformed HTTP response raises
 # http.client.HTTPException instead -- BadStatusLine, IncompleteRead and
@@ -1010,11 +1291,11 @@ def convert(cfg, data, fmt, queue=None):
     # for a prediction that has been wrong twice. The estimate is still computed
     # and logged, because it is useful for diagnosis, and a site that has
     # measured its own workload can act on it via --convert-threshold.
+    cost = estimate_font_cost(payload)
     if cfg.convert_threshold:
         if cost is not None and cost <= cfg.convert_threshold:
             return data, f'relayed (font cost {cost}, under threshold)'
 
-    cost = estimate_font_cost(payload)
     started = time.time()
     try:
         if cfg.converter_socket:
@@ -1497,6 +1778,7 @@ class Handler(socketserver.BaseRequestHandler):
                     b'operation not permitted\n')
             return
         note = ''
+        fmt = None
 
         if msg.code in (OP_PRINT_JOB, OP_SEND_DOCUMENT) and msg.data:
             group = msg.operation()
@@ -1566,6 +1848,16 @@ class Handler(socketserver.BaseRequestHandler):
                  f'  [{note}]' if note else '')
         respond(wfile, '200 OK' if status == 200 else f'{status} Error',
                 'application/ipp', out)
+
+        # The client has its answer; now find out whether the printer really
+        # prints it. This happens after responding, so following a job never
+        # delays one.
+        if msg.code in (0x0002, 0x0006) and status == 200 and cfg.alerter:
+            try:
+                maybe_watch(cfg, queue, ipp.parse(raw), msg, fmt,
+                            msg.data or b'', note)
+            except Exception as exc:
+                log.error('could not start following the job: %s', exc)
 
 
 SD_LISTEN_FDS_START = 3
@@ -1729,6 +2021,10 @@ def list_queues(url):
     return 0
 
 
+DEFAULT_CONVERTER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'defont')
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog='ippfix',
@@ -1755,13 +2051,33 @@ def build_parser():
                         help='TLS certificate')
     parser.add_argument('--key', default='/etc/ippfix/ippfix.key',
                         help='TLS private key')
-    parser.add_argument('--converter', default='/usr/local/lib/ippfix/defont',
+    # Alongside this file, wherever it was installed. Hard-coding a path meant
+    # the default was wrong for whichever of the two install layouts was not
+    # chosen when it was written.
+    parser.add_argument('--converter', default=DEFAULT_CONVERTER,
                         help='PDF conversion helper: either an executable that '
                              'filters stdin to stdout, or unix:PATH to reach '
-                             'the separately sandboxed conversion service')
+                             'the separately sandboxed conversion service '
+                             '(default: defont, alongside this program)')
     parser.add_argument('--timeout', type=int, default=300,
                         help='seconds allowed per conversion and per upstream '
                              'request (default: 300)')
+    parser.add_argument('--alert-mail', metavar='ADDRESS',
+                        help='email this address when a job does not print. '
+                             'The printer reports success even when it marks '
+                             'nothing, so without this such a loss is invisible '
+                             'to everyone. Off unless set: a printer that does '
+                             'not report impressions honestly would cry wolf on '
+                             'every job.')
+    parser.add_argument('--alert-max-per-hour', type=int, default=6,
+                        metavar='N',
+                        help='never send more than N alerts an hour (default '
+                             '6). Suppressed ones are logged and counted in the '
+                             'next message, so a flood is reported as a flood '
+                             'rather than becoming one.')
+    parser.add_argument('--alert-timeout', type=int, default=600, metavar='SEC',
+                        help='how long to follow a job before giving up on it '
+                             '(default 600)')
     parser.add_argument('--no-convert', action='store_true',
                         help='relay jobs untouched, for comparison')
     parser.add_argument('--archive', metavar='DIR', default=None,

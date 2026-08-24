@@ -6,6 +6,9 @@ cache.
 .B ippfix
 [\fB\-a\fR|\fB\-\-advertise\fR \fIADDRESS\fR]
 [\fB\-\-also\-advertise\fR \fIADDRESS\fR]
+[\fB\-\-alert\-mail\fR \fIADDRESS\fR]
+[\fB\-\-alert\-max\-per\-hour\fR \fIN\fR]
+[\fB\-\-alert\-timeout\fR \fISEC\fR]
 [\fB\-\-archive\fR \fIDIR\fR]
 [\fB\-\-list\fR [\fIURL\fR]]
 [\fB\-\-max\-connections\fR \fIN\fR]
@@ -116,6 +119,41 @@ because they need a scope identifier a DNS\-SD record cannot carry.
 Publish only the IPv4 address, for networks where IPv6 exists but is not
 routable.
 .TP
+.B \-\-alert\-mail " \fIADDRESS\fR"
+Send mail to
+.I ADDRESS
+when a job does not print. Off unless set.
+.IP
+The failures this proxy exists for are silent: the printer accepts the job,
+reports it completed, and marks nothing, so every layer above it repeats that
+success and nobody finds out. When this is set, each print job is followed to
+its terminal state and judged on what the printer says it marked rather than on
+whether the request succeeded. IPP reports this itself \(em a job that completes
+having marked nothing gives
+.I job\-impressions\-completed
+of zero \(em so no other protocol is needed.
+.IP
+The report names the queue, the job, what conversion did, the sequence of states
+the printer went through, and the document's structure: producer, embedded font
+programs, shading and pattern types, transparency groups, soft masks and a
+digest. It contains no text and no images from the document; the aim is to make
+a fault reproducible, not to copy what somebody printed.
+.IP
+This is off by default because a printer that does not report impressions
+honestly would report every job as lost.
+.TP
+.B \-\-alert\-max\-per\-hour " \fIN\fR"
+Send at most
+.I N
+alerts an hour, default 6. Suppressed ones are logged, and the count is carried
+into the next message, so a flood is reported as a flood instead of becoming
+one.
+.TP
+.B \-\-alert\-timeout " \fISEC\fR"
+Give up following a job after
+.I SEC
+seconds, default 600. A job still unfinished then is reported as such.
+.TP
 .B \-\-archive " \fIDIR\fR"
 Diagnostic only. Keep a copy of every job exactly as it arrived, before
 conversion, together with a short text file recording the queue, job name,
@@ -141,8 +179,9 @@ TLS certificate. Default
 .TP
 .B \-\-converter " \fIPATH\fR"
 Helper that rewrites a PDF read on standard input and writes the result to
-standard output. Default
-.IR /usr/local/lib/ippfix/defont .
+standard output. Defaults to
+.I defont
+alongside the program, so it is correct whichever way this was installed.
 .TP
 .B \-\-key " \fIFILE\fR"
 TLS private key. Default
