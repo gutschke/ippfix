@@ -29,6 +29,50 @@ RASTER_COLORSPACE="${RASTER_COLORSPACE:-19}"
 # accepts no raster format we can produce, so there is no fallback for it.
 RASTER_DEVICE="${RASTER_DEVICE:-appleraster}"
 
+# --selfcheck reports whether the Ghostscript on this machine is fit for the
+# job. Ghostscript 10.02.1 -- Ubuntu 24.04's version -- discards function-based
+# shadings, which is how browsers emit conic and repeating CSS gradients; 10.05
+# and later keep them. Nothing needs to be configured either way, because every
+# conversion is checked and one that lost something is discarded in favour of
+# the original. This only tells you which of those two you are getting.
+if [ "${1:-}" = "--selfcheck" ]; then
+  probe="$(mktemp -t defont-probe-XXXXXX)"
+  result="$(mktemp -t defont-result-XXXXXX)"
+  trap 'rm -f "$probe" "$result"' EXIT
+  base64 -d > "$probe" <<'PROBE_PDF'
+JVBERi0xLjQKMSAwIG9iago8PCAvRnVuY3Rpb25UeXBlIDQgL0RvbWFpbiBbLTUwIDUwIC01MCA1
+MF0gL1JhbmdlIFswIDEgMCAxIDAgMV0gL0xlbmd0aCA0MyA+PgpzdHJlYW0Ke2V4Y2ggYXRhbiAz
+NjAgZGl2IGR1cCBkdXAgMSBleGNoIHN1YiAwLjI1fQplbmRzdHJlYW0KZW5kb2JqCjIgMCBvYmoK
+PDwgL1R5cGUgL1BhdHRlcm4gL1BhdHRlcm5UeXBlIDIgL01hdHJpeCBbMSAwIDAgMSA2MCA2MF0g
+L1NoYWRpbmcgPDwgL1NoYWRpbmdUeXBlIDEgL0RvbWFpbiBbLTUwIDUwIC01MCA1MF0gL0NvbG9y
+U3BhY2UgL0RldmljZVJHQiAvRnVuY3Rpb24gMSAwIFIgPj4gPj4KZW5kb2JqCjMgMCBvYmoKPDwg
+L0xlbmd0aCA0MiA+PgpzdHJlYW0KcSAvUGF0dGVybiBjcyAvUDAgc2NuIDEwIDEwIDEwMCAxMDAg
+cmUgZiBRCmVuZHN0cmVhbQplbmRvYmoKNCAwIG9iago8PCAvVHlwZSAvUGFnZSAvUGFyZW50IDUg
+MCBSIC9NZWRpYUJveCBbMCAwIDEyMCAxMjBdIC9SZXNvdXJjZXMgPDwgL1BhdHRlcm4gPDwgL1Aw
+IDIgMCBSID4+ID4+IC9Db250ZW50cyAzIDAgUiA+PgplbmRvYmoKNSAwIG9iago8PCAvVHlwZSAv
+UGFnZXMgL0tpZHMgWzQgMCBSXSAvQ291bnQgMSA+PgplbmRvYmoKNiAwIG9iago8PCAvVHlwZSAv
+Q2F0YWxvZyAvUGFnZXMgNSAwIFIgPj4KZW5kb2JqCnhyZWYKMCA3CjAwMDAwMDAwMDAgNjU1MzUg
+ZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMTYzIDAwMDAwIG4gCjAwMDAwMDAzMzEgMDAw
+MDAgbiAKMDAwMDAwMDQyMyAwMDAwMCBuIAowMDAwMDAwNTUyIDAwMDAwIG4gCjAwMDAwMDA2MDkg
+MDAwMDAgbiAKdHJhaWxlcgo8PCAvU2l6ZSA3IC9Sb290IDYgMCBSID4+CnN0YXJ0eHJlZgo2NTgK
+JSVFT0YK
+PROBE_PDF
+  echo "ghostscript: $("$GS" --version 2>/dev/null || echo 'NOT FOUND')"
+  "$GS" -q -dNOPAUSE -dBATCH -dSAFER -dNoOutputFonts -sDEVICE=pdfwrite         -o "$result" "$probe" 2>/dev/null
+  if LC_ALL=C grep -qa '/FunctionType' "$result"; then
+    echo "function-based shadings: preserved"
+    echo "verdict: fit. Every document is converted."
+    exit 0
+  fi
+  echo "function-based shadings: DISCARDED"
+  echo "verdict: affected. Documents using conic or repeating gradients are"
+  echo "         relayed unconverted, so they keep their appearance but are"
+  echo "         not protected against the font fault. Everything else is"
+  echo "         converted normally. Ghostscript 10.05 or later fixes this;"
+  echo "         Ubuntu 26.04 and Debian 13 both ship a new enough version."
+  exit 1
+fi
+
 infile="$(mktemp -t defont-in-XXXXXX)"
 outfile="$(mktemp -t defont-out-XXXXXX)"
 trap 'rm -f "$infile" "$outfile" "${rasterfile:-}"' EXIT INT TERM QUIT HUP
@@ -69,6 +113,42 @@ if [ "$(head -c 9 "$infile")" = '%%ippfix ' ]; then
     esac
   done
 fi
+
+# Ghostscript is not a lossless conduit, and when it loses something it does so
+# quietly. Version 10.02.1 -- what Ubuntu 24.04 ships -- discards function-based
+# shadings (/ShadingType 1 driven by a /FunctionType 4 calculator program),
+# which is how browsers emit conic and repeating CSS gradients. The page still
+# prints; the gradient is simply absent. That is precisely the silent wrongness
+# this proxy must never introduce, so pinning a version is not enough: the
+# result is checked instead, and any release with a comparable defect is caught
+# by the same test. Ghostscript 10.07.1 handles these correctly.
+#
+# The test is deliberately coarse -- whether a whole class of construct has
+# vanished, not whether counts match. Ghostscript legitimately merges identical
+# objects, so an exact count would raise false alarms; a class disappearing
+# entirely is unambiguous.
+marks() {
+  python3 -c '
+import re, sys, zlib
+d = open(sys.argv[1], "rb").read()
+seen = set()
+def scan(b):
+    seen.update(m.group(0) for m in
+                re.finditer(rb"/(?:Shading|Pattern|Function)Type\s*\d+", b))
+scan(d)
+# Object streams hide these dictionaries from a plain scan, so expand any we find.
+for m in re.finditer(rb"/Type\s*/ObjStm.*?stream\r?\n", d, re.S):
+    e = d.find(b"endstream", m.end())
+    if e < 0:
+        continue
+    try:
+        scan(zlib.decompress(d[m.end():e].rstrip(b"\r\n")))
+    except Exception:
+        pass
+print(b" ".join(sorted(x.replace(b" ", b"") for x in seen)).decode("latin1"))
+' "$1" 2>/dev/null || LC_ALL=C grep -aoE '/(Shading|Pattern|Function)Type *[0-9]+' "$1" \
+    | tr -d ' ' | sort -u | tr '\n' ' '
+}
 
 emit() {
   if [ $# -ge 2 ] && [ "$2" != "-" ]; then
@@ -117,6 +197,25 @@ if [ ! -s "$outfile" ]; then
 fi
 if grep -qa '/FontFile' "$outfile"; then
   echo "defont: font programs survived, passing input through" >&2
+  emit "$infile" "${2:--}"
+  exit 0
+fi
+
+# Every class of drawing construct in the input must survive into the output.
+lost=''
+before="$(marks "$infile")"
+after="$(marks "$outfile")"
+for m in $before; do
+  case " $after " in
+    *" $m "*) ;;
+    *) lost="$lost $m" ;;
+  esac
+done
+if [ -n "$lost" ]; then
+  echo "defont: conversion dropped${lost}; passing input through." \
+       "Ghostscript before 10.07 discards function-based shadings, which is" \
+       "how browsers emit conic and repeating gradients; upgrading it restores" \
+       "the fix for these documents." >&2
   emit "$infile" "${2:--}"
   exit 0
 fi

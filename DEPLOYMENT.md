@@ -491,6 +491,61 @@ same document to both:
 ippfix --port 6310 --no-advertise --no-convert ipp://PRINTER/ipp/print
 ```
 
+## Keeping Ghostscript current
+
+Ghostscript does the conversion, and it is the most exposed component here: it
+parses documents that arrive from the network. It needs to stay patched, which
+means it needs to keep coming from the distribution. **Do not build it from
+source or carry a private copy** -- an unpackaged Ghostscript is one that
+`apt upgrade` will never fix, on exactly the component you least want to leave
+unfixed.
+
+### The version matters, but nothing needs configuring
+
+Ghostscript 10.02.1, which Ubuntu 24.04 LTS ships and will keep shipping for its
+whole life, discards function-based shadings -- how browsers emit conic and
+repeating CSS gradients. Later releases handle them:
+
+| Ghostscript | ships in | function-based shadings |
+|---|---|---|
+| 10.02.1 | Ubuntu 24.04 LTS | discarded |
+| 10.05.1 | Debian 13 | preserved |
+| 10.06.0 | Ubuntu 26.04 LTS | preserved |
+
+On an affected version nothing prints wrongly, because every conversion is
+checked before it is used and one that lost something is thrown away in favour
+of the original bytes. Those documents keep their appearance and simply forgo
+the font fix. To see which behaviour you have:
+
+```sh
+/usr/local/lib/ippfix/defont --selfcheck
+```
+
+### What to do about it
+
+**Nothing, if you are on 24.04 and expect to move to 26.04 eventually.** The
+distribution fixes this on its own schedule; the check stops firing by itself
+once a newer Ghostscript is installed, and there is no pin to remember to
+remove. This is the recommended course.
+
+If those documents matter enough to act sooner, in decreasing order of sanity:
+
+- **Move this host to a release with a newer Ghostscript.** Ubuntu 26.04 LTS or
+  Debian 13. Clean, supported, and the whole problem disappears.
+- **Run only the converter on a newer base.** The converter is already a
+  separate, network-isolated service, so putting it in its own container is a
+  small change rather than a redesign. It gains a second thing to keep updated.
+- **A PPA.** Works, but you are trusting a third party for security updates on
+  your most exposed parser, and PPAs are frequently abandoned.
+- **Installing a newer distribution's `.deb` on 24.04.** Do not. Debian 13's
+  Ghostscript wants `libjpeg.so.62` and `libpaper.so.2` where 24.04 has `.so.8`
+  and `.so.1`, so it drags in a private library stack that apt will not maintain
+  -- the same problem as building it yourself, with more moving parts.
+
+Whichever you choose, `--selfcheck` tells you where you actually stand, and the
+output check means a wrong answer degrades to "not converted" rather than to
+"printed wrongly".
+
 ## Rolling back
 
 Every option is reversible, and none of them modifies stored jobs or printer

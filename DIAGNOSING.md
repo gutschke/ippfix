@@ -63,17 +63,109 @@ glyphs used. Do not trust a threshold derived from any of them. This is why
 `ippfix` converts every PDF by default rather than predicting which ones need
 it.
 
-**This is one code path, and there may be others.** Everything above concerns
-embedded TrueType fonts with hinting. Nothing has been established about CFF
-and OpenType fonts, Type 3 fonts, bitmap and colour fonts, or about failures
-arising from anything other than fonts. A printer that still loses jobs with
-`ippfix` in place is evidence of a different path, and worth investigating
-rather than dismissing.
+**This is one code path, and there are others.** Everything above concerns
+embedded TrueType fonts with hinting. A second, unrelated failure is documented
+below. Nothing has been established about CFF and OpenType fonts, or about
+failures arising from anything other than fonts and transparency. A printer that
+still loses jobs with `ippfix` in place is evidence of a further path, and worth
+investigating rather than dismissing.
 
 **The fault has also been recorded as an assertion.** Some failures leave
 `ASSERT FAILED / Task: POSTSCRIPT / File: fontcache.c` in the device's log; the
 ones reproduced here leave no trace at all. Whether these are the same defect at
 different severities is unknown.
+
+## A second failure: transparency, not fonts
+
+A printer with a conservative interpreter has no support for colour fonts, and
+does not need any: **a colour font never reaches it as a font.** PDF has no way
+to represent one, so the browser takes it apart first. What it turns into
+depends on the format, and the two families are not equally safe.
+
+Rendered by Chrome 149, one page each:
+
+| source | becomes | printer |
+|---|---|---|
+| CBDT/CBLC bitmap emoji | Type 3 fonts drawing 80x76 images -- 348 image objects for 176 emoji | prints |
+| COLR/CPAL vector colour | 345 form XObjects, 240 shadings, **690 transparency groups** | **aborts** |
+
+The bitmap case is fine. The vector case is not, and it fails differently from
+the font fault: the printer returns `job-state = aborted` with
+`document-format-error` rather than silently reporting success, so the client is
+told. Colour is not what distinguishes them -- **transparency and shading** are.
+No assert is logged and no font program is involved.
+
+**This proxy does not fix it.** That is worth stating plainly, because a first
+measurement suggested otherwise: converted through Ghostscript 10.02.1 the page
+did print. It printed because that release destroyed most of what the page
+contained -- ink coverage fell from 5.51% to 2.40%, and better than half the
+artwork was gone. Converted through a release that renders it correctly, the
+page aborts exactly as the original does. The abort is a real limit in the
+printer, and outlining fonts has no bearing on it.
+
+For such documents the only thing that would help is rasterising, which is not
+currently attempted on a format error. That is a plausible improvement and is
+not implemented.
+
+## Fidelity: the conversion must not change the page
+
+Removing fonts is worth nothing if the page comes out different. A silently
+wrong page is worse than one that fails to print, because nobody checks.
+
+So the conversion is measured, not assumed. `fidelity.py` in this repository
+renders the original and the converted file with **poppler** -- which had no
+part in the conversion, so a fault in Ghostscript cannot hide behind a matching
+fault in the rasteriser -- and compares them pixel by pixel. Rasterising both
+with Ghostscript would have missed the defect below entirely, because its
+renderer dropped the same construct its writer did.
+
+Text is expected to differ very slightly: outlining removes hinting, so stems
+land on the pixel grid differently. Geometry must not move and effects must not
+disappear.
+
+### What this found
+
+A test page exercising rounded corners, linear/radial/conic gradients, alpha
+and `opacity`, blend modes, shadows, transforms, `clip-path`, hairlines down to
+0.0625px, dashed and dotted borders and inline SVG:
+
+| Ghostscript | mean difference | ink coverage | conic gradient |
+|---|---|---|---|
+| 10.02.1 | 2.28 | 5.53% -> **4.79%** | **dropped** |
+| 10.07.1 | 0.33 | 5.53% -> 5.57% | preserved |
+
+Browsers emit conic and repeating CSS gradients as a `/ShadingType 1`
+function-based shading driven by a `/FunctionType 4` PostScript calculator
+program. Ghostscript 10.02.1 discards them, reporting only `error in pattern`.
+The page still prints, with the gradient simply absent.
+
+| Ghostscript | ships in | function-based shadings |
+|---|---|---|
+| 10.02.1 | Ubuntu 24.04 LTS | **discarded** |
+| 10.05.1 | Debian 13 | preserved |
+| 10.06.0 | Ubuntu 26.04 LTS | preserved |
+| 10.07.1 | upstream | preserved |
+
+### Why there is no version pin
+
+`defont` checks its own output instead. Every class of drawing construct in the
+input -- `/ShadingType`, `/PatternType`, `/FunctionType` -- must still be present
+afterwards; if a class has vanished, the conversion is discarded and the
+original is sent unchanged. The document then keeps its appearance, and gives up
+only the protection against the font fault.
+
+This is deliberately coarse. Ghostscript legitimately merges identical objects,
+so comparing exact counts would raise false alarms; a whole class disappearing
+is unambiguous. Measured against every version above, it fires only on 10.02.1
+and only for documents that actually contain the affected constructs.
+
+Nothing needs to be configured, and nothing needs to be undone later: when the
+underlying Ghostscript improves, the check stops firing on its own and those
+documents start being converted again.
+
+    defont --selfcheck
+
+reports which behaviour the installed Ghostscript has.
 
 ## A warning about method
 
