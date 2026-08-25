@@ -79,10 +79,16 @@ hundred glyphs from a large embedded font gets *smaller* (the reproducer here
 goes 394 KB → 192 KB, because the font program outweighs the outlines drawn
 from it), but dense body copy runs about 670 KB of outlined PDF per page.
 
-Printers cap the size of a PDF they will accept — 61 MB on the printer this was
-built for — and past that the job is **rasterised** rather than refused. That is
-roughly 90 pages of dense text, or twice that at normal density, so a long
-report can reach it. The journal says so whenever it happens.
+Printers declare a maximum PDF size, and **the proxy does not act on it.** The
+printer this was built for declares 76.8 MB and was measured printing a 92.5 MB
+document without complaint; deciding from the declared figure meant rasterising
+documents it would have taken whole. So the outlined PDF is sent, and if the
+printer refuses it *for a reason about the document*, it is converted again as
+raster and sent once more. The journal says so whenever that happens.
+
+That retry is safe only because a returned refusal means no job was created. A
+dropped or lost answer is the opposite case — the printer may be holding what it
+just read — and is never resent, because doing so prints the job twice.
 
 That is a smaller loss than it sounds, and it is **not** what ChromeOS does when
 you tick "print as image". Rasterising here means 600 dpi contone at the
@@ -91,6 +97,13 @@ with no 1-bit mode at all, so the printer still runs its own halftoning and edge
 processing on what it receives. The blur you may have seen from "print as image"
 comes from Chrome encoding the page as JPEG at a hardcoded quality of 40, not
 from rasterising as such.
+
+When a job does come back as raster, the proxy tells the converter which side of
+the paper the client asked for. On this printer the raster stream's own duplex
+field **overrides** the IPP attribute — measured on paper: two-sided requested,
+accepted with nothing reported unsupported, two simplex sheets produced. A
+raster job that does not carry the right field silently prints one-sided while
+every layer reports success.
 
 What is genuinely lost is geometry precision: glyph edges are quantised to the
 600 dpi grid before the printer's RIP sees them, where vector input would let it

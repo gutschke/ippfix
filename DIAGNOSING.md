@@ -168,10 +168,11 @@ artwork was gone. Converted through a release that renders it correctly, the
 page aborts exactly as the original does. The abort is a real limit in the
 printer, and outlining fonts has no bearing on it.
 
-Rasterising such a page would probably print it, but nothing attempts that: the
-raster tier is chosen on document size before the job is sent, and nothing in
-the proxy reacts to a rejection. That is a plausible improvement and it is not
-implemented.
+Rasterising such a page would probably print it, and the proxy now does attempt
+that: a job the printer refuses is converted again as raster and sent once more.
+Whether it helps for this fault has not been measured — the abort is
+`document-format-error`, which is on the retry list, so the machinery fires, but
+nobody has confirmed the raster then prints.
 
 ## Fault 3: a malformed soft mask, lost silently
 

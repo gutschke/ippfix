@@ -565,9 +565,9 @@ flag is already off by then, and `--cancel` removes it early. The address comes
 from `--alert-mail` unless one is given.
 
 **Large jobs.** Outlining inlines a full path at every glyph occurrence, so a
-long document can grow past what the printer will accept as a PDF. When that
-happens the job is rasterised instead — a modest loss of fidelity, but it prints
-rather than being rejected.
+long document can grow past what the printer declares it will accept as a PDF.
+The proxy sends it anyway, and rasterises only if the printer actually refuses
+it — a modest loss of fidelity, but it prints rather than being rejected.
 
 Modest is meant literally, and this is worth being accurate about because it is
 easy to assume the worst. Rasterising here is 600 dpi contone at the device's
@@ -580,18 +580,16 @@ recovers most but not all of that. It costs transfer size and *saves* CPU
 path — that blur is Chrome encoding the page as JPEG at quality 40.
 
 Measured: outlining costs about **650 KB of PDF per page** on dense body copy
-and **390 KB** on an ordinary report page, so a 61 MB device limit arrives at
-roughly 90 or 155 pages respectively. That is a long report, not a pathological
-document.
+and **390 KB** on an ordinary report page, so a 155-page report reaches the
+76.8 MB this device declares. **It prints anyway** — the same device was
+measured accepting and rendering a 92.5 MB PDF. Declared limits on this printer
+family are advisory, which is why the proxy no longer decides from them.
 
-**Know the limit of this tier before relying on it.** The raster is 1.5–2.5 MB
-per page, which crosses the proxy's own 256 MB ceiling on converted output at
-around 175 report pages — only twenty pages past where rasterising starts. Past
-that the conversion is abandoned and the original is relayed **unconverted**,
-which is the one outcome this proxy exists to avoid. A 200-page report is
-already in that band. See
-[OPEN-QUESTIONS.md](OPEN-QUESTIONS.md) — splitting the job is the fix, and is
-not yet implemented.
+Duplex needs care on the raster path. The raster stream carries its own
+two-sided field and **it overrides the IPP attribute** on this printer, so the
+proxy passes the job's `sides` value to the converter. A raster job built
+without it prints one-sided while every layer reports success. See
+[DIAGNOSING.md](DIAGNOSING.md).
 
 The tier is logged whenever it fires:
 
@@ -610,10 +608,11 @@ page in a document, never on an average, so it does not dilute one costly page
 among many cheap ones — but it is still a prediction, and the model behind it
 has been falsified twice. That is why it is off by default.
 
-The limit comes from the printer's own
-`pdf-k-octets-supported` (the daemon uses 80% of what the device reports, and
-logs the figure at startup); `--max-pdf-bytes` supplies a limit only for a
-device that declares none. To see what yours declares:
+The daemon reads the printer's `pdf-k-octets-supported` and logs it at startup,
+**marked advisory** — nothing decides from it. `--max-pdf-bytes` defaults to 0,
+meaning do not pre-empt; set it only for a device you have measured to actually
+enforce a limit, where paying for a refusal on every large job is worse than
+avoiding it. To see what yours declares:
 
 ```sh
 ipptool -tv ipp://PRINTER/ipp/print get-printer-attributes.test | grep pdf-k-octets

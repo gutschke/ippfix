@@ -160,7 +160,7 @@ would have printed whole. Only three refusal statuses qualify, each because it
 says both that no job was created and that the document is the reason; a lost or
 dropped answer is never resent, because the printer may be holding what it just
 read. For scale: outlining costs about 670 KB of PDF per page on dense body
-copy, so a 155-page report reaches the 61 MB figure the device declares — and
+copy, so a 155-page report reaches the 76.8 MB figure the device declares — and
 prints anyway.
 
 What that tier costs is smaller than "rasterised" suggests. The raster is
@@ -331,8 +331,10 @@ log rather than dropped.
 `Queue.learn()` reads `document-format-supported`, `urf-supported`,
 `printer-resolution-supported`, `pdf-k-octets-supported`, `color-supported`
 and `pwg-raster-document-resolution-supported` once, and uses them to pick the
-raster device, colour space and resolution, and the maximum PDF size (80% of
-what the device declares, to stay clear of the limit rather than sit on it).
+raster device, colour space and resolution. It reads `pdf-k-octets-supported`
+too and uses it for **nothing but a log line, marked advisory**: the figure was
+measured not to be enforced, so deciding from it meant rasterising documents the
+printer would have taken whole.
 
 Failure is retried rather than remembered: a printer that is down when the
 daemon starts must not disable the raster tier until the next restart. Only
@@ -442,7 +444,8 @@ rather than whenever the machine got round to them. And it is a context
 manager that bounds its job history and joins its threads, because a test
 harness that leaves something running is the same bug as a daemon that does.
 
-The relay tests exist because the job-splitting work rewrites exactly that
+The relay tests were written because the job-splitting work would have rewritten
+exactly that
 code. Behaviour that looks wrong is pinned as it is, with a comment saying so:
 changing behaviour and pinning it in one commit makes both unreviewable.
 

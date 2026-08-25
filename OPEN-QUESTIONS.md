@@ -66,11 +66,10 @@ this proxy issued would break the cases that matter (cancelling across a proxy
 restart, or from a second device) while stopping nobody who can send one more
 packet, and would read as an access control that is not one.
 
-What is worth doing, and is part of the splitting work rather than a fix here,
-is narrower and well defined: once a job is several upstream jobs, refuse to
-relay a Cancel-Job aimed at a *chunk* id. Those ids are the proxy's business,
-not the client's, and cancelling the middle of somebody's document is a fault
-with no legitimate form.
+A narrower version of this was going to arrive with job splitting — refusing a
+Cancel-Job aimed at an internal chunk id, which has no legitimate form. That
+feature was abandoned, so the narrow fix has nothing to attach to and the broad
+one is still not worth making.
 
 The exposure meanwhile is roughly what a directly reachable printer has, on a
 network where the alternative is that anyone can also just print.
@@ -115,12 +114,12 @@ it was built for, and does not touch two others that were found while looking.
 
 ### The structural limit
 
-Faults 1 and 3 both end with the printer reporting success. Nothing in the
-proxy's handling of a job reacts to what the printer then does with it: the one
-fallback it has — rasterising — is chosen from the document's size before the
-job is sent, and never from the outcome. **A failure that reports success
-cannot change how a job is prepared**, and no improvement to the fallback
-changes that.
+Faults 1 and 3 both end with the printer reporting success. The proxy does react
+to a printer that *refuses* a job — it converts again as raster and sends once
+more — but a refusal is the case where the printer says something is wrong.
+**A failure that reports success cannot change how a job is prepared**, because
+there is nothing for the fallback to trigger on. The page-counter cross-check
+now makes such a failure visible after the fact; it still cannot prevent it.
 
 Fault 1 is nevertheless handled, because it is prevented rather than detected:
 outlining removes the font programs, so the condition cannot arise. Fault 3
