@@ -452,11 +452,26 @@ optimisation rather than as a safety margin. A file whose cost cannot be
 determined is always converted, never assumed cheap.
 .TP
 .B \-\-max\-pdf\-bytes " \fIMB\fR"
-Rasterise rather than send an outlined PDF larger than this. Default 60.
-Overridden by the printer's own
-.B pdf\-k\-octets\-supported
-where it reports one, so the shipped default only applies to a device that
-declares no limit.
+Have the converter rasterise an outlined PDF larger than this rather than send
+it. Default 0, meaning do not pre\-empt: send it, and let the printer answer for
+itself.
+.IP
+The proxy used to decide from the printer's own
+.BR pdf\-k\-octets\-supported ,
+which turned out to decide from a number the device does not enforce. An
+M283fdw declares a 76.8 MB limit and printed a 92.5 MB document without
+complaint, so deciding from the declared figure meant rasterising documents the
+printer would have taken whole \- discarding the vector precision that outlining
+exists to preserve.
+.IP
+What a printer will refuse is now discovered by offering it the document. A job
+refused for a reason that is about the document, rather than about the printer's
+state, is converted again as raster and sent once more; a refusal means no job
+was created, which is what makes that safe. A dropped or lost answer is never
+resent, because the printer may be holding what it just read.
+.IP
+Set a number only for a device measured to enforce one, where paying for a
+refusal on every large job is worse than pre\-empting it.
 .TP
 .B \-\-all\-formats
 Offer clients every document format the printer supports, including

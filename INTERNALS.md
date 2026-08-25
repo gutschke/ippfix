@@ -151,13 +151,17 @@ could carry a line that looks like one.
 |---|---|
 | relayed untouched | not a PDF, conversion failed, or the conversion was rejected below |
 | text outlined | the normal path for every PDF |
-| rasterised | only when the outlined PDF would exceed what the printer accepts |
+| rasterised | only after the printer refuses the outlined PDF, or when `--max-pdf-bytes` is set |
 
-The raster tier is chosen from the outlined document's size before the job is
-sent, never from a rejection: by the time a printer refuses a job there is
-nothing left to fall back with. Measured on dense body copy, outlining costs
-about 670 KB of PDF per page, so a 61 MB device cap is reached around 90 such
-pages — reachable by a long report, not only by a pathological document.
+The raster tier is chosen from the printer's own refusal, not from a threshold.
+An earlier version decided in advance from `pdf-k-octets-supported`, which turned
+out to be a figure this device does not enforce, so it rasterised documents that
+would have printed whole. Only three refusal statuses qualify, each because it
+says both that no job was created and that the document is the reason; a lost or
+dropped answer is never resent, because the printer may be holding what it just
+read. For scale: outlining costs about 670 KB of PDF per page on dense body
+copy, so a 155-page report reaches the 61 MB figure the device declares — and
+prints anyway.
 
 What that tier costs is smaller than "rasterised" suggests. The raster is
 contone at the device's own resolution — the printer's raster interface is

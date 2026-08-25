@@ -34,6 +34,16 @@ If geometry ever does need normalising, `-dFIXEDMEDIA` alone **clips** — a
 Legal page truncated at 792pt, which looks like a successful print.
 `-dPDFFitPage` is required with it.
 
+**`MAX_BODY` and the advisory cap now contradict each other.** The proxy refuses
+an incoming document over 64 MB outright, so the 92.5 MB PDF that the printer
+accepted directly could never have reached it through the proxy. That bound is
+hardening — it decides how much a stranger on the LAN can make this daemon
+buffer — and the document a client sends is normally far smaller than its
+outlined form, so the two numbers describe different things. But a photo-heavy
+document really can exceed it, and such a job prints when sent to the printer
+directly and fails through the proxy, which is the wrong way round. Raising it
+costs memory in a 512 MB cgroup. Not resolved.
+
 **Whether this printer streams raster or spools it** is likewise unmeasured. The
 format permits streaming and Ghostscript emits it in streamable form — it writes
 zero into the page-count field and the printer accepts that, so the device

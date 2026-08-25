@@ -307,9 +307,21 @@ An unrecognised option is an error rather than something ignored.
   converted, never assumed cheap.
 
 * `--max-pdf-bytes` *MB*:
-  Rasterise rather than send an outlined PDF larger than this. Default 60.
-  Overridden by the printer's own `pdf-k-octets-supported` where it reports one,
-  so the shipped default only applies to a device that declares no limit.
+  Have the converter rasterise an outlined PDF larger than this rather than send
+  it. Default 0, meaning do not pre-empt: send it and let the printer answer for
+  itself.
+
+  The proxy used to decide from the printer's own `pdf-k-octets-supported`,
+  which turned out to be a number the device does not enforce — an M283fdw
+  declares 76.8 MB and printed 92.5 MB. Deciding from it meant rasterising
+  documents the printer would have taken whole.
+
+  What a printer refuses is now discovered by offering it the document. A job
+  refused for a reason about the *document* is converted again as raster and
+  sent once more; a refusal means no job was created, which is what makes that
+  safe. A dropped answer is never resent — the printer may be holding what it
+  just read.
+
 
 * `--all-formats`:
   Offer clients every document format the printer supports, including
