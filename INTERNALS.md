@@ -115,14 +115,21 @@ version is that four models were fitted and all four were falsified.
 
 **The converter is told what the printer accepts**, because it cannot ask: a
 one-line `%%ippfix device=… colorspace=… dpi=… maxpdf=…` header precedes the
-document. Two more fields exist for splitting an oversized job. `first=N last=N`
+document. `sides=` carries the job's own `sides` value, because on the raster
+path the URF stream's duplex field overrides the IPP attribute — measured on
+paper, see [DIAGNOSING.md](DIAGNOSING.md). It is passed through verbatim and
+never invented; if the client did not ask for a side, nothing is sent.
+
+Two more fields exist for extracting part of a document. `first=N last=N`
 asks for one range of pages, 1-based and **inclusive at both ends** — the same
 convention as Ghostscript's `-dFirstPage`/`-dLastPage`, so that no conversion
 happens anywhere along the path and there is exactly one place an off-by-one
 could live. `report=1` asks the converter to answer with a leading
-`%%ippfix-out pages=N` line giving the *input* document's page count, which is
-the only honest way to plan a split: counting pages here would mean parsing a
-PDF outside the sandbox that exists to contain precisely that.
+`%%ippfix-out pages=N` line giving the *input* document's page count: counting
+pages here would mean parsing a PDF outside the sandbox that exists to contain
+precisely that. Job splitting was abandoned once the size limit it worked around
+turned out not to be enforced, but the range mode stays — extracting pages 40-60
+of a document that fails is how a content-dependent fault gets reproduced.
 
 A bad range is fatal to the conversion rather than ignored. Every other field
 falls back to a default when it makes no sense, but falling back on a range
