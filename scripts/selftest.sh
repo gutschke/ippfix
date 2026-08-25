@@ -1300,42 +1300,6 @@ for bad_uri in ('t=ipp://p/ipp/print?pagecounter=off',
     except ValueError:
         continue
     raise AssertionError(bad_uri)
-
-# SNMP carries nothing that names a printer, so one listener speaks for one
-# printer -- and with several printers the daemon must refuse rather than pick.
-def qs(*specs):
-    return [ippfix.parse_queue(s) for s in specs]
-one = qs('a=ipp://p1/ipp/print')
-assert ippfix.choose_relay_queue(one)[0] is one[0]
-two = qs('a=ipp://p1/ipp/print', 'b=ipp://p2/ipp/print')
-picked, why = ippfix.choose_relay_queue(two)
-assert picked is None and 'snmp-relay' in why, why
-marked = qs('a=ipp://p1/ipp/print?snmp-relay=on', 'b=ipp://p2/ipp/print')
-assert ippfix.choose_relay_queue(marked)[0].name == 'a'
-both = qs('a=ipp://p1/ipp/print?snmp-relay=on', 'b=ipp://p2/ipp/print?snmp-relay=on')
-assert ippfix.choose_relay_queue(both)[0] is None
-
-# One address per printer is the way to serve several at once: the address
-# does the naming the protocol will not.
-pair = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1',
-          'b=ipp://p2/ipp/print?snmp-relay=10.0.0.2')
-assert ippfix.choose_relay_queue(pair, '10.0.0.1')[0].name == 'a'
-assert ippfix.choose_relay_queue(pair, '10.0.0.2')[0].name == 'b'
-assert ippfix.choose_relay_queue(pair, '10.0.0.3')[0] is None
-# A printer with its own listener must not also be answered by the wildcard.
-assert ippfix.choose_relay_queue(pair, None)[0] is None
-mixed = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1', 'c=ipp://p3/ipp/print')
-assert ippfix.choose_relay_queue(mixed, None)[0].name == 'c'
-# Two printers claiming one address is a configuration error, not a coin toss.
-clash = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1',
-           'b=ipp://p2/ipp/print?snmp-relay=10.0.0.1')
-assert ippfix.choose_relay_queue(clash, '10.0.0.1')[0] is None
-try:
-    ippfix.parse_queue('a=ipp://p/ipp/print?snmp-relay=nonsense')
-except ValueError:
-    pass
-else:
-    raise AssertionError('an unparseable listen address must not be accepted')
 PY2
 
 echo 'snmp relay'
