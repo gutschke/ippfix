@@ -29,16 +29,58 @@ echo 'syntax'
 check 'ippfix.py compiles'        'python3 -m py_compile ippfix.py'
 check 'ippcodec.py compiles'      'python3 -m py_compile ippcodec.py'
 check 'fakeprinter.py compiles'   'python3 -m py_compile scripts/fakeprinter.py'
+check 'scrub-check.py compiles'   'python3 -m py_compile scripts/scrub-check.py'
 rm -rf __pycache__ scripts/__pycache__
-for s in defont install.sh uninstall.sh ippfix scripts/selftest.sh; do
+for s in defont install.sh uninstall.sh ippfix scripts/selftest.sh \
+         scripts/githooks/pre-commit; do
   check "$s parses" "bash -n '$s'"
 done
 
 echo 'executables carry the executable bit'
 for f in defont ippfix install.sh uninstall.sh scripts/selftest.sh \
-         scripts/fakeprinter.py; do
+         scripts/fakeprinter.py scripts/scrub-check.py \
+         scripts/githooks/pre-commit; do
   check "$f is executable" "[ -x '$f' ]"
 done
+
+# A scrub that is only remembered is a scrub that eventually is not. This one
+# reads the whole tree and fails on anything shaped like an address, a MAC or a
+# mailbox that has not been accounted for -- including the "before" half of a
+# substitution, which is how a careful sanitisation once undid itself.
+echo 'the tree carries no network detail it should not'
+if ./scripts/scrub-check.py > "$work/scrub" 2>&1; then
+  ok 'every address, MAC and mailbox in the tree is accounted for'
+else
+  sed 's/^/        /' "$work/scrub"
+  bad 'the tree contains network detail that does not belong there'
+fi
+# The guard has to be able to fail, or it is decoration. Feed it the shapes it
+# exists to catch and insist that it catches every one of them.
+#
+# Each probe is assembled at run time from pieces, so that no line of this file
+# ever holds a whole address, MAC or mailbox. Written out in full they would be
+# caught by the very check above -- which is the guard working, but it would
+# also mean this suite could only test the guard by defeating it.
+probe="$work/probe.txt"
+net='198.51'      # a documentation prefix, but not one on the allowed list:
+                  # unlisted is enough to fail, whether or not it is real
+hex='1A2B3C'      # what HP puts after NPI, three octets of the MAC
+oui='00:00:5e'    # the block RFC 7042 set aside for documentation
+dom='a-real-domain.org'
+probes=0
+caught=0
+for text in "an address at $net.100.4" \
+            "printer-name NPI$hex" \
+            "ether $oui:00:53:01" \
+            "mail someone@$dom"; do
+  printf '%s\n' "$text" > "$probe"
+  probes=$((probes+1))
+  ./scripts/scrub-check.py "$probe" >/dev/null 2>&1 || caught=$((caught+1))
+done
+check 'the guard rejects each shape it exists to catch' '[ "$caught" = "$probes" ]'
+# ...and does not cry wolf over the documentation ranges the rule points at.
+printf '192.0.2.10 198.51.100.9 2001:db8::1 ::1 127.0.0.1 a@b.example\n' > "$probe"
+check 'the guard accepts the documentation ranges' './scripts/scrub-check.py "$probe"'
 
 echo 'IPP codec'
 python3 - "$work" <<'PY' && ok 'round-trips messages byte for byte' || bad 'round-trip'

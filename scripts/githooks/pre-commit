@@ -1,0 +1,31 @@
+#!/bin/bash -e
+#
+# Refuse a commit that would put real network detail into the tree.
+#
+# Install with:
+#
+#     git config core.hooksPath scripts/githooks
+#
+# A hook is not a substitute for the same check in scripts/selftest.sh, which
+# runs for everybody: hooks are not cloned, and this one is opt-in. It is here
+# to catch the mistake where it is cheapest to fix, rather than at release.
+#
+# What is about to be committed is judged, not what is lying on disk, so a file
+# that is only partly staged is read exactly as the commit will record it.
+root="$(git rev-parse --show-toplevel)"
+mapfile -d '' -t staged < <(git diff --cached --name-only --diff-filter=ACM -z)
+[ "${#staged[@]}" -gt 0 ] || exit 0
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT INT TERM
+for path in "${staged[@]}"; do
+  mkdir -p "$work/$(dirname "$path")"
+  git show ":$path" > "$work/$path"
+done
+
+cd "$work"
+if ! "$root/scripts/scrub-check.py" "${staged[@]}"; then
+  echo 'pre-commit: nothing was committed. Fix the above, or, if it does'  >&2
+  echo '            belong here, say so in ALLOWED_* in scrub-check.py.'  >&2
+  exit 1
+fi

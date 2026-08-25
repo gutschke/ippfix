@@ -451,7 +451,7 @@ requires it.
 ./scripts/selftest.sh
 ```
 
-232 checks: 76 of its own plus the 156 in `scripts/selftest-pagerange.sh`, which
+239 checks: 83 of its own plus the 156 in `scripts/selftest-pagerange.sh`, which
 it runs and whose results it adds to its own totals rather than reducing them to
 one pass or fail. The child suite needs Ghostscript; a machine without one is
 reported as a skip and counted as such, never as a pass, and never as 156
@@ -468,7 +468,10 @@ and `build_parser()` have to be changed together.
 `scripts/fakeprinter.py` is the mock: an IPP listener on loopback that answers
 Get-Printer-Attributes from a **captured** reply
 (`scripts/fixtures/get-printer-attributes.b64`, real bytes off a real M283fdw
-with the addresses sanitised), tracks jobs through pending → processing →
+with the identifiers sanitised — each replaced by a placeholder of the same
+length, so the message stays byte-exact, and the originals deliberately not
+written down anywhere, least of all in the note explaining the substitution),
+tracks jobs through pending → processing →
 completed, refuses a second concurrent job the way a printer reporting
 `multiple-document-jobs-supported = false` does, and can be told to fail: abort
 the job, hold it with `media-empty`, refuse connections, or take the whole
@@ -501,6 +504,17 @@ fault in the rasteriser — and compares them pixel by pixel.
 - **A conversion that might have changed the page is not used.** The failure
   mode this tool must never introduce is a page that prints wrongly, because
   nobody checks a page that printed.
-- **Do not put real network detail in the tree.** Examples use the RFC 5737
-  ranges and `.example` names. `scripts/selftest.sh` checks for leaked home
-  directory paths; the rest is manual.
+- **Do not put real network detail in the tree.** Examples use the RFC 5737 /
+  RFC 3849 ranges, the RFC 7042 documentation MAC block, and the RFC 2606
+  `.example` names. This is enforced, not remembered: `scripts/scrub-check.py`
+  reads every tracked file and fails on any address, MAC, MAC-derived printer
+  name or mailbox that is not on its allow list, `scripts/selftest.sh` runs it,
+  and `scripts/githooks/pre-commit` runs it over what is staged if you install
+  it with `git config core.hooksPath scripts/githooks`. Adding to the allow
+  list is deliberately a visible edit.
+- **A sanitisation must not describe itself in terms of what it removed.** The
+  fixture header once listed each substitution as *original → replacement*,
+  which handed a reader back exactly the values the substitution had removed;
+  the scrub was undone by the note explaining it. Name the field, show the
+  replacement, and stop. Test the result by *shape* — an assertion that the
+  removed value is absent has to quote it, and quoting it puts it back.
