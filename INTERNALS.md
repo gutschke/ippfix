@@ -443,9 +443,11 @@ requires it.
 ./scripts/selftest.sh
 ```
 
-76 checks of its own plus the 156 in `scripts/selftest-pagerange.sh`, which it
-runs and which needs Ghostscript; a machine without one is reported as a skip
-and counted as such, never as a pass. All of it is offline: no printer, nothing
+232 checks: 76 of its own plus the 156 in `scripts/selftest-pagerange.sh`, which
+it runs and whose results it adds to its own totals rather than reducing them to
+one pass or fail. The child suite needs Ghostscript; a machine without one is
+reported as a skip and counted as such, never as a pass, and never as 156
+passes that did not happen. All of it is offline: no printer, nothing
 on the network but loopback, nothing installed. It compiles the sources,
 round-trips IPP messages, exercises queue parsing and URL construction, checks IPv6 address selection against a
 synthetic `/proc/net/if_inet6`, runs `defont` over a PDF that really does embed

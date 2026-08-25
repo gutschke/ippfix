@@ -869,10 +869,16 @@ with FakePrinter() as printer:
 
     sent = printer.requests[-1][1]
     # The upstream port is whatever the kernel handed out, so it is the one
-    # thing that cannot be a constant. Linux allocates five-digit ephemeral
-    # ports, so blanking it keeps every length prefix below correct.
-    assert 10000 <= printer.port <= 65535, printer.port
-    sent = sent.replace(str(printer.port).encode(), b'00000')
+    # thing here that cannot be a constant. It used to be blanked by replacing
+    # its digits with 00000, which silently required a five-digit port and so
+    # depended on this host's ip_local_port_range -- a test that fails for a
+    # reason unconnected to the code it covers. Build the expected attribute
+    # from the mock's own host and port instead, length prefix and all, and the
+    # digit count stops mattering. printer.host/.port are facts about the mock,
+    # not values produced by the code under test, so this stays a real check.
+    upstream = f'ipp://{printer.host}:{printer.port}/ipp/print'.encode()
+    printer_uri = (b'E\x00\x0bprinter-uri'
+                   + len(upstream).to_bytes(2, 'big') + upstream)
 
     expected = (
         b'\x02\x00'                          # version 2.0, as the client sent
@@ -882,7 +888,7 @@ with FakePrinter() as printer:
         b'G\x00\x12attributes-charset\x00\x05utf-8'
         b'H\x00\x1battributes-natural-language\x00\x05en-us'
         # Re-addressed to the printer, in the position printer-uri already had.
-        b'E\x00\x0bprinter-uri\x00\x1fipp://127.0.0.1:00000/ipp/print'
+        + printer_uri +
         b'B\x00\x14requesting-user-name\x00\x06tester'
         b'B\x00\x08job-name\x00\ntranscript'
         b'I\x00\x0fdocument-format\x00\x0fapplication/pdf'
@@ -1639,7 +1645,9 @@ from fakeprinter import FakePrinter, proxy_for, relay, job_request
 
 with FakePrinter() as printer:
     cfg, queue = proxy_for(printer)
-    cfg.timeout = 0.05          # how long a second job waits for the first
+    # Long enough that the lower bound below is not measuring clock
+    # granularity, short enough that the suite does not notice.
+    cfg.timeout = 0.25          # how long a second job waits for the first
 
     msg = job_request(0x0002, 1, 'ipp://192.0.2.10/ipp/office',
                       document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
@@ -1654,8 +1662,15 @@ with FakePrinter() as printer:
     # Refused after cfg.timeout, not queued behind the job in flight. The real
     # clock is the right one here: the point is that a client is not left
     # holding a socket open for as long as a large job takes to transfer.
+    #
+    # Both bounds matter, and only the upper one used to be checked -- against a
+    # flat 2 seconds, which a timeout of 0.25 could miss by a factor of eight
+    # and which an instant failure would also satisfy. The lower bound is the
+    # one that says the timeout was honoured rather than skipped.
     waited = time.monotonic() - started
-    assert waited < 2, f'waited {waited:.1f}s for a busy queue'
+    assert waited >= cfg.timeout, (
+        f'answered in {waited:.3f}s without waiting the {cfg.timeout}s timeout')
+    assert waited < cfg.timeout + 2, f'waited {waited:.1f}s for a busy queue'
     # An IPP question gets an IPP answer: HTTP 200 carrying 0x0507
     # server-error-busy, which a print system reads as "try again". The HTTP
     # 503 with a line of English that used to come back here read as the server
@@ -2169,17 +2184,33 @@ PY2
 # working on the converter. There is still one entry point.
 if [ -x ./scripts/selftest-pagerange.sh ]; then
   echo
-  child=0
-  ./scripts/selftest-pagerange.sh || child=$?
+  childlog="$(mktemp -t ippfix-childsuite-XXXXXX)"
+  set +e
+  ./scripts/selftest-pagerange.sh 2>&1 | tee "$childlog"
+  child=${PIPESTATUS[0]}
+  set -e
   echo
   # 77 is that suite saying it could not run at all -- see the comment at the
-  # top of it. It is counted as a skip here rather than folded into the pass
-  # count, because a run without Ghostscript proved none of the 156 things it
-  # exists to prove.
+  # top of it. It is counted as a skip rather than folded into the pass count,
+  # because a run without Ghostscript proved none of the things it exists to
+  # prove.
+  #
+  # Otherwise its counts are added to ours. They used to collapse into a single
+  # fail++, so the headline said "76 passed" while a hundred and fifty-six
+  # checks had quietly contributed nothing to it -- and a dozen failures over
+  # there arrived here as one. A total that does not count everything it ran is
+  # worse than no total, because it is the number people read.
+  childcounts="$(sed -n 's/^\([0-9][0-9]*\) passed, \([0-9][0-9]*\) failed.*/\1 \2/p' \
+                 "$childlog" | tail -1)"
+  rm -f "$childlog"
   case "$child" in
-    0)  ;;
-    77) skip 'page ranges (the suite could not run)' ;;
-    *)  fail=$((fail+1)) ;;
+    77) skip 'page ranges (Ghostscript is missing, so none of it ran)' ;;
+    *)  if [ -n "$childcounts" ]; then
+          pass=$((pass + ${childcounts% *}))
+          fail=$((fail + ${childcounts#* }))
+        else
+          bad 'page ranges (the suite ended without printing a summary)'
+        fi ;;
   esac
 else
   bad 'scripts/selftest-pagerange.sh is missing or not executable'
