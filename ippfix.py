@@ -302,6 +302,12 @@ class Queue:
         # What the printer says it will take, for the log only. Measured not to
         # be enforced: see learn().
         self.declared_pdf_bytes = None
+        # What the printer says about itself, for the DNS-SD record. None is
+        # "the printer has not said", which is not the same as False and is
+        # advertised as neither: see discovery_txt().
+        self.formats = []              # document-format-supported, verbatim
+        self.colour = None
+        self.duplex = None
         self.learned = False
         self.learn_failed_at = None    # monotonic time of the last failure
         self.pages = None              # PageCounter, once Config has built it
@@ -344,7 +350,8 @@ class Queue:
                 'requested-attributes', ipp.TAG_KEYWORD,
                 ['document-format-supported', 'urf-supported',
                  'printer-resolution-supported', 'pdf-k-octets-supported',
-                 'color-supported', 'pwg-raster-document-resolution-supported'])
+                 'color-supported', 'sides-supported',
+                 'pwg-raster-document-resolution-supported'])
             status, raw = upstream_ipp(self, ipp.serialize(request), timeout)
             if status != 200:
                 raise OSError(f'HTTP {status}')
@@ -362,6 +369,7 @@ class Queue:
 
         formats = [f.decode('utf-8', 'replace')
                    for f in (group.get('document-format-supported') or [])]
+        self.formats = formats
         for candidate in RASTER_PREFERENCE:
             if candidate in formats:
                 self.raster_format = candidate
@@ -372,6 +380,16 @@ class Queue:
                for f in (group.get('urf-supported') or [])]
         colour = group.get('color-supported')
         has_colour = bool(colour and colour[0] not in (b'\x00', b''))
+        # Kept apart from has_colour on purpose. Deciding a colour space needs
+        # an answer either way, and grey is the safe one to assume; saying so
+        # in a DNS-SD record does not, and a printer that never mentioned
+        # colour has not said it is monochrome.
+        if colour:
+            self.colour = has_colour
+        sides = [s.decode('utf-8', 'replace')
+                 for s in (group.get('sides-supported') or [])]
+        if sides:
+            self.duplex = any(s.startswith('two-sided') for s in sides)
         order = (COLOUR_ORDER + GREY_ORDER) if has_colour else GREY_ORDER
         for name in order:
             if name in urf:
@@ -2147,8 +2165,7 @@ def unreachable(wfile, queue, msg, opname, exc):
     ipp_error(wfile, msg, 0x0502, b'the printer is not responding')
 
 
-def converter_header(queue, cfg, first=None, last=None, report=False,
-                     sides=None, force_raster=False):
+def converter_header(queue, cfg, sides=None, force_raster=False):
     """Tell the converter what this particular printer will accept.
 
     The converter runs with no network at all, deliberately, so it cannot ask
@@ -2156,11 +2173,6 @@ def converter_header(queue, cfg, first=None, last=None, report=False,
     document: which raster format and colour space to fall back to, at what
     resolution, and how large a PDF to hand over before rasterising instead. A
     converter that receives no header keeps its built-in defaults.
-
-    `first` and `last` ask for one range of pages, 1-based and inclusive at both
-    ends. `report` asks the converter to say how many pages the input has, which
-    is the only honest way to plan a split -- counting them here would mean
-    parsing a PDF outside the sandbox that exists to contain exactly that.
 
     `sides` is the client's own word, relayed so that the converter can put the
     right duplex byte in a raster stream. Measured on paper: for a URF document
@@ -2171,26 +2183,42 @@ def converter_header(queue, cfg, first=None, last=None, report=False,
     the job means no `sides` in the header.
 
     `force_raster` is how a document the printer has already refused is asked
-    for again. There is no separate field for it: `maxpdf=0` means every
-    outlined document is over the limit, which is exactly "rasterise this",
-    and it needs no change on the converter's side.
+    for again. It sends `raster=only`, which tells the converter to rasterise
+    the input and not to outline it first.
+
+    That is a field of its own rather than `maxpdf=0`, which looks like the
+    same request and is not. The converter compares against `maxpdf` only after
+    outlining, and only after three fail-safes that each hand back the ORIGINAL
+    document and report success -- so a document that lost a shading on the way
+    through would come back as the very PDF the printer has just refused, and
+    the retry would have nothing to send. Those fail-safes are right for
+    outlining, which can lose content; the raster is taken from the original
+    input, so there is nothing there for them to protect. A converter too old
+    to know the field ignores it and outlines as it always did, which this end
+    detects and declines to resend -- see rasterise_after_refusal.
     """
     queue.learn()          # a no-op once it has succeeded; retries if it has not
     if not queue.raster_format:
+        # Nothing to ask for: this printer takes no raster format we can make.
+        # force_raster cannot be honoured either, and saying both `raster=none`
+        # and `raster=only` would be a contradiction rather than a request.
+        # rasterise_after_refusal refuses to get here for exactly that reason.
         fields = ['raster=none']
     else:
         fields = [f'device={queue.raster_device}',
                   f'colorspace={queue.raster_colorspace}',
                   f'dpi={queue.raster_dpi}']
+        if force_raster:
+            fields.append('raster=only')
     # What the printer declares it accepts is not used here; it was measured not
     # to be what the printer enforces (see Queue.learn), so a job is offered
     # whole and rasterised only if the printer actually refuses it. The
     # converter still needs a number for its own last resort, and the only
     # honest one left is the largest converted document this proxy would accept
     # back at all: below that, rasterising could only ever throw away fidelity
-    # the printer might have taken.
-    limit = 0 if force_raster else (cfg.max_pdf_bytes or MAX_CONVERTED)
-    fields.append(f'maxpdf={limit}')
+    # the printer might have taken. On a `raster=only` call it decides nothing,
+    # because nothing is outlined for it to measure.
+    fields.append(f'maxpdf={cfg.max_pdf_bytes or MAX_CONVERTED}')
     if sides is not None:
         if sides in SIDES_VALUES:
             fields.append(f'sides={sides}')
@@ -2200,39 +2228,7 @@ def converter_header(queue, cfg, first=None, last=None, report=False,
             log.info('%s: not relaying sides=%r to the converter; it is not '
                      'one of %s', queue.name, sides[:40],
                      ', '.join(SIDES_VALUES))
-    if first is not None:
-        fields.append(f'first={int(first)}')
-    if last is not None:
-        fields.append(f'last={int(last)}')
-    if report:
-        fields.append('report=1')
     return ('%%ippfix ' + ' '.join(fields) + '\n').encode()
-
-
-CONVERTER_REPORT = b'%%ippfix-out '
-
-
-def read_converter_report(out):
-    """Split the converter's report line off the document it precedes.
-
-    Returns (pages, document). `pages` is None when there was no report, which
-    is what a converter older than this asks-and-answers protocol does. A caller
-    that gets None must not assume it may split: it does not know how many pages
-    there are, and guessing is how a chunk ends up covering the wrong ones.
-    """
-    if not out.startswith(CONVERTER_REPORT):
-        return None, out
-    line, sep, rest = out.partition(b'\n')
-    if not sep:
-        return None, out
-    pages = None
-    for field in line.split()[1:]:
-        key, _, value = field.partition(b'=')
-        if key == b'pages' and value.isdigit():
-            pages = int(value)
-    # pages=0 is the converter saying "not a PDF I can count", which is not the
-    # same as not having answered.
-    return pages, rest
 
 
 def convert_over_socket(path, data, timeout):
@@ -3158,6 +3154,74 @@ class Server(socketserver.ThreadingTCPServer):
 # ---------------------------------------------------------------------------
 # discovery
 # ---------------------------------------------------------------------------
+# CUPS reads the DNS-SD printer-type as a bitfield, and two of its bits are
+# claims about what this device can do rather than about how it is reached:
+# 0x8 colour and 0x10 duplex. Both are set only from what the printer said.
+# The base keeps 0x4, black and white, which is the one capability no printer
+# lacks, alongside the bits that describe the queue itself -- remote, copies,
+# a small and a variable media size, and the commands bit.
+#
+# The value this replaced was the constant 0x809056, which claimed duplex for
+# every device while the words beside it claimed colour, and the two disagreed:
+# 0x809056 has 0x4 set and 0x8 clear, i.e. monochrome.
+PRINTER_TYPE_BASE = 0x809046
+PRINTER_TYPE_COLOUR = 0x8
+PRINTER_TYPE_DUPLEX = 0x10
+
+
+def discovery_txt(cfg, queue, scheme):
+    """The DNS-SD TXT record for one queue, from what the printer has said.
+
+    Everything about the device itself is derived from Queue.learn(), and a key
+    it could not answer for is left out entirely rather than filled in. This is
+    the one place a client reads a capability *before* any IPP exchange can
+    correct it: a client that finds no `Color` key asks the printer, while one
+    told `Color=T` about a monochrome device believes it and offers colour that
+    will never arrive. An absent key is a question; a wrong key is an answer.
+
+    The formats are filtered exactly as rewrite_response filters them, because
+    discovery and the printer's own attribute list are read by the same client
+    and disagreeing would be worse than either answer alone.
+    """
+    props = {
+        'txtvers': '1', 'qtotal': '1',
+        'rp': queue.local_path.lstrip('/'),
+        'ty': queue.name,
+        'note': 'ippfix',
+        'adminurl': cfg.base_http() + '/',
+        'priority': '10',
+        'UUID': cfg.our_uuid(queue).replace('urn:uuid:', ''),
+        'TLS': '1.2' if scheme == 'ipps' else '',
+    }
+    formats = queue.formats
+    if cfg.restrict_formats:
+        formats = [f for f in formats
+                   if f in SAFE_FORMATS or f.lower() in SAFE_FORMATS]
+    # One TXT entry, key included, may be 255 bytes. A printer listing a great
+    # many formats is trimmed from the end of its own preference order rather
+    # than allowed to break the whole record; what is dropped is said in the
+    # journal, because a format missing from discovery is a format clients will
+    # not offer.
+    kept = []
+    for fmt in formats:
+        if len('pdl=' + ','.join(kept + [fmt])) > 255:
+            log.info('%s: not advertising %s over DNS-SD; the TXT entry is '
+                     'full', queue.name, ', '.join(formats[len(kept):]))
+            break
+        kept.append(fmt)
+    if kept:
+        props['pdl'] = ','.join(kept)
+    ptype = PRINTER_TYPE_BASE
+    if queue.colour is not None:
+        props['Color'] = 'T' if queue.colour else 'F'
+        ptype |= PRINTER_TYPE_COLOUR if queue.colour else 0
+    if queue.duplex is not None:
+        props['Duplex'] = 'T' if queue.duplex else 'F'
+        ptype |= PRINTER_TYPE_DUPLEX if queue.duplex else 0
+    props['printer-type'] = hex(ptype)
+    return {k: v for k, v in props.items() if v != ''}
+
+
 def advertise(cfg):
     """Publish each queue over DNS-SD, on IPv4 and IPv6.
 
@@ -3175,20 +3239,7 @@ def advertise(cfg):
     for queue in cfg.queues.values():
         for service, scheme in (('_ipp._tcp.local.', 'ipp'),
                                 ('_ipps._tcp.local.', 'ipps')):
-            props = {
-                'txtvers': '1', 'qtotal': '1',
-                'rp': queue.local_path.lstrip('/'),
-                'ty': queue.name,
-                'note': 'ippfix',
-                'pdl': 'application/pdf,image/urf,image/jpeg',
-                'adminurl': cfg.base_http() + '/',
-                'priority': '10',
-                'UUID': cfg.our_uuid(queue).replace('urn:uuid:', ''),
-                'TLS': '1.2' if scheme == 'ipps' else '',
-                'Color': 'T', 'Duplex': 'T',
-                'printer-type': '0x809056',
-            }
-            props = {k: v for k, v in props.items() if v != ''}
+            props = discovery_txt(cfg, queue, scheme)
             info = ServiceInfo(
                 service,
                 f'{queue.name}.{service}',
@@ -3200,7 +3251,11 @@ def advertise(cfg):
             )
             zc.register_service(info)
             registered.append(info)
-            log.info('advertising %s as %s', queue.name, service)
+            log.info('advertising %s as %s (%s)', queue.name, service,
+                     ', '.join(f'{k}={v}' for k, v in sorted(props.items())
+                               if k in ('pdl', 'Color', 'Duplex'))
+                     or 'no capabilities: the printer has not answered yet, '
+                        'so none are claimed')
 
     def withdraw():
         for info in registered:

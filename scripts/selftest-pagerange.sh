@@ -24,9 +24,20 @@ ok()   { printf '  ok    %s\n' "$1"; pass=$((pass+1)); }
 bad()  { printf '  FAIL  %s\n' "$1"; fail=$((fail+1)); }
 check() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 
+# Every check here drives the real Ghostscript: what is being pinned is what a
+# conversion does to a document, and there is nothing to pin without one. So a
+# machine without it is skipped rather than failed -- this suite is meant to
+# run anywhere, and failing would mean the tree could not be tested at all on a
+# host that simply has not got the converter installed.
+#
+# It exits 77 rather than 0 for that, because exiting 0 told the caller every
+# check in this file had passed when none of them had run, and that is the one
+# thing a test suite must never say. The parent counts 77 as a skip, prints it,
+# and keeps it out of the pass count.
 if ! command -v gs >/dev/null 2>&1; then
-  echo '  skip  page ranges (ghostscript not installed)'
-  exit 0
+  echo '  skip  page ranges: ghostscript is not installed, so none of the'
+  echo '        checks in this file ran and nothing in it has been proved'
+  exit 77
 fi
 
 work="$(mktemp -d)"
@@ -493,13 +504,17 @@ for value in bogus two-sided One-Sided one-sided-long-edge '' '-dDuplex=true' \
         "grep -q 'refusing unknown sides' '$work/err'"
   check "sides=${value:-<empty>} leaves the stream exactly as it was" \
         "cmp -s '$work/out' '$work/ref.urf'"
+  # The recorded command line has to be there before its contents mean
+  # anything: a negative grep over a log the stub never wrote to passes
+  # because nothing ran, which is the one outcome this must not report as ok.
   check "sides=${value:-<empty>} reaches no Ghostscript command line" \
-        "! grep -q -- '-dDuplex' '$GSARGV' && ! grep -q -- '-dTumble' '$GSARGV'"
+        "gsline appleraster | grep -q -- '-sDEVICE=appleraster' && \
+         ! grep -q -- '-dDuplex' '$GSARGV' && ! grep -q -- '-dTumble' '$GSARGV'"
 done
 : > "$GSARGV"
 stubrun gs-argv "maxpdf=1000 dpi=75 sides=-sDEVICE=uniprint" "$work/same.pdf"
 check 'a device name smuggled through sides does not become the device' \
-      "! grep -q -- 'uniprint' '$GSARGV'"
+      "[ -s '$GSARGV' ] && ! grep -q -- 'uniprint' '$GSARGV'"
 check 'and the raster device is still the one that was asked for' \
       "gsline appleraster | grep -q -- '-sDEVICE=appleraster'"
 
@@ -515,8 +530,11 @@ check 'the PDF path still returns a PDF' \
       "head -c 5 '$work/out' | grep -qa '%PDF-'"
 check 'the PDF path still returns every page' \
       "[ \"\$(typepages '$work/out')\" = 9 ]"
+# Again, the pdfwrite command line must exist for its contents to mean
+# anything: `! gsline pdfwrite | grep -q` is true of a run that never happened.
 check 'the duplex flags stay off the pdfwrite command line' \
-      "! gsline pdfwrite | grep -q -- '-dDuplex' && \
+      "[ -n \"\$(gsline pdfwrite)\" ] && \
+       ! gsline pdfwrite | grep -q -- '-dDuplex' && \
        ! gsline pdfwrite | grep -q -- '-dTumble'"
 check 'sides is not reported as an unknown header field' \
       "! grep -q 'unknown header field' '$work/err'"
@@ -545,6 +563,95 @@ check 'and the document still comes back as PDF' \
 run "first=2 last=2 maxpdf=1000 dpi=75 sides=two-sided-long-edge" "$work/same.pdf"
 check 'a single page range rasterises with the sides value applied' \
       "[ \"\$(urfduplex '$work/out')\" = '3' ]"
+
+echo 'raster=only rasterises the input instead of outlining it first'
+# Why this is a field of its own rather than maxpdf=0. A size of zero is only
+# compared against the OUTLINED copy, which means it is reached only after the
+# pdfwrite pass and the fail-safes that follow it -- and each of those answers
+# with the original document. So "everything is over the limit" could answer a
+# request for raster with the very PDF the printer had just refused, which is
+# what the stub below reproduces.
+cat > "$work/gs-lossy" <<'STUB'
+#!/bin/bash
+# Converts normally, then removes a whole class of drawing construct from the
+# pdfwrite output -- what Ghostscript before 10.05 does to the function-based
+# shadings browsers emit for conic and repeating gradients. The raster device
+# is left alone, because that is the difference being tested.
+pdfwrite=
+for a in "$@"; do
+  case "$a" in
+    -dPDFINFO)         exec gs "$@" ;;
+    -sDEVICE=pdfwrite) pdfwrite=1 ;;
+    -sOutputFile=*)    out="${a#-sOutputFile=}" ;;
+  esac
+done
+gs "$@" || exit $?
+[ -n "$pdfwrite" ] || exit 0
+python3 -c '
+import sys
+path = sys.argv[1]
+data = open(path, "rb").read()
+open(path, "wb").write(data.replace(b"/ShadingType", b"/ShodingType"))
+' "$out"
+STUB
+chmod +x "$work/gs-lossy"
+
+# First, that the stub really does trip the fail-safe: without it there is
+# nothing being worked around and the two checks below would mean nothing.
+stubrun gs-lossy "dpi=75" "$work/shade.pdf"
+check 'a conversion that loses a construct passes the original through' \
+      "cmp -s '$work/out' '$work/shade.pdf'"
+# The old way of asking for raster, on that document: a PDF comes back. The
+# printer refused a PDF, so this is nothing to send it.
+stubrun gs-lossy "maxpdf=0 dpi=75" "$work/shade.pdf"
+check 'maxpdf=0 answers with the original PDF when a fail-safe fires' \
+      "cmp -s '$work/out' '$work/shade.pdf'"
+# The field that says what was meant. The raster is made from the input, so
+# the checks that guard outlining have nothing to check and do not run.
+stubrun gs-lossy "raster=only dpi=75" "$work/shade.pdf"
+check 'raster=only rasterises the same document instead' \
+      "head -c 7 '$work/out' | grep -qa UNIRAST"
+check 'raster=only writes no fail-safe message' \
+      "! grep -q 'passing input through' '$work/err'"
+
+# The stream itself: identical to what the size-triggered path produces from
+# the same document, because it is the same command line built once.
+run "raster=only dpi=75" "$work/same.pdf"
+check 'raster=only comes back as URF' "head -c 7 '$work/out' | grep -qa UNIRAST"
+check 'raster=only produces the same stream the size path does' \
+      "cmp -s '$work/out' '$work/ref.urf'"
+check 'raster=only exits 0' "[ \"\$rc\" = 0 ]"
+# No outlining pass at all. On the retry -- which is where this field is used,
+# after a printer has already refused the document -- that pass would be spent
+# on a copy nobody is ever going to look at.
+: > "$GSARGV"
+stubrun gs-argv "raster=only dpi=75" "$work/same.pdf"
+check 'raster=only builds a raster command line' \
+      "gsline appleraster | grep -q -- '-sDEVICE=appleraster'"
+check 'raster=only never calls pdfwrite' \
+      "[ -s '$GSARGV' ] && ! grep -q -- '-sDEVICE=pdfwrite' '$GSARGV'"
+# The other header fields still apply on this path: it is the same raster
+# command line, not a second one that has to be kept in step by hand.
+run "raster=only dpi=75 sides=two-sided-long-edge" "$work/same.pdf"
+check 'raster=only still says which side of the sheet each page lands on' \
+      "[ \"\$(urfduplex '$work/out')\" = '3 3' ]"
+run "raster=only dpi=75 first=2 last=2" "$work/same.pdf"
+check 'raster=only still honours a page range' \
+      "[ \"\$(urfduplex '$work/out')\" = '1' ]"
+# A printer that takes no raster format cannot be answered with one. Refusing
+# the job would be the wrong answer -- outlining is a perfectly good one -- so
+# the request degrades to what a header that never mentioned it would give.
+run "raster=only raster=none dpi=75" "$work/p9.pdf"
+check 'raster=only with no raster format outlines instead' \
+      "head -c 5 '$work/out' | grep -qa '%PDF-'"
+check 'and says why on stderr' \
+      "grep -q 'accepts no raster format' '$work/err'"
+check 'and it is still the whole document' "[ \"\$(typepages '$work/out')\" = 9 ]"
+# Not a PDF, so there is nothing to rasterise and nothing to outline either.
+run "raster=only dpi=75" "$work/raster.bin"
+check 'raster=only passes a non-PDF through unchanged' \
+      "cmp -s '$work/out' '$work/raster.bin'"
+
 unset GSARGV
 
 echo 'nothing changes for a caller that never mentions a range'

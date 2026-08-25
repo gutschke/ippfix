@@ -120,16 +120,28 @@ path the URF stream's duplex field overrides the IPP attribute — measured on
 paper, see [DIAGNOSING.md](DIAGNOSING.md). It is passed through verbatim and
 never invented; if the client did not ask for a side, nothing is sent.
 
-Two more fields exist for extracting part of a document. `first=N last=N`
-asks for one range of pages, 1-based and **inclusive at both ends** — the same
-convention as Ghostscript's `-dFirstPage`/`-dLastPage`, so that no conversion
-happens anywhere along the path and there is exactly one place an off-by-one
-could live. `report=1` asks the converter to answer with a leading
-`%%ippfix-out pages=N` line giving the *input* document's page count: counting
-pages here would mean parsing a PDF outside the sandbox that exists to contain
-precisely that. Job splitting was abandoned once the size limit it worked around
-turned out not to be enforced, but the range mode stays — extracting pages 40-60
-of a document that fails is how a content-dependent fault gets reproduced.
+`raster=only` says "rasterise the input, do not outline it first". It is what
+a document the printer has already refused is asked for again, and it is a
+field of its own rather than `maxpdf=0` because the two are not the same
+request: `maxpdf` is compared against the *outlined* copy, after three
+fail-safes that each answer with the original document, so a document that
+loses a shading in Ghostscript would come back as the very PDF the printer just
+refused. Those fail-safes guard outlining, which can lose content; the raster
+is made from the original input, so on that path there is nothing for them to
+check and the outlining pass is skipped altogether.
+
+Two more fields exist for extracting part of a document, **in `defont` only**.
+`first=N last=N` asks for one range of pages, 1-based and **inclusive at both
+ends** — the same convention as Ghostscript's `-dFirstPage`/`-dLastPage`, so
+that no conversion happens anywhere along the path and there is exactly one
+place an off-by-one could live. `report=1` asks the converter to answer with a
+leading `%%ippfix-out pages=N` line giving the *input* document's page count.
+Job splitting was abandoned once the size limit it worked around turned out not
+to be enforced, and the daemon emits neither field and reads no report line;
+the code that did was deleted rather than left waiting for a caller. The mode
+stays in the converter because extracting pages 40-60 of a document that fails
+is how a content-dependent fault gets reproduced, and that is done by running
+`defont` on the document by hand.
 
 A bad range is fatal to the conversion rather than ignored. Every other field
 falls back to a default when it makes no sense, but falling back on a range
@@ -159,9 +171,9 @@ out to be a figure this device does not enforce, so it rasterised documents that
 would have printed whole. Only three refusal statuses qualify, each because it
 says both that no job was created and that the document is the reason; a lost or
 dropped answer is never resent, because the printer may be holding what it just
-read. For scale: outlining costs about 670 KB of PDF per page on dense body
-copy, so a 155-page report reaches the 76.8 MB figure the device declares — and
-prints anyway.
+read. For scale: outlining costs about 650 KB of PDF per page on dense body
+copy, so it takes about 118 such pages to reach the 76.8 MB figure the device
+declares — and it prints anyway.
 
 What that tier costs is smaller than "rasterised" suggests. The raster is
 contone at the device's own resolution — the printer's raster interface is
@@ -360,6 +372,16 @@ an interface clients cannot route to — produces queues that stall rather than
 fail. `global_ipv6()` parses `/proc/net/if_inet6` for the flags, which is why
 `ProcSubset=pid` is *not* set on the service.
 
+The TXT record's capability keys — `pdl`, `Color`, `Duplex` and the device bits
+of `printer-type` — come from `Queue.learn()`, and `discovery_txt()` omits any
+key the printer has not answered for. Discovery is the one place a client reads
+a capability before an IPP exchange can correct it, so an absent key (which
+makes the client ask) beats a plausible one (which it believes). A printer that
+was unreachable at startup is therefore advertised without them, and the
+journal line for the queue says so. The format list is filtered exactly as
+`rewrite_response()` filters `document-format-supported`, and trimmed from the
+end if it would overrun the 255-byte TXT entry.
+
 ## Hardening rules that must not regress
 
 The self-test enforces the first four; the rest are the reasoning behind them.
@@ -421,9 +443,11 @@ requires it.
 ./scripts/selftest.sh
 ```
 
-64 checks, all offline: no printer, nothing on the network but loopback,
-nothing installed. It compiles the sources, round-trips IPP messages, exercises
-queue parsing and URL construction, checks IPv6 address selection against a
+76 checks of its own plus the 156 in `scripts/selftest-pagerange.sh`, which it
+runs and which needs Ghostscript; a machine without one is reported as a skip
+and counted as such, never as a pass. All of it is offline: no printer, nothing
+on the network but loopback, nothing installed. It compiles the sources,
+round-trips IPP messages, exercises queue parsing and URL construction, checks IPv6 address selection against a
 synthetic `/proc/net/if_inet6`, runs `defont` over a PDF that really does embed
 a font (including inside an object stream), asserts the hardening rules above,
 pins the relay path against a mock printer, verifies the units with

@@ -34,6 +34,22 @@ RASTER_COLORSPACE="${RASTER_COLORSPACE:-19}"
 # accepts no raster format we can produce, so there is no fallback for it.
 RASTER_DEVICE="${RASTER_DEVICE:-appleraster}"
 
+# Rasterise the input straight away instead of outlining it first. Empty means
+# the normal path: outline, and rasterise only if the result is over
+# MAX_PDF_BYTES.
+#
+# This exists because "rasterise this document" and "the size limit is zero"
+# are not the same request, though they look alike. A size of zero is only
+# reached after the pdfwrite pass and the three fail-safes below it, and each
+# of those returns the ORIGINAL document and exits 0 -- so a document that
+# loses a shading on the way through comes back as the very PDF the caller was
+# trying not to send. The fail-safes are right for outlining, which can lose
+# content; they have nothing to check here, because the raster is taken from
+# the original input and not from the outlined copy. Asking for raster
+# explicitly also saves a full outlining pass over a document whose outlined
+# form nobody is ever going to look at.
+RASTER_ONLY="${RASTER_ONLY:-}"
+
 # Which side of the sheet each page is to land on: one of the three values IPP
 # has, or empty for "say nothing", which is what a caller that has never heard
 # of this field asks for by saying nothing and is exactly the behaviour this
@@ -156,6 +172,13 @@ if [ "$(head -c 9 "$infile")" = '%%ippfix ' ]; then
       device=appleraster|device=pclm|device=pclm8|device=pwgraster|device=urf)
                     RASTER_DEVICE="$value" ;;
       raster=none)  RASTER_DEVICE='' ;;
+      # "Rasterise the input, do not outline it first." Spelled as its own
+      # value of the field that already says which raster format to use, so
+      # that the two statements about raster live in one place. Anything else
+      # after raster= falls through to the unknown-field message below and
+      # changes nothing, which is what a caller of a version that has never
+      # heard of this asks for.
+      raster=only)  RASTER_ONLY=1 ;;
       # The three values IPP defines, and nothing else. Spelled out one by one
       # rather than matched with a pattern for the same reason the device name
       # is: this value reaches a Ghostscript command line too, and a word
@@ -209,6 +232,17 @@ if [ "$(head -c 9 "$infile")" = '%%ippfix ' ]; then
       *)            echo "defont: ignoring unknown header field ${field}" >&2 ;;
     esac
   done
+fi
+
+# raster=only and raster=none in the same header contradict each other, as does
+# raster=only from a caller that never said which device to use on a build
+# where the default was cleared. There is no raster to make, so the request
+# degrades to the behaviour of a header that never mentioned it -- outlining --
+# rather than killing a job that has a perfectly good answer.
+if [ -n "$RASTER_ONLY" ] && [ -z "$RASTER_DEVICE" ]; then
+  echo "defont: raster=only asked for but this printer accepts no raster" \
+       "format; outlining instead" >&2
+  RASTER_ONLY=''
 fi
 
 # Every other field falls back to its default when it makes no sense, which is
@@ -432,6 +466,102 @@ range=()
 if [ -n "$FIRST_PAGE" ]; then range+=(-dFirstPage="$FIRST_PAGE"); fi
 if [ -n "$LAST_PAGE" ];  then range+=(-dLastPage="$LAST_PAGE");   fi
 
+# What the page headers of the raster stream are to say about duplex.
+#
+# THE RASTER PATH ONLY. These flags are built here, beside the raster command
+# line and nowhere near the pdfwrite one below, and they must never be added
+# to it. On the PDF path the printer interprets the document itself and
+# honours the IPP sides attribute in the normal way, so there is nothing to
+# correct and nothing to say; a -dDuplex there would only stamp a page-device
+# setting into a PDF that no printer reads back, while making it look as
+# though the two paths were doing the same thing. The bug is specific to
+# raster because only the raster stream carries a duplex field of its own,
+# and that field wins over the attribute -- see the note on SIDES above for
+# what that looked like on paper.
+#
+# Measured, not reasoned about. Ghostscript 10.06.0, -sDEVICE=appleraster, a
+# two page input. The byte inspected is byte 2 of a 32 byte URF page header,
+# which for the first page is file offset 14: eight bytes of "UNIRAST\0"
+# magic, four bytes of page count, then the page header. Every page header in
+# the stream carries the field, not just the first, and all of them changed
+# together:
+#
+#   (no flags at all)             -> 1     one-sided
+#   -dDuplex=false                -> 1     one-sided
+#   -dDuplex=true -dTumble=false  -> 3     two-sided-long-edge
+#   -dDuplex=true -dTumble=true   -> 2     two-sided-short-edge
+#   -dTumble=true on its own      -> 1     Tumble does nothing without Duplex
+#
+# Which of 2 and 3 means which edge cannot be read off those numbers, so it
+# was pinned against the one raster format that spells it out in words: the
+# same flags given to -sDEVICE=pwgraster put Duplex=1/Tumble=0 in the CUPS
+# page header for the case that yields 3, and Duplex=1/Tumble=1 for the case
+# that yields 2. CUPS's Tumble is the PPD's DuplexTumble, which is short edge
+# binding. So 3 is long edge and 2 is short edge, which is also what the URF
+# specification says. Anybody re-checking this has no printer to hand either,
+# so check it the same way: the self-test asserts these exact bytes.
+#
+# -dTumble is stated explicitly in the long edge case rather than left to its
+# default, because the point of this whole change is that a default nobody
+# wrote down was the bug.
+#
+# The flags are not URF-specific and are safe for every device this script
+# will emit: appleraster, urf, pwgraster, pclm and pclm8 all accept them and
+# all still produce output. pwgraster records them in its CUPS page header as
+# above; the two PCLm devices at least act on them. Only the URF numbers were
+# pinned to paper, because URF is the format the affected printer takes.
+duplex=()
+case "$SIDES" in
+  one-sided)            duplex=(-dDuplex=false) ;;
+  two-sided-long-edge)  duplex=(-dDuplex=true -dTumble=false) ;;
+  two-sided-short-edge) duplex=(-dDuplex=true -dTumble=true) ;;
+  # Absent, or refused during header parsing. Nothing at all is passed, so
+  # the stream is byte for byte what this script produced before the field
+  # existed -- which is what makes an unrecognised value harmless.
+esac
+
+# Rasterise from the ORIGINAL, not the outlined copy: the outlines are a
+# detour, and going straight from the source keeps one interpretation step.
+# The range applies here too. Rasterising the whole document in answer to a
+# request for one page of it would be the same mistake as passing the whole
+# input through, only harder to notice.
+#
+# Both callers want the same command line, and there is exactly one place it
+# can be written without the two drifting apart.
+rasterise() {   # fills "$rasterfile"; non-zero means nothing usable came back
+  rasterfile="$(mktemp -t defont-raster-XXXXXX)"
+  "$GS" -q -dNOPAUSE -dBATCH -dSAFER -K400000 \
+        "${range[@]}" "${duplex[@]}" \
+        -sDEVICE="$RASTER_DEVICE" -r"$RASTER_DPI" \
+        -dcupsColorSpace="$RASTER_COLORSPACE" -dcupsBitsPerColor=8 \
+        -sOutputFile="$rasterfile" "$infile" >&2 && [ -s "$rasterfile" ]
+}
+
+# raster=only: the caller wants the raster and not the outlined PDF, which is
+# what a printer that has already refused the PDF is asked for again. It
+# happens here, before the pdfwrite pass, because there is nothing for that
+# pass to contribute -- the raster comes from the input either way -- and
+# because the fail-safes that follow it would all answer with the very PDF the
+# caller is trying to replace. Rasterising that cannot be done leaves the same
+# answer as before this field existed: the input, passed through, which the
+# caller can tell apart from a raster by looking at it.
+#
+# A range is passed to Ghostscript here as it is anywhere else, but the check
+# that the right NUMBER of pages came back cannot run on this path: nothing
+# here counts the pages in a raster stream, and counting them would mean
+# parsing one. The proxy never asks for both at once -- it asks for a range
+# only by hand, for diagnosis -- so this is a limit of the diagnostic path and
+# is written down rather than guarded.
+if [ -n "$RASTER_ONLY" ]; then
+  if rasterise; then
+    emit "$rasterfile" "$outarg"
+    rm -f "$rasterfile"
+    exit 0
+  fi
+  rm -f "$rasterfile"
+  fallback "rasterising failed"
+fi
+
 # -dNoOutputFonts does the work. The remaining options exist to make sure
 # nothing else is quietly degraded on the way through: image downsampling in
 # particular is on by default in Ghostscript's named presets, which would throw
@@ -537,70 +667,7 @@ fi
 if [ "$outsize" -gt "$MAX_PDF_BYTES" ] && [ -n "$RASTER_DEVICE" ]; then
   echo "defont: outlined output ${outsize} bytes exceeds ${MAX_PDF_BYTES};" \
        "rasterising instead" >&2
-  rasterfile="$(mktemp -t defont-raster-XXXXXX)"
-  # What the page headers of the raster stream are to say about duplex.
-  #
-  # RASTER ONLY. These flags are built here, inside the raster branch, so that
-  # they cannot drift onto the pdfwrite call above, and they must never be
-  # added to it. On the PDF path the printer interprets the document itself and
-  # honours the IPP sides attribute in the normal way, so there is nothing to
-  # correct and nothing to say; a -dDuplex there would only stamp a page-device
-  # setting into a PDF that no printer reads back, while making it look as
-  # though the two paths were doing the same thing. The bug is specific to
-  # raster because only the raster stream carries a duplex field of its own,
-  # and that field wins over the attribute -- see the note on SIDES above for
-  # what that looked like on paper.
-  #
-  # Measured, not reasoned about. Ghostscript 10.06.0, -sDEVICE=appleraster, a
-  # two page input. The byte inspected is byte 2 of a 32 byte URF page header,
-  # which for the first page is file offset 14: eight bytes of "UNIRAST\0"
-  # magic, four bytes of page count, then the page header. Every page header in
-  # the stream carries the field, not just the first, and all of them changed
-  # together:
-  #
-  #   (no flags at all)             -> 1     one-sided
-  #   -dDuplex=false                -> 1     one-sided
-  #   -dDuplex=true -dTumble=false  -> 3     two-sided-long-edge
-  #   -dDuplex=true -dTumble=true   -> 2     two-sided-short-edge
-  #   -dTumble=true on its own      -> 1     Tumble does nothing without Duplex
-  #
-  # Which of 2 and 3 means which edge cannot be read off those numbers, so it
-  # was pinned against the one raster format that spells it out in words: the
-  # same flags given to -sDEVICE=pwgraster put Duplex=1/Tumble=0 in the CUPS
-  # page header for the case that yields 3, and Duplex=1/Tumble=1 for the case
-  # that yields 2. CUPS's Tumble is the PPD's DuplexTumble, which is short edge
-  # binding. So 3 is long edge and 2 is short edge, which is also what the URF
-  # specification says. Anybody re-checking this has no printer to hand either,
-  # so check it the same way: the self-test asserts these exact bytes.
-  #
-  # -dTumble is stated explicitly in the long edge case rather than left to its
-  # default, because the point of this whole change is that a default nobody
-  # wrote down was the bug.
-  #
-  # The flags are not URF-specific and are safe for every device this script
-  # will emit: appleraster, urf, pwgraster, pclm and pclm8 all accept them and
-  # all still produce output. pwgraster records them in its CUPS page header as
-  # above; the two PCLm devices at least act on them. Only the URF numbers were
-  # pinned to paper, because URF is the format the affected printer takes.
-  duplex=()
-  case "$SIDES" in
-    one-sided)            duplex=(-dDuplex=false) ;;
-    two-sided-long-edge)  duplex=(-dDuplex=true -dTumble=false) ;;
-    two-sided-short-edge) duplex=(-dDuplex=true -dTumble=true) ;;
-    # Absent, or refused during header parsing. Nothing at all is passed, so
-    # the stream is byte for byte what this script produced before the field
-    # existed -- which is what makes an unrecognised value harmless.
-  esac
-  # Rasterise from the ORIGINAL, not the outlined copy: the outlines are a
-  # detour, and going straight from the source keeps one interpretation step.
-  # The range applies here too. Rasterising the whole document in answer to a
-  # request for one page of it would be the same mistake as passing the whole
-  # input through, only harder to notice.
-  if "$GS" -q -dNOPAUSE -dBATCH -dSAFER -K400000 \
-        "${range[@]}" "${duplex[@]}" \
-        -sDEVICE="$RASTER_DEVICE" -r"$RASTER_DPI" \
-        -dcupsColorSpace="$RASTER_COLORSPACE" -dcupsBitsPerColor=8 \
-        -sOutputFile="$rasterfile" "$infile" >&2 && [ -s "$rasterfile" ]; then
+  if rasterise; then
     emit "$rasterfile" "$outarg"
     rm -f "$rasterfile"
     exit 0

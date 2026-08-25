@@ -11,9 +11,15 @@ cd "$(dirname "$(readlink -f "$0")")/.."
 
 pass=0
 fail=0
+skipped=0
 
 ok()   { printf '  ok    %s\n' "$1"; pass=$((pass+1)); }
 bad()  { printf '  FAIL  %s\n' "$1"; fail=$((fail+1)); }
+# A skip is counted and named, never left to look like a pass. Whole sections
+# here need Ghostscript, systemd or a font that a minimal machine has not got,
+# and a run where they were absent is a different result from a run where they
+# passed -- "the suite is green" must not be able to mean "half of it ran".
+skip() { printf '  skip  %s\n' "$1"; skipped=$((skipped+1)); }
 check() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
 
 work="$(mktemp -d)"
@@ -167,6 +173,60 @@ for path, want in (('/ipp/office', 'office'), ('/office', 'office'),
 assert h.resolve(c4, '/nope') is None, 'ambiguous path must not guess'
 PY2
 
+echo 'discovery'
+python3 - <<'PY2' && ok 'the TXT record claims only what the printer said' || bad 'DNS-SD TXT record'
+import logging, sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)
+import ippfix
+from fakeprinter import FakePrinter, proxy_for
+
+with FakePrinter() as printer:
+    cfg, queue = proxy_for(printer)
+
+    # Before the printer has answered, nothing about the device is claimed at
+    # all. This record is read before any IPP exchange can correct it, so a key
+    # that would have to be guessed is left out: an absent key makes the client
+    # ask, a plausible one makes it believe.
+    cold = ippfix.discovery_txt(cfg, queue, 'ipp')
+    for key in ('pdl', 'Color', 'Duplex'):
+        assert key not in cold, cold
+    assert int(cold['printer-type'], 16) & 0x18 == 0, cold['printer-type']
+    assert cold['rp'] == 'ipp/office' and cold['ty'] == 'office', cold
+    assert 'TLS' not in cold, cold          # this one is the plaintext service
+
+    queue.learn()
+    hot = ippfix.discovery_txt(cfg, queue, 'ipps')
+    assert hot['Color'] == 'T' and hot['Duplex'] == 'T', hot
+    assert hot['TLS'] == '1.2', hot
+    # The formats are the printer's own, filtered exactly as its own attribute
+    # list is filtered on the way back to a client: discovery and IPP must not
+    # disagree, and PostScript is refused by both.
+    formats = hot['pdl'].split(',')
+    assert 'application/pdf' in formats and 'image/urf' in formats, hot['pdl']
+    assert 'application/postscript' not in formats, hot['pdl']
+    # Colour and duplex, in the bitfield as well as in the words.
+    assert int(hot['printer-type'], 16) & 0x18 == 0x18, hot['printer-type']
+
+    # A monochrome, simplex device has to be advertised as one. This is what
+    # the hardcoded record got wrong: it said colour and duplex to everybody,
+    # in the one place nothing later can correct.
+    queue.colour = False
+    queue.duplex = False
+    mono = ippfix.discovery_txt(cfg, queue, 'ipp')
+    assert mono['Color'] == 'F' and mono['Duplex'] == 'F', mono
+    assert int(mono['printer-type'], 16) & 0x18 == 0, mono['printer-type']
+
+    # One TXT entry holds 255 bytes including its key. A printer listing more
+    # formats than that is trimmed rather than allowed to break the record and
+    # take the whole queue out of discovery with it.
+    queue.formats = ['application/pdf'] + ['application/vnd.hp-PCLXL'] * 40
+    trimmed = ippfix.discovery_txt(cfg, queue, 'ipp')
+    assert len('pdl=' + trimmed['pdl']) <= 255, trimmed['pdl']
+    assert trimmed['pdl'].startswith('application/pdf,'), trimmed['pdl']
+PY2
+
 echo 'address selection'
 python3 - <<'PY' && ok 'excludes unusable IPv6 addresses' || bad 'address selection'
 import sys, socket
@@ -255,11 +315,18 @@ sys.exit(1)\""
   check 'refuses an unknown raster device' "grep -q 'refusing unknown raster device' '$work/inject.err'"
   check 'still produces output after refusing one' "[ -s '$work/inject.out' ]"
 
+  # The exit status is part of the answer, so it is captured rather than
+  # discarded: passing the input through IS the success case here, and a
+  # `|| true` that hides a non-zero status would let a converter that failed
+  # outright pass this as long as it happened to leave a file behind.
   printf '%%PDF-1.4 truncated and broken' > "$work/broken.pdf"
-  ./defont < "$work/broken.pdf" > "$work/broken.out" 2>/dev/null || true
-  check 'falls back to the original on failure' "[ -s '$work/broken.out' ]"
+  brokenrc=0
+  ./defont < "$work/broken.pdf" > "$work/broken.out" 2>/dev/null || brokenrc=$?
+  check 'a broken PDF still produces a document, and exits 0' \
+        "[ \"\$brokenrc\" = 0 ] && [ -s '$work/broken.out' ] && \
+         head -c 5 '$work/broken.out' | grep -qa '%PDF-'"
 else
-  echo '  skip  defont (ghostscript not installed)'
+  skip 'defont (ghostscript not installed)'
 fi
 
 echo 'hardening'
@@ -413,7 +480,10 @@ many = page * 3 + b'2 0 obj\n<< /Length 18 >>\nstream\n0 0 9 9 re f\nendstream\n
 assert estimate_font_cost(many) == cost, 'estimate grew with page count'
 PY2
 
-python3 - <<'PY2' && ok 'one costly page is not diluted by a long document' || bad 'per-page worst case'
+# 77 is this suite's word for "not run", chosen because it is what automake's
+# test protocol uses and because it cannot be confused with a pass.
+worst=0
+python3 - <<'PY2' || worst=$?
 import sys, zlib
 sys.path.insert(0, '.')
 from ippfix import estimate_font_cost
@@ -426,7 +496,7 @@ FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 try:
     font = open(FONT, 'rb').read()
 except OSError:
-    sys.exit(0)                      # no font installed; nothing to measure
+    sys.exit(77)                     # no font installed; nothing to measure
 
 def esc(b):
     return b.replace(b'\\', b'\\\\').replace(b'(', b'\\(').replace(b')', b'\\)')
@@ -477,6 +547,11 @@ for where in (0, 50, 99):
     got = estimate_font_cost(build(100, where))
     assert got == alone, ('diluted at position %d' % where, got, alone)
 PY2
+case "$worst" in
+  0)  ok 'one costly page is not diluted by a long document' ;;
+  77) skip 'per-page worst case (DejaVuSans not installed)' ;;
+  *)  bad 'per-page worst case' ;;
+esac
 
 python3 - <<'PY2' && ok 'offers only formats it can stand behind' || bad 'format policy'
 import sys
@@ -1153,10 +1228,9 @@ line, _, document = data.partition(b'\n')
 fields = dict(f.split(b'=', 1) for f in line.split()[1:] if b'=' in f)
 with open(os.path.abspath(sys.argv[0]) + '.log', 'a') as handle:
     handle.write(line.decode('utf-8', 'replace') + '\n')
-if fields.get(b'maxpdf') == b'0':
-    # maxpdf=0 is how the proxy asks for raster: everything is over the limit.
-    # The duplex byte follows the sides field, which is the whole reason that
-    # field exists.
+if fields.get(b'raster') == b'only':
+    # raster=only is how the proxy asks for raster. The duplex byte follows the
+    # sides field, which is the whole reason that field exists.
     duplex = 1 if fields.get(b'sides', b'one-sided') == b'one-sided' else 2
     header = bytes([8, int(fields.get(b'colorspace', b'19')), duplex, 0])
     sys.stdout.buffer.write(b'UNIRAST\0' + struct.pack('>I', 1)
@@ -1208,9 +1282,11 @@ assert sent[0].operation().get_str('document-format') == 'application/pdf'
 assert sent[0].data.startswith(b'%PDF-'), sent[0].data[:16]
 assert len(jobs) == 1
 # Nothing pre-empts the printer's answer any more: the only ceiling the
-# converter is given is the largest document this proxy would take back at all.
+# converter is given is the largest document this proxy would take back at all,
+# and nothing has asked for raster.
 assert len(headers) == 1, headers
 assert f'maxpdf={ippfix.MAX_CONVERTED}' in headers[0], headers[0]
+assert 'raster=only' not in headers[0], headers[0]
 assert 'sides=two-sided-long-edge' in headers[0], headers[0]
 
 # And the same job against a printer that does enforce it: refused with 0x0408
@@ -1225,9 +1301,13 @@ assert sent[1].data.startswith(b'UNIRAST'), sent[1].data[:16]
 # is the only reason resending is allowed at all.
 assert len(jobs) == 1, f'{len(jobs)} jobs exist upstream'
 assert jobs[0].urf_duplex is not None, 'the raster was not readable'
-# The retry asks for raster by saying everything is too large, and carries the
-# client's sides with it so the stream's duplex byte can follow.
-assert 'maxpdf=0' not in headers[0] and 'maxpdf=0' in headers[1], headers
+# The retry asks for raster in the one field that means that and nothing else,
+# and carries the client's sides with it so the stream's duplex byte can follow.
+# The size limit is beside the point on that call and is left where it was: a
+# converter that reached it would be outlining, which is what the retry exists
+# to stop.
+assert 'raster=only' not in headers[0] and 'raster=only' in headers[1], headers
+assert f'maxpdf={ippfix.MAX_CONVERTED}' in headers[1], headers[1]
 assert 'sides=two-sided-long-edge' in headers[1], headers[1]
 # The client is told about the job that exists, not about the refusal.
 assert answer.ipp.group(ipp.JOB_ATTRS).get_int('job-id') == jobs[0].id
@@ -1288,6 +1368,131 @@ with FakePrinter(mode='accept_then_drop_response', pdf_cap=64) as printer:
     queue.lock.release()
 PY2
 
+# The other half of the retry: every way it can decide it has nothing better to
+# offer. Each one must leave the printer's own refusal on its way to the client
+# and must not send a second document, which is the behaviour that existed
+# before the retry did.
+python3 - "$work" <<'PY2' && ok 'a retry with nothing better to offer sends nothing' || bad 'raster retry declines'
+import logging, os, sys
+work = sys.argv[1]
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)
+import ippcodec as ipp
+import ippfix
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+# Two stand-in converters, because "nothing better to offer" has to be told
+# apart from "nothing was asked for". The first answers every call with a
+# raster, so anything that reaches it and is not declined would be sent; the
+# log it keeps is what proves a call happened at all.
+RASTER = os.path.join(work, 'stubraster')
+CALLS = RASTER + '.log'
+with open(RASTER, 'w') as handle:
+    handle.write('#!/usr/bin/env python3\n'
+                 'import os, struct, sys\n'
+                 'data = sys.stdin.buffer.read()\n'
+                 'line, _, doc = data.partition(b"\\n")\n'
+                 'open(os.path.abspath(sys.argv[0]) + ".log", "a").write(\n'
+                 '    line.decode("utf-8", "replace") + "\\n")\n'
+                 'sys.stdout.buffer.write(b"UNIRAST\\0" + struct.pack(">I", 1)\n'
+                 '                        + bytes([8, 19, 1, 0]) + bytes(28)\n'
+                 '                        + bytes(64))\n')
+# The second hands back the document it was given, whatever the header asked
+# for. That is not a contrived stub: it is exactly what defont does when one of
+# its outlining fail-safes fires -- empty output, a surviving font program, a
+# class of drawing lost by Ghostscript -- each of which passes the ORIGINAL
+# through and reports success. It is also what a converter too old to know
+# raster=only does with every job.
+PDFONLY = os.path.join(work, 'stubpdf')
+with open(PDFONLY, 'w') as handle:
+    handle.write('#!/usr/bin/env python3\n'
+                 'import sys\n'
+                 'data = sys.stdin.buffer.read()\n'
+                 'sys.stdout.buffer.write(data.partition(b"\\n")[2])\n')
+os.chmod(RASTER, 0o755)
+os.chmod(PDFONLY, 0o755)
+
+DOCUMENT = b'%PDF-1.4\n' + b'body line\n' * 20
+
+with FakePrinter(mode='enforce_pdf_cap', pdf_cap=64) as printer:
+    cfg, queue = proxy_for(printer, extra=['--converter', RASTER])
+    cfg.convert = True
+    queue.learn()
+    assert queue.raster_format, 'the mock offered no raster format to fall to'
+
+    def offer(data=DOCUMENT, fmt='application/pdf'):
+        open(CALLS, 'w').close()
+        msg = job_request(0x0002, 1, 'ipp://192.0.2.10/ipp/office',
+                          document_format=(ipp.TAG_MIMETYPE, [fmt]))
+        msg.data = data
+        return ippfix.rasterise_after_refusal(cfg, queue, msg, data, fmt,
+                                              None, 0x0408)
+
+    def called():
+        return bool(open(CALLS).read())
+
+    # The armed case, so that what follows is a refusal to act rather than a
+    # converter that could not have produced anything anyway.
+    payload, note = offer()
+    assert payload is not None and 'image/urf' in note, note
+
+    # Nothing else this proxy can make: no raster format was ever learned, so
+    # the only thing to send would be a format the printer never claimed.
+    learned = queue.raster_format
+    queue.raster_format = None
+    assert offer() == (None, None)
+    queue.raster_format = learned
+    # Conversion switched off entirely. Nothing is converted and nothing is
+    # sent; the refusal is the client's answer.
+    cfg.convert = False
+    assert offer() == (None, None)
+    assert not called()
+    cfg.convert = True
+    # Already raster, or never a PDF to begin with. The same bytes would come
+    # back and earn the same refusal, so the converter is not even asked.
+    assert offer(data=b'UNIRAST\0not a pdf at all') == (None, None)
+    assert not called(), 'the converter was run on something that is not a PDF'
+    # --fail-closed turns a failed conversion into an exception, which is still
+    # nothing to offer rather than something the client is told twice.
+    cfg.fail_closed = True
+    cfg.converter = os.path.join(work, 'no-such-converter')
+    assert offer() == (None, None)
+    cfg.fail_closed = False
+
+    # The converter answered with a PDF. Those are the bytes the printer has
+    # just refused, so sending them again would earn the same refusal -- and
+    # this is the case raster=only exists for, because maxpdf=0 is reached only
+    # past the fail-safes that produce exactly this.
+    cfg.converter = PDFONLY
+    assert offer() == (None, None)
+    # The same for a client that called its PDF something else: what came back
+    # is refused for being a PDF, not merely for being the format that was
+    # sent. The printer refused a PDF whatever the job called it.
+    assert offer(fmt='application/octet-stream') == (None, None)
+
+    # learn() is the only thing that should have gone upstream here: none of
+    # these sent a document.
+    assert [op for op, _raw in printer.requests] == [0x000B], printer.requests
+
+# And the same thing end to end, with the converter that cannot improve on the
+# document: the refusal reaches the client, and the printer sees one job.
+with FakePrinter(mode='enforce_pdf_cap', pdf_cap=64) as printer:
+    cfg, queue = proxy_for(printer, extra=['--converter', PDFONLY])
+    cfg.convert = True
+    msg = job_request(0x0002, 1, 'ipp://192.0.2.10/ipp/office',
+                      document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    msg.data = DOCUMENT
+    answer = relay(cfg, msg)
+
+    assert answer.ipp.code == 0x0408, hex(answer.ipp.code)
+    assert [op for op, _raw in printer.requests].count(0x0002) == 1, \
+        'a document the converter could not improve was sent twice'
+    assert printer.jobs == [], printer.jobs
+    assert queue.lock.acquire(blocking=False), 'the queue lock was not released'
+    queue.lock.release()
+PY2
+
 python3 - <<'PY2' && ok 'sides reaches the converter, and a retry asks for raster' || bad 'converter sides header'
 import sys
 sys.path.insert(0, '.')
@@ -1315,12 +1520,28 @@ for bogus in ('two-sided', '', 'ONE-SIDED', 'one-sided device=uniprint',
     assert b'sides=' not in ippfix.converter_header(queue, cfg, sides=bogus), \
         repr(bogus)
 
-# A retry asks for raster the only way there is to ask: everything is over the
-# limit. The client's sides goes with it, because the stream's duplex byte is
-# what the printer will actually obey.
+# With no raster format learned there is nothing to ask for, and a request for
+# raster must not turn into a header that says both "no raster format" and
+# "raster only".
+assert b'raster=none' in plain, plain
+refused = ippfix.converter_header(queue, cfg, force_raster=True)
+assert b'raster=only' not in refused, refused
+
+# A retry asks for raster in a field that says only that. The client's sides
+# goes with it, because the stream's duplex byte is what the printer will
+# actually obey. maxpdf is left alone: overloading it as a mode flag meant the
+# converter reached it only after outlining, and only after fail-safes that
+# hand back the original PDF -- so "rasterise this" could answer with the very
+# document the printer had just refused.
+queue.raster_format = 'image/urf'
+queue.raster_device = 'appleraster'
+queue.raster_colorspace = 19
+queue.raster_dpi = 600
 forced = ippfix.converter_header(queue, cfg, sides='one-sided',
                                  force_raster=True)
-assert b'maxpdf=0' in forced and b'sides=one-sided' in forced, forced
+assert b'raster=only' in forced and b'sides=one-sided' in forced, forced
+assert f'maxpdf={ippfix.MAX_CONVERTED}'.encode() in forced, forced
+assert b'raster=only' not in ippfix.converter_header(queue, cfg)
 
 # A site that has measured a printer which really does refuse oversized jobs
 # can still put the ceiling back.
@@ -1544,8 +1765,22 @@ PY2
 
 echo 'systemd units'
 if command -v systemd-analyze >/dev/null 2>&1; then
+  # Two of the things systemd-analyze says on a machine where ippfix is not
+  # installed are about the machine rather than about the unit: units it
+  # references are absent, and the ExecStart paths do not exist yet. Those are
+  # filtered out and EVERYTHING else fails the check -- an unknown directive, a
+  # value it cannot parse, a setting in a section it does not read.
+  #
+  # The empty-output test is the point. This check used to pipe into `grep -qv`
+  # and end in `|| true`, so it passed unconditionally; even without the
+  # `|| true`, `grep -qv` succeeds as soon as any ONE line fails to match, so a
+  # unit with ten fatal errors reported ok.
+  verify() {   # $1 = unit file; echoes what is actually wrong with it
+    systemd-analyze verify "$1" 2>&1 \
+      | grep -vE 'Unit .* not found|Command .* is not executable'
+  }
   for u in ippfix.service ippfix.socket ippfix-convert.socket 'ippfix-convert@.service'; do
-    check "$u is valid" "systemd-analyze verify './$u' 2>&1 | grep -qvE 'Unit .* not found' || true"
+    check "$u is valid" "[ -z \"\$(verify './$u')\" ]"
   done
   # The converter is where hostile documents are parsed; it must stay the more
   # confined of the two, and must never be given network access.
@@ -1584,7 +1819,7 @@ PY2
   check 'the unit that mails reports lets delivery outlive it' \
         "grep -q '^KillMode=process\$' debian/pkg/ippfix-alert.service"
 else
-  echo '  skip  systemd units (systemd-analyze not available)'
+  skip 'systemd units (systemd-analyze not available)'
 fi
 
 echo 'reporting'
@@ -1895,12 +2130,15 @@ rid, packet = snmp.encode_request('1.3.6.1.2.1.43.10.2.1.4.1.1', 'secret')
 msg = snmp.parse(packet)
 assert msg.community == 'secret' and msg.pdu_type == snmp.GET
 assert msg.oids == ['1.3.6.1.2.1.43.10.2.1.4.1.1'] and msg.request_id == rid
-assert snmp.decode_oid(snmp.encode_request('1.3.6.1.4.1.99999.1')[1][-13:-2]) or True
 
 # Round-tripping an OID with a multi-byte arc, which is where hand-rolled BER
-# usually breaks.
+# usually breaks. Every arc worth checking belongs in this loop, where what
+# came back is compared with the text it was built from. An assertion of the
+# form `assert decode_oid(...) or True` is true whatever decode_oid returns,
+# and one that slices a fixed byte offset out of the middle of a packet pins an
+# offset rather than a behaviour.
 for text in ('1.3.6.1.2.1.43.10.2.1.4.1.1', '1.3.6.1.4.1.11.2.3.9.1',
-             '1.3.6.1.4.1.2147483647.1', '0.0'):
+             '1.3.6.1.4.1.2147483647.1', '1.3.6.1.4.1.99999.1', '0.0'):
     body = snmp.encode_oid(text)
     assert snmp.decode_oid(body[2:]) == text, text
 
@@ -1926,42 +2164,23 @@ else:
     raise AssertionError('oversized datagram accepted')
 PY2
 
-python3 - <<'PY2' && ok 'the converter is asked for a range, and answers with a count' || bad 'converter page-range contract'
-import sys
-sys.path.insert(0, '.')
-import ippfix
-
-args = ippfix.build_parser().parse_args(['t=ipp://p.example/ipp/print'])
-queue = ippfix.parse_queue('t=ipp://p.example/ipp/print')
-cfg = ippfix.Config(args, [queue])
-queue.learned = True          # do not go to the network for this
-
-plain = ippfix.converter_header(queue, cfg)
-assert b'first=' not in plain and b'report=' not in plain, plain
-# Asking for one range, 1-based and inclusive at both ends. An off-by-one here
-# duplicates or drops a page at every seam, and neither is visible until
-# somebody reads the paper.
-ranged = ippfix.converter_header(queue, cfg, first=4, last=6, report=True)
-assert b'first=4' in ranged and b'last=6' in ranged and b'report=1' in ranged
-
-# The count comes back ahead of the document. A converter that predates this
-# says nothing, and None must not be read as a page count.
-cases = [(b'%%ippfix-out pages=9\n%PDF-1.4\nx', (9, b'%PDF-1.4\nx')),
-         (b'%PDF-1.4\nx', (None, b'%PDF-1.4\nx')),
-         (b'%%ippfix-out pages=0\n%PDF', (0, b'%PDF')),
-         (b'%%ippfix-out pages=x\n%PDF', (None, b'%PDF')),
-         (b'%%ippfix-out pages=3', (None, b'%%ippfix-out pages=3'))]
-for raw, want in cases:
-    assert ippfix.read_converter_report(raw) == want, raw
-PY2
-
 # The page-range suite is its own file: it needs Ghostscript and takes about
 # twenty seconds, and keeping it separate means it can be run on its own while
 # working on the converter. There is still one entry point.
 if [ -x ./scripts/selftest-pagerange.sh ]; then
   echo
-  ./scripts/selftest-pagerange.sh || fail=$((fail+1))
+  child=0
+  ./scripts/selftest-pagerange.sh || child=$?
   echo
+  # 77 is that suite saying it could not run at all -- see the comment at the
+  # top of it. It is counted as a skip here rather than folded into the pass
+  # count, because a run without Ghostscript proved none of the 156 things it
+  # exists to prove.
+  case "$child" in
+    0)  ;;
+    77) skip 'page ranges (the suite could not run)' ;;
+    *)  fail=$((fail+1)) ;;
+  esac
 else
   bad 'scripts/selftest-pagerange.sh is missing or not executable'
 fi
@@ -1983,5 +2202,7 @@ check 'no absolute home paths leaked' \
       "! grep -rqE '/home/[a-z]+/' --exclude-dir=.git --exclude-dir=__pycache__ ."
 
 echo
-echo "$pass passed, $fail failed"
+# The skip count is printed even when it is zero. A number that only appears
+# when something went unrun is a number nobody learns to look for.
+echo "$pass passed, $fail failed, $skipped skipped"
 [ "$fail" -eq 0 ]

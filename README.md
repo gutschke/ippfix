@@ -77,7 +77,7 @@ logged — a job that might not print beats one that prints something wrong.
 *occurrence*, so size follows how much text there is. A page drawing a few
 hundred glyphs from a large embedded font gets *smaller* (the reproducer here
 goes 394 KB → 192 KB, because the font program outweighs the outlines drawn
-from it), but dense body copy runs about 670 KB of outlined PDF per page.
+from it), but dense body copy runs about 650 KB of outlined PDF per page.
 
 Printers declare a maximum PDF size, and **the proxy does not act on it.** The
 printer this was built for declares 76.8 MB and was measured printing a 92.5 MB

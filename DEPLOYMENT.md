@@ -580,8 +580,9 @@ recovers most but not all of that. It costs transfer size and *saves* CPU
 path — that blur is Chrome encoding the page as JPEG at quality 40.
 
 Measured: outlining costs about **650 KB of PDF per page** on dense body copy
-and **390 KB** on an ordinary report page, so a 155-page report reaches the
-76.8 MB this device declares. **It prints anyway** — the same device was
+and **390 KB** on an ordinary report page, so it takes about **118 dense pages,
+or 197 ordinary ones**, to reach the 76.8 MB this device declares.
+**It prints anyway** — the same device was
 measured accepting and rendering a 92.5 MB PDF. Declared limits on this printer
 family are advisory, which is why the proxy no longer decides from them.
 
