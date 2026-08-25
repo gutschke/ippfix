@@ -36,6 +36,7 @@ Run it standalone to poke at by hand:
     python3 scripts/fakeprinter.py            # prints the URI it is listening on
 """
 import base64
+import collections
 import contextlib
 import os
 import socket
@@ -67,10 +68,34 @@ OP_IDENTIFY_PRINTER = 0x003C
 
 # IPP status codes this printer can answer with.
 OK = 0x0000
+OK_IGNORED = 0x0001            # successful-ok-ignored-or-substituted-attributes
 BAD_REQUEST = 0x0400
 NOT_FOUND = 0x0406
 NOT_POSSIBLE = 0x0404          # what the M283fdw answers; measured, see below
+TOO_LARGE = 0x0408             # client-error-request-entity-too-large
 MULTIPLE_JOBS_NOT_SUPPORTED = 0x0509
+
+# A URF stream begins UNIRAST\0, then a 4-byte page count, then one 32-byte
+# header per page. The first three bytes of that header are bits per pixel,
+# colour space, and duplex -- so the duplex byte of the first page is at offset
+# 14 of the stream, and that byte is what the printer obeys. Measured on paper:
+# a two-page URF declaring one-sided, sent with sides=two-sided-long-edge and
+# media=na_letter_8.5x11in, was answered 0x0000 with nothing in
+# unsupported-attributes, reported two impressions, completed -- and came out as
+# two simplex sheets.
+URF_MAGIC = b'UNIRAST\0'
+URF_PAGE_HEADER = 32
+URF_ONE_SIDED = 1              # the only duplex value confirmed on paper
+
+# Colour space bytes this mock will accept in a URF stream. NOT measured: what
+# was measured is that a stream produced without -dcupsColorSpace -- so carrying
+# a colour space nobody chose -- came back job-state 8, aborted, with 0
+# impressions, and made the printer emit an error page naming a parser fault.
+# These five are the values the proxy is able to ask for, being the
+# urf-supported names it knows how to translate; anything else stands for a
+# colour space the device does not implement. So what the abort below pins is
+# the behaviour, not the device's table -- establishing that would cost paper.
+URF_COLORSPACES = (0, 1, 18, 19, 20)
 
 # RFC 8011 job-state.
 PENDING = 3
@@ -153,11 +178,47 @@ def captured_attributes():
     return base64.b64decode(text)
 
 
+def declared_pdf_cap():
+    """The upper end of pdf-k-octets-supported, in bytes, as captured.
+
+    Read from the fixture rather than written down here, so that the number the
+    mock declares and the number it can be told to enforce are the same one the
+    device published. It declares 0..75000 -- and does not enforce it.
+    """
+    group = ipp.parse(captured_attributes()).group(ipp.PRINTER_ATTRS)
+    value = (group.get('pdf-k-octets-supported') or [b''])[0]
+    if len(value) != 8:
+        return None
+    return struct.unpack_from('>ii', value, 0)[1] * 1024
+
+
+URFHeader = collections.namedtuple('URFHeader', 'pages bpp colorspace duplex')
+
+
+def parse_urf(data):
+    """Read the first page header of a URF stream.
+
+    Returns (pages, bpp, colorspace, duplex), or None for anything that is not
+    a URF stream this printer could begin to read. Only the first page is
+    looked at: it is the one the device acts on for the whole job, and it is
+    the one a test can put a known byte into.
+    """
+    if data[:len(URF_MAGIC)] != URF_MAGIC:
+        return None
+    start = len(URF_MAGIC) + 4
+    if len(data) < start + URF_PAGE_HEADER:
+        return None
+    pages = struct.unpack_from('>I', data, len(URF_MAGIC))[0]
+    bpp, colorspace, duplex = data[start], data[start + 1], data[start + 2]
+    return URFHeader(pages, bpp, colorspace, duplex)
+
+
 class Job:
     """One job, and what the printer will say about it."""
 
     __slots__ = ('id', 'name', 'fmt', 'size', 'state', 'reasons',
-                 'impressions', 'pages', 'open')
+                 'impressions', 'pages', 'open', 'sides', 'sides_ignored',
+                 'urf_duplex')
 
     def __init__(self, job_id, name, fmt, size, pages):
         self.id = job_id
@@ -171,10 +232,33 @@ class Job:
         # False between Create-Job and Close-Job: a job still taking documents
         # does not start printing.
         self.open = False
+        # What the printer took from the request, which is not always what the
+        # request asked for: sides is dropped unless media came with it.
+        self.sides = None
+        self.sides_ignored = False
+        # The duplex byte of the raster stream, when the document was one.
+        self.urf_duplex = None
 
     @property
     def active(self):
         return self.state not in TERMINAL
+
+    @property
+    def duplexed(self):
+        """Whether this job really duplexed, as far as the paper would show.
+
+        None means unknown, and is returned rather than a guess in the case
+        that matters: the URF duplex values for two-sided have not been
+        established yet, so only `URF_ONE_SIDED` is read as an answer. For a
+        raster job the stream decides and the IPP attribute does not -- that is
+        the finding this exists to keep -- and for anything else the attribute
+        is all there is.
+        """
+        if self.urf_duplex is not None:
+            return False if self.urf_duplex == URF_ONE_SIDED else None
+        if self.sides is None:
+            return None
+        return self.sides != 'one-sided'
 
 
 class FakePrinter:
@@ -197,6 +281,7 @@ class FakePrinter:
              'hold_job',                   # pending, media-empty, forever
              'silent_loss',                # completes having marked nothing
              'unreachable',                # connections are refused
+             'enforce_pdf_cap',            # refuses a PDF over its declared cap
              'accept_then_drop_response')  # body read in full, no answer sent
 
     MAX_JOBS = 16          # bounded history: a test must not grow one without end
@@ -204,10 +289,19 @@ class FakePrinter:
     ACCEPT_POLL = 0.1      # how often the accept loop checks for a mode change
 
     def __init__(self, host='127.0.0.1', path='/ipp/print', mode=None,
-                 pages_per_job=1, page_counter=1000):
+                 pages_per_job=1, page_counter=1000, pdf_cap=None,
+                 urf_colorspaces=URF_COLORSPACES):
         self.host = host
         self.path = path
         self.pages_per_job = pages_per_job
+        # The cap this printer declares, taken from the captured attributes so
+        # that it is the device's own number rather than one invented here. It
+        # is enforced only in 'enforce_pdf_cap' mode: the real device declares
+        # 75000 KB and printed a 92.5 MB PDF, so accepting is the faithful
+        # default. A test may lower it rather than transfer 76 MB to prove a
+        # point about a refusal.
+        self.pdf_cap = declared_pdf_cap() if pdf_cap is None else pdf_cap
+        self.urf_colorspaces = tuple(urf_colorspaces)
         # The lifetime page counter the SNMP cross-check reads. It starts
         # somewhere non-zero because a printer that has never printed is not
         # the case anybody is testing.
@@ -382,6 +476,81 @@ class FakePrinter:
     def job(self, job_id):
         return next((j for j in self.jobs if j.id == job_id), None)
 
+    def _too_large(self, fmt, size):
+        """Refuse a PDF over the declared cap -- only when asked to.
+
+        The real device does not do this: it declares pdf-k-octets-supported
+        0..75000, a 76.8 MB working limit, and printed a 92.5 MB PDF. So the
+        default is to accept, which is why the proxy no longer decides for
+        itself that a document is too big. This mode exists because the
+        refuse-then-rasterise path it grew instead cannot be tested against a
+        printer that never refuses anything.
+
+        Nothing is created when it refuses. That is the property the whole
+        retry rests on: the client may send something else without printing
+        anything twice.
+        """
+        if self._mode != 'enforce_pdf_cap' or not self.pdf_cap:
+            return None
+        if (fmt or '') not in ('application/pdf', 'application/octet-stream'):
+            return None
+        return TOO_LARGE if size > self.pdf_cap else None
+
+    def _take_sides(self, job, request):
+        """Apply the sides attribute the way this firmware does, or not at all.
+
+        Measured: `sides=two-sided-long-edge` on its own comes back 0x0001 with
+        `sides` in unsupported-attributes and the job prints one-sided; the
+        same job with `media=na_letter_8.5x11in` beside it comes back 0x0000
+        and duplexes. The device publishes `job-constraints-supported:
+        duplex-unsupported-media` and resolves the constraint by discarding
+        `sides` rather than by applying `media-default`, which RFC 8011 5.2
+        says it should.
+
+        Returns the unsupported-attributes groups for the reply, which is empty
+        when there was nothing to complain about.
+        """
+        group = request.group(ipp.JOB_ATTRS)
+        sides = group.get_str('sides') if group else None
+        if sides is None:
+            return []
+        has_media = (group.index_of('media') >= 0
+                     or group.index_of('media-col') >= 0)
+        if has_media:
+            job.sides = sides
+            return []
+        job.sides_ignored = True
+        return [ipp.Group(ipp.UNSUPPORTED_ATTRS,
+                          [(ipp.TAG_KEYWORD, b'sides', sides.encode())])]
+
+    def _read_document(self, job, fmt, data):
+        """Look at a raster document the way the marking engine would.
+
+        Two findings live here. The stream's own duplex byte is what the device
+        obeys, whatever `sides` said, so it is recorded and exposed rather than
+        interpreted -- only the one-sided value has been confirmed on paper.
+        And a stream it cannot parse is aborted rather than dropped: a URF made
+        without -dcupsColorSpace came back job-state 8 with 0 impressions.
+
+        The abort also costs a sheet on the real device, which emits an error
+        page naming a parser fault. Nothing here can model paper; the point is
+        that code which starts producing an unacceptable raster fails a test
+        instead of a print.
+        """
+        if not data or (fmt != 'image/urf'
+                        and data[:len(URF_MAGIC)] != URF_MAGIC):
+            return
+        header = parse_urf(data)
+        if header is None or header.colorspace not in self.urf_colorspaces:
+            job.state = ABORTED
+            job.reasons = ['job-aborted-by-system']
+            return
+        job.urf_duplex = header.duplex
+        if header.pages:
+            # The stream says how many pages there are, and the device reports
+            # one impression per page of it.
+            job.pages = header.pages
+
     @property
     def active_job(self):
         return next((j for j in self.jobs if j.active), None)
@@ -466,7 +635,14 @@ class FakePrinter:
                 # ruined paper.
                 if self.active_job is not None:
                     return self._reply(request, MULTIPLE_JOBS_NOT_SUPPORTED)
+                # Refused before a job exists, so there is nothing for a client
+                # that sends something else instead to print twice.
+                refusal = self._too_large(fmt, len(request.data))
+                if refusal is not None:
+                    return self._reply(request, refusal)
                 job = self._new_job(name, fmt, len(request.data))
+                unsupported = self._take_sides(job, request)
+                self._read_document(job, fmt, request.data)
                 if request.code == OP_CREATE_JOB:
                     job.open = True
                 elif self._mode == 'reject_job':
@@ -481,16 +657,27 @@ class FakePrinter:
                     # The body has been read in full and the job exists. Now
                     # vanish. Anything that resubmits after this double-prints.
                     return None
-                return self._reply(request, OK, [self._job_group(job)])
+                # 0x0001 successful-ok-ignored-or-substituted-attributes: the
+                # job was taken, and something it asked for was not done.
+                return self._reply(request, OK_IGNORED if unsupported else OK,
+                                   unsupported + [self._job_group(job)])
 
             if request.code == OP_SEND_DOCUMENT:
                 job_id = self._int_attr(request, 'job-id')
                 job = self.job(job_id)
                 if job is None:
                     return self._reply(request, NOT_FOUND)
+                refusal = self._too_large(fmt or job.fmt,
+                                          job.size + len(request.data))
+                if refusal is not None:
+                    # The document is refused; the job it was offered to is
+                    # left as it was, having taken nothing.
+                    return self._reply(request, refusal)
                 job.size += len(request.data)
                 if job.fmt is None:
                     job.fmt = fmt
+                unsupported = self._take_sides(job, request)
+                self._read_document(job, fmt or job.fmt, request.data)
                 last = op.get('last-document') if op else None
                 if last and last[0] not in (b'\x00', b''):
                     job.open = False
@@ -501,7 +688,8 @@ class FakePrinter:
                     job.reasons = ['media-empty']
                 if self._mode == 'accept_then_drop_response':
                     return None
-                return self._reply(request, OK, [self._job_group(job)])
+                return self._reply(request, OK_IGNORED if unsupported else OK,
+                                   unsupported + [self._job_group(job)])
 
             if request.code == OP_CLOSE_JOB:
                 job = self.job(self._int_attr(request, 'job-id'))
@@ -659,12 +847,34 @@ def relay(cfg, msg, path=None, client=('192.0.2.99', 5000)):
     return Answer(lines[0].split(' ', 1)[1], headers, body)
 
 
-def job_request(op, request_id, uri, job_id=None, **attrs):
+def post(printer, msg):
+    """Send one IPP request straight at the mock, with no proxy in between.
+
+    The tests that pin what the mock itself does need to reach it directly: put
+    the proxy in the middle and a fault there could hide a fault here.
+    """
+    import http.client
+    body = ipp.serialize(msg)
+    conn = http.client.HTTPConnection(printer.host, printer.port, timeout=5)
+    try:
+        conn.request('POST', printer.path, body=body,
+                     headers={'Content-Type': 'application/ipp',
+                              'Content-Length': str(len(body))})
+        return ipp.parse(conn.getresponse().read())
+    finally:
+        conn.close()
+
+
+def job_request(op, request_id, uri, job_id=None, job_attrs=(), **attrs):
     """An IPP request as a client would send it, with attributes in one order.
 
     Order matters here: these messages are compared byte for byte against what
     the proxy forwarded, and a dict that iterated differently would make that
     comparison meaningless.
+
+    `job_attrs` is a sequence of (name, tag, values) put in the job group,
+    which is where a client asks for sides and media -- and where this printer
+    insists on seeing both of them together.
     """
     msg = ipp.new_request(op, request_id, uri)
     group = msg.operation()
@@ -672,7 +882,22 @@ def job_request(op, request_id, uri, job_id=None, **attrs):
         group.items.append((ipp.TAG_INTEGER, b'job-id', ipp.i32(job_id)))
     for name, (tag, values) in attrs.items():
         group.replace(name.replace('_', '-'), tag, values)
+    if job_attrs:
+        job = ipp.Group(ipp.JOB_ATTRS)
+        for name, tag, values in job_attrs:
+            job.replace(name, tag, values)
+        msg.groups.append(job)
     return msg
+
+
+def urf_document(pages=1, colorspace=19, duplex=URF_ONE_SIDED, bpp=8):
+    """A URF stream with a chosen first-page header, for tests.
+
+    Only the header matters here: nothing rasterises it, and the printer this
+    stands in for decides what it will do from these bytes.
+    """
+    header = bytes([bpp, colorspace, duplex, 0]) + bytes(URF_PAGE_HEADER - 4)
+    return URF_MAGIC + struct.pack('>I', pages) + header + bytes(64)
 
 
 if __name__ == '__main__':

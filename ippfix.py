@@ -83,6 +83,7 @@ import snmpmini as snmp
 log = logging.getLogger('ippfix')
 
 OP_PRINT_JOB = 0x0002
+OP_CREATE_JOB = 0x0005
 OP_SEND_DOCUMENT = 0x0006
 OP_NAMES = {0x0002: 'Print-Job', 0x0004: 'Validate-Job', 0x0005: 'Create-Job',
             0x0006: 'Send-Document', 0x0008: 'Cancel-Job',
@@ -135,6 +136,53 @@ SAFE_FORMATS = ('application/pdf', 'image/urf', 'application/PCLm',
 # Raster formats worth falling back to, best first. Chosen from what the
 # printer says it accepts, never assumed.
 RASTER_PREFERENCE = ('image/urf', 'application/PCLm', 'image/pwg-raster')
+
+# The three values `sides` may take on the way to the converter. The client's
+# own word is passed through and nothing is ever invented, but it is checked
+# against this list first: the value is written into a line the converter parses
+# as whitespace-separated fields, so a value carrying a space would let whoever
+# sent the job add a field of their own -- a device= naming a Ghostscript device
+# with a history of defeating -dSAFER, say. A value that is not one of these is
+# dropped and the converter keeps its default, which is what happened before
+# this field existed at all.
+SIDES_VALUES = ('one-sided', 'two-sided-long-edge', 'two-sided-short-edge')
+
+# The IPP statuses that justify converting again as raster and resending.
+#
+# Every one of them says the same two things: the printer created no job, and
+# the document it was handed is the reason. That is what makes a resend safe --
+# there is nothing to double, because nothing was accepted. It is also why this
+# list may only ever grow from a status with those two properties. A lost or
+# dropped answer has neither: the printer may well be holding the job, and
+# sending it again prints it twice.
+#
+#   0x0408 client-error-request-entity-too-large
+#       The document is larger than the printer will take. RFC 8011 8.1.3 has
+#       the Printer reject the request, so no Job object exists. This is the
+#       measured case: the device declares pdf-k-octets-supported 0..75000 and
+#       does not enforce it, so the size at which it will actually answer this
+#       cannot be predicted and must be discovered by asking.
+#   0x0411 client-error-document-format-error
+#       The format was accepted but the bytes could not be parsed. Again no job
+#       is created, and the fault is in the document, so handing over the same
+#       document again would earn the same answer -- while a raster of it does
+#       not go near the interpreter that objected.
+#   0x040A client-error-document-format-not-supported
+#       The printer will not take this format at all. It is only ever answered
+#       about the document just offered, and it is answered before a job is
+#       created. Raster is the one other thing this proxy can produce, so it is
+#       worth exactly one attempt.
+#
+# Deliberately absent: everything that describes the printer's state rather than
+# the document -- 0x0505 temporary-error, 0x0506 not-accepting-jobs, 0x0507
+# busy, 0x0509 multiple-document-jobs-not-supported, 0x050B too-many-jobs.
+# Rasterising answers none of them, and several are transient, so a resend would
+# be a second attempt at the same job rather than a different one.
+RETRY_AS_RASTER = {
+    0x0408: 'client-error-request-entity-too-large',
+    0x040A: 'client-error-document-format-not-supported',
+    0x0411: 'client-error-document-format-error',
+}
 
 # Ghostscript device per raster format, and the cupsColorSpace numbers behind
 # the names printers use in urf-supported. Nothing here is assumed of a
@@ -251,7 +299,9 @@ class Queue:
         self.raster_device = None
         self.raster_colorspace = None
         self.raster_dpi = None
-        self.max_pdf_bytes = None
+        # What the printer says it will take, for the log only. Measured not to
+        # be enforced: see learn().
+        self.declared_pdf_bytes = None
         self.learned = False
         self.learn_failed_at = None    # monotonic time of the last failure
         self.pages = None              # PageCounter, once Config has built it
@@ -263,10 +313,18 @@ class Queue:
         """Ask the printer what it can actually take, once.
 
         Everything the raster fallback needs varies by model: which raster
-        format, which colour space (a monochrome device offers no colour one),
-        which resolution, and how large a PDF it will accept. Guessing any of
-        them produces a job the printer rejects, which is the failure this
-        proxy exists to remove.
+        format, which colour space (a monochrome device offers no colour one)
+        and which resolution. Guessing any of them produces a job the printer
+        rejects, which is the failure this proxy exists to remove.
+
+        How large a PDF the printer will accept is read too, and then used for
+        nothing but the log. Measured on an M283fdw: it declares
+        pdf-k-octets-supported 0..75000, a 76.8 MB working limit, and printed a
+        92.5 MB PDF without complaint. A declared cap that the device does not
+        enforce cannot be used to decide anything -- deciding from it means
+        rasterising documents the printer would have taken whole. What the
+        printer will refuse is now discovered by offering it the document; see
+        RETRY_AS_RASTER.
         """
         if self.learned:
             return
@@ -343,8 +401,7 @@ class Queue:
         if koctets and len(koctets[0]) == 8:
             upper = struct.unpack_from('>ii', koctets[0], 0)[1]
             if upper > 0:
-                # Stay clear of the limit rather than sitting on it.
-                self.max_pdf_bytes = int(upper * 1024 * 0.8)
+                self.declared_pdf_bytes = upper * 1024
 
         if self.raster_format:
             log.info('%s: raster fallback %s, %s, %d dpi', self.name,
@@ -354,9 +411,14 @@ class Queue:
             log.warning('%s: printer accepts no raster format we can produce; '
                         'oversized jobs will be sent as PDF and may be '
                         'rejected', self.name)
-        if self.max_pdf_bytes:
-            log.info('%s: printer accepts PDF up to %.0f MB', self.name,
-                     self.max_pdf_bytes / 1e6)
+        if self.declared_pdf_bytes:
+            # Advisory, and said so in the journal, because a reader who takes
+            # this number for a limit will misread every later line about a
+            # job that was larger and printed anyway.
+            log.info('%s: printer declares PDF up to %.0f MB; treated as '
+                     'advisory, since the device this was built for does not '
+                     'enforce its own', self.name,
+                     self.declared_pdf_bytes / 1e6)
 
     def note_formats(self, offered, kept):
         """Remember which raster format this printer will actually take.
@@ -436,6 +498,12 @@ class Config:
         self.archive_max_bytes = args.archive_max_bytes * 1024 * 1024
         self.convert_threshold = args.convert_threshold
         self.restrict_formats = not args.all_formats
+        # Not a prediction of what the printer will take -- nothing here
+        # predicts that any more. It is the size above which the converter is
+        # asked to rasterise on its own, which is a last resort for a document
+        # this proxy could not hand over whole whatever the printer thinks. 0,
+        # the default, means "do not pre-empt": offer the printer the outlined
+        # PDF and let it answer for itself. See converter_header().
         self.max_pdf_bytes = args.max_pdf_bytes * 1024 * 1024
 
     def base_http(self):
@@ -2079,19 +2147,33 @@ def unreachable(wfile, queue, msg, opname, exc):
     ipp_error(wfile, msg, 0x0502, b'the printer is not responding')
 
 
-def converter_header(queue, cfg, first=None, last=None, report=False):
+def converter_header(queue, cfg, first=None, last=None, report=False,
+                     sides=None, force_raster=False):
     """Tell the converter what this particular printer will accept.
 
     The converter runs with no network at all, deliberately, so it cannot ask
     the printer anything. Everything model-specific therefore travels with the
     document: which raster format and colour space to fall back to, at what
-    resolution, and how large a PDF the printer will take. A converter that
-    receives no header keeps its built-in defaults.
+    resolution, and how large a PDF to hand over before rasterising instead. A
+    converter that receives no header keeps its built-in defaults.
 
     `first` and `last` ask for one range of pages, 1-based and inclusive at both
     ends. `report` asks the converter to say how many pages the input has, which
     is the only honest way to plan a split -- counting them here would mean
     parsing a PDF outside the sandbox that exists to contain exactly that.
+
+    `sides` is the client's own word, relayed so that the converter can put the
+    right duplex byte in a raster stream. Measured on paper: for a URF document
+    that byte decides, and the IPP `sides` attribute beside it does not -- a job
+    sent as two-sided-long-edge with a stream declaring one-sided came back
+    successful, reported two impressions, and produced two simplex sheets. So
+    the converter has to be told, and nothing here may invent it: no `sides` in
+    the job means no `sides` in the header.
+
+    `force_raster` is how a document the printer has already refused is asked
+    for again. There is no separate field for it: `maxpdf=0` means every
+    outlined document is over the limit, which is exactly "rasterise this",
+    and it needs no change on the converter's side.
     """
     queue.learn()          # a no-op once it has succeeded; retries if it has not
     if not queue.raster_format:
@@ -2100,8 +2182,24 @@ def converter_header(queue, cfg, first=None, last=None, report=False):
         fields = [f'device={queue.raster_device}',
                   f'colorspace={queue.raster_colorspace}',
                   f'dpi={queue.raster_dpi}']
-    limit = queue.max_pdf_bytes or cfg.max_pdf_bytes
+    # What the printer declares it accepts is not used here; it was measured not
+    # to be what the printer enforces (see Queue.learn), so a job is offered
+    # whole and rasterised only if the printer actually refuses it. The
+    # converter still needs a number for its own last resort, and the only
+    # honest one left is the largest converted document this proxy would accept
+    # back at all: below that, rasterising could only ever throw away fidelity
+    # the printer might have taken.
+    limit = 0 if force_raster else (cfg.max_pdf_bytes or MAX_CONVERTED)
     fields.append(f'maxpdf={limit}')
+    if sides is not None:
+        if sides in SIDES_VALUES:
+            fields.append(f'sides={sides}')
+        else:
+            # Neither substituted nor guessed at: the converter is simply not
+            # told, and keeps whatever it would have done without this field.
+            log.info('%s: not relaying sides=%r to the converter; it is not '
+                     'one of %s', queue.name, sides[:40],
+                     ', '.join(SIDES_VALUES))
     if first is not None:
         fields.append(f'first={int(first)}')
     if last is not None:
@@ -2184,11 +2282,16 @@ def _failed(cfg, data, why):
     return data, f'relayed ({why})'
 
 
-def convert(cfg, data, fmt, queue=None):
+def convert(cfg, data, fmt, queue=None, sides=None, force_raster=False):
     """Outline the text of a PDF. Anything else is relayed untouched.
 
     Fails safe: on any doubt the original is forwarded, because a job that
     might not print beats one that prints something wrong.
+
+    `sides` is the client's own value, handed on so the converter can set the
+    duplex byte of a raster stream; `force_raster` asks for raster rather than
+    an outlined PDF, and is only ever set after a printer has refused the PDF.
+    Both travel in the converter's header line -- see converter_header().
     """
     if not cfg.convert or not data:
         return data, 'relayed'
@@ -2218,15 +2321,16 @@ def convert(cfg, data, fmt, queue=None):
 
     started = time.time()
     try:
+        header = (converter_header(queue, cfg, sides=sides,
+                                   force_raster=force_raster)
+                  if queue else b'')
         if cfg.converter_socket:
-            out = convert_over_socket(cfg.converter_socket,
-                                      converter_header(queue, cfg) + payload,
+            out = convert_over_socket(cfg.converter_socket, header + payload,
                                       cfg.timeout)
         else:
             # start_new_session so a timeout can kill the whole group:
             # terminating the helper leaves Ghostscript itself running.
-            payload = converter_header(queue, cfg) + payload if queue \
-                else payload
+            payload = header + payload
             proc = subprocess.Popen(
                 [cfg.converter], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2257,8 +2361,116 @@ def convert(cfg, data, fmt, queue=None):
     if b'/FontFile' in out:
         log.warning('font programs survived conversion')
         return _failed(cfg, data, 'fonts survived')
-    return out, (f'outlined {len(data)} -> {len(out)} bytes in '
+    what = 'rasterised' if force_raster else 'outlined'
+    return out, (f'{what} {len(data)} -> {len(out)} bytes in '
                  f'{time.time() - started:.1f}s (font cost {cost})')
+
+
+def refused_document(status, raw):
+    """Read a reply as "no job was created, and the document is why".
+
+    Returns the printer's own status when it is one of RETRY_AS_RASTER, and
+    None for everything else -- including a reply that cannot be parsed at all.
+    Silence and nonsense are not evidence that no job exists, and only that
+    evidence makes sending the document again safe.
+    """
+    if status != 200:
+        return None
+    try:
+        code = ipp.parse(raw).code
+    except Exception:
+        return None
+    return code if code in RETRY_AS_RASTER else None
+
+
+def rasterise_after_refusal(cfg, queue, msg, original, fmt, sides, refusal):
+    """Convert again as raster, for a document the printer has just refused.
+
+    Returns (payload, note) to send instead, or (None, None) when there is
+    nothing better to offer -- in which case the printer's refusal reaches the
+    client exactly as it did before this existed.
+
+    This is the whole reason the proxy no longer guesses at a size limit. The
+    printer declares one it does not enforce, so the only reliable way to learn
+    that a document is too large is to offer it and be told. That is safe here
+    and nowhere else: every status in RETRY_AS_RASTER means no job was created,
+    so this cannot be the second copy of anything.
+    """
+    if not cfg.convert or not queue.raster_format:
+        return None, None          # there is nothing else this proxy can make
+    if not looks_like_pdf(msg.data):
+        # Already raster, or never a PDF to begin with. Offering the same bytes
+        # again would earn the same refusal.
+        return None, None
+    why = RETRY_AS_RASTER[refusal]
+    try:
+        data, note = convert(cfg, original, fmt, queue, sides=sides,
+                             force_raster=True)
+    except ConversionFailed as exc:
+        log.warning('%s: the printer refused the document (%s) and it could '
+                    'not be rasterised (%s)', queue.name, why, exc)
+        return None, None
+    produced = sniff_format(data)
+    if data is original or produced is None or produced == fmt \
+            or produced == 'application/pdf':
+        log.warning('%s: the printer refused the document (%s) and the '
+                    'converter had no raster to offer instead', queue.name, why)
+        return None, None
+    msg.data = data
+    group = msg.operation()
+    if group is not None:
+        group.replace('document-format', ipp.TAG_MIMETYPE, [produced])
+    log.warning('%s: the printer refused the document (%s); converting again '
+                'and sending it as %s. The refused attempt created no job, '
+                'which is what that status means, so nothing prints twice',
+                queue.name, why, produced)
+    return ipp.serialize(msg), f'{note}; refused {why}, sent as {produced}'
+
+
+def job_sides(msg):
+    """The `sides` a client asked for, from the job group of its own request.
+
+    That group and no other. The value is relayed verbatim or not at all, so
+    there is nowhere else it could honestly come from.
+    """
+    group = msg.group(ipp.JOB_ATTRS)
+    return group.get_str('sides') if group else None
+
+
+def warn_sides_without_media(queue, msg):
+    """Say so when a duplex request is about to be dropped by the printer.
+
+    Measured on an M283fdw: `sides=two-sided-long-edge` sent on its own comes
+    back 0x0001 successful-ok-ignored-or-substituted-attributes with `sides`
+    among the unsupported attributes, and the job prints one-sided. Adding
+    `media=na_letter_8.5x11in` to the same job makes it answer 0x0000 and
+    genuinely duplex. The device publishes `job-constraints-supported:
+    duplex-unsupported-media` and resolves that constraint by discarding
+    `sides` instead of applying `media-default`, which RFC 8011 5.2 requires.
+
+    Nothing is added to the job to paper over it. `media-supported` on this
+    device also lists `custom_min_3x5in` and `custom_max_8.5x14in`, which are
+    range descriptors and are refused when actually requested -- so the
+    advertised list is not a list of things a proxy may pick from. And no value
+    is neutral: an absent `media` is a request to auto-select, not a gap, so
+    supplying one would choose the user's paper for them. All this does is turn
+    a silent surprise into one line in the journal.
+    """
+    group = msg.group(ipp.JOB_ATTRS)
+    if group is None:
+        return
+    sides = group.get_str('sides')
+    if not sides or not sides.startswith('two-sided'):
+        return
+    # media-col names a size too, so a client that sent one has chosen paper
+    # and the printer's constraint has something to resolve against.
+    if group.index_of('media') >= 0 or group.index_of('media-col') >= 0:
+        return
+    log.warning('%s: %s was asked for with no media in the same job. This '
+                'printer discards sides rather than applying media-default, '
+                'so the job will print one-sided and say it succeeded. No '
+                'media is added here: there is no neutral value, and choosing '
+                "one picks the user's paper for them", queue.name, sides[:40])
 
 
 # ---------------------------------------------------------------------------
@@ -2733,18 +2945,37 @@ class Handler(socketserver.BaseRequestHandler):
         fmt = None
         archived = None
 
+        # Every operation that can carry a client's job attributes, which is
+        # not the same set as the ones that carry a document: a Create-Job
+        # names the sides and the Send-Document after it carries the pages.
+        if msg.code in (OP_PRINT_JOB, OP_CREATE_JOB, OP_SEND_DOCUMENT):
+            warn_sides_without_media(queue, msg)
+
         if msg.code in (OP_PRINT_JOB, OP_SEND_DOCUMENT) and msg.data:
             group = msg.operation()
             fmt = group.get_str('document-format') if group else None
+            # What the client asked for, relayed to the converter untouched. A
+            # raster stream carries its own duplex byte and that byte is what
+            # the printer obeys, so the converter has to be told; see
+            # converter_header(). The job goes upstream unchanged either way.
+            #
+            # NOTE, pinned as it is: a client that uses Create-Job puts its
+            # sides on the Create-Job, which carries no document, and the
+            # Send-Document that carries the pages usually repeats nothing. So
+            # on that path the converter is not told. Remembering it would mean
+            # holding per-job state in a proxy that deliberately holds none,
+            # and inventing it is exactly what must not happen -- so the
+            # converter keeps its default, as it did before this field existed.
+            sides = job_sides(msg)
             # One job at a time: these printers report
             # multiple-document-jobs-supported = false, and a second job
             # arriving mid-transfer confuses them.
             original = msg.data
             try:
-                msg.data, note = convert(cfg, msg.data, fmt, queue)
-                # Conversion may legitimately change the format: an outlined
-                # document too large for the printer to accept as a PDF comes
-                # back as raster. Say so, rather than mislabelling it.
+                msg.data, note = convert(cfg, msg.data, fmt, queue, sides=sides)
+                # Conversion may legitimately change the format: a document
+                # the converter would not hand over whole comes back as raster
+                # instead. Say so, rather than mislabelling it.
                 if msg.data is not original:
                     produced = sniff_format(msg.data)
                     if produced and produced != fmt and group is not None:
@@ -2762,27 +2993,44 @@ class Handler(socketserver.BaseRequestHandler):
                 fmt, original, note)
             rewrite_request(queue, msg)
             payload = ipp.serialize(msg)
-            if not queue.lock.acquire(timeout=cfg.timeout):
-                log.warning('%s: busy, refusing job', queue.name)
-                # 0x0507 is server-error-busy, which a print system understands
-                # as "try again" -- where an HTTP 503 with a line of English
-                # reads as the server being broken.
-                ipp_error(wfile, msg, 0x0507,
-                          b'the printer is busy with another job')
-                return
-            failure = None
-            try:
-                status, raw = upstream_ipp(queue, payload, cfg.timeout)
-            except UPSTREAM_ERRORS as exc:
-                failure = exc
-            finally:
-                # Release before answering. Writing to a client can block for as
-                # long as that client cares to take, and holding the queue lock
-                # across it would let one slow reader stall every other job.
-                queue.lock.release()
-            if failure is not None:
-                unreachable(wfile, queue, msg, name, failure)
-                return
+            # Two attempts at most, and the second only after an answer that
+            # says the printer created no job. The bound is the loop itself:
+            # there is no path round it a third time.
+            for attempt in (1, 2):
+                if not queue.lock.acquire(timeout=cfg.timeout):
+                    log.warning('%s: busy, refusing job', queue.name)
+                    # 0x0507 is server-error-busy, which a print system
+                    # understands as "try again" -- where an HTTP 503 with a
+                    # line of English reads as the server being broken.
+                    ipp_error(wfile, msg, 0x0507,
+                              b'the printer is busy with another job')
+                    return
+                failure = None
+                try:
+                    status, raw = upstream_ipp(queue, payload, cfg.timeout)
+                except UPSTREAM_ERRORS as exc:
+                    failure = exc
+                finally:
+                    # Release before answering. Writing to a client can block
+                    # for as long as that client cares to take, and holding the
+                    # queue lock across it would let one slow reader stall
+                    # every other job.
+                    queue.lock.release()
+                if failure is not None:
+                    # No answer at all. The printer may be holding the job it
+                    # just read, so this is precisely the case that must never
+                    # be sent again -- doing so prints it twice.
+                    unreachable(wfile, queue, msg, name, failure)
+                    return
+                refusal = (refused_document(status, raw) if attempt == 1
+                           else None)
+                if refusal is None:
+                    break
+                retry, retry_note = rasterise_after_refusal(
+                    cfg, queue, msg, original, fmt, sides, refusal)
+                if retry is None:
+                    break            # nothing better to offer; relay the refusal
+                payload, note = retry, retry_note
         else:
             rewrite_request(queue, msg)
             try:
@@ -3106,12 +3354,17 @@ def build_parser():
                              'synthetic documents well and real browser output '
                              'poorly, and converting is cheap. Set a threshold '
                              'only if you have measured your own workload')
-    parser.add_argument('--max-pdf-bytes', type=int, default=60,
+    parser.add_argument('--max-pdf-bytes', type=int, default=0,
                         metavar='MB',
-                        help='rasterise rather than send an outlined PDF larger '
-                             'than this. Overridden by the printer\'s own '
-                             'pdf-k-octets-supported when it reports one '
-                             '(default: 60)')
+                        help='have the converter rasterise an outlined PDF '
+                             'larger than this instead of sending it. The '
+                             'default of 0 sends it and lets the printer '
+                             'answer for itself, because the size a printer '
+                             'declares it accepts was measured not to be the '
+                             'size it enforces; a job the printer does refuse '
+                             'is converted again as raster and resent. Set a '
+                             'number only for a device measured to refuse '
+                             'oversized jobs in some way this cannot detect')
     parser.add_argument('--all-formats', action='store_true',
                         help='offer clients every format the printer '
                              'supports, including PostScript. PostScript is '

@@ -593,6 +593,173 @@ with FakePrinter(mode='silent_loss') as printer:
 # ...and nothing is left running afterwards.
 assert threading.active_count() == before, 'the mock leaked a thread'
 PY2
+# Four things measured on the real device, each of which was a paragraph
+# somebody had to remember. Modelled in the mock so that code which forgets one
+# fails a test rather than a sheet of paper. Each block is its own check, so a
+# regression names the finding it broke.
+python3 - <<'PY2' && ok 'sides is ignored unless media is sent with it' || bad 'sides quirk'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+from fakeprinter import FakePrinter, job_request, post
+
+SIDES = ('sides', ipp.TAG_KEYWORD, ['two-sided-long-edge'])
+MEDIA = ('media', ipp.TAG_KEYWORD, ['na_letter_8.5x11in'])
+
+
+def submit(printer, request_id, job_attrs):
+    msg = job_request(0x0002, request_id, printer.uri, job_attrs=job_attrs,
+                      document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    msg.data = b'%PDF-1.4\n'
+    return post(printer, msg)
+
+
+with FakePrinter() as printer:
+    # sides on its own: the job is taken, the request is dropped, and the
+    # printer says so. 0x0001 is
+    # successful-ok-ignored-or-substituted-attributes.
+    reply = submit(printer, 1, [SIDES])
+    assert reply.code == 0x0001, hex(reply.code)
+    unsupported = reply.group(ipp.UNSUPPORTED_ATTRS)
+    assert unsupported is not None, 'sides was dropped without saying so'
+    assert unsupported.get_str('sides') == 'two-sided-long-edge'
+    job = printer.jobs[-1]
+    assert (job.sides, job.sides_ignored) == (None, True)
+    assert job.duplexed is not True, 'a dropped sides must not duplex'
+    printer.clock.advance(5)
+    printer.clock.advance(5)
+
+    # The same request with media beside it in the same job group: taken, and
+    # this time applied. This is the whole quirk -- the device resolves its
+    # duplex-unsupported-media constraint by discarding sides rather than by
+    # applying media-default, as RFC 8011 5.2 requires.
+    reply = submit(printer, 2, [SIDES, MEDIA])
+    assert reply.code == 0x0000, hex(reply.code)
+    assert reply.group(ipp.UNSUPPORTED_ATTRS) is None, 'nothing to complain of'
+    job = printer.jobs[-1]
+    assert (job.sides, job.sides_ignored) == ('two-sided-long-edge', False)
+    assert job.duplexed is True
+
+    # A job asking for nothing is unaffected either way.
+    printer.clock.advance(5)
+    printer.clock.advance(5)
+    reply = submit(printer, 3, [])
+    assert reply.code == 0x0000 and reply.group(ipp.UNSUPPORTED_ATTRS) is None
+PY2
+
+python3 - <<'PY2' && ok 'the URF duplex byte decides, not the sides attribute' || bad 'urf duplex byte'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+from fakeprinter import FakePrinter, job_request, post, urf_document, parse_urf
+
+# Byte 14 of the stream: byte 2 of the first 32-byte page header, after the
+# 8-byte magic and the 4-byte page count.
+stream = urf_document(pages=2, duplex=1)
+assert stream[14] == 1 and parse_urf(stream).duplex == 1
+assert parse_urf(b'%PDF-1.4\n') is None, 'only a URF stream has a duplex byte'
+assert parse_urf(b'UNIRAST\x00\x00\x00\x00\x01') is None, 'a truncated header'
+
+with FakePrinter() as printer:
+    msg = job_request(0x0002, 1, printer.uri,
+                      document_format=(ipp.TAG_MIMETYPE, ['image/urf']),
+                      job_attrs=[('sides', ipp.TAG_KEYWORD,
+                                  ['two-sided-long-edge']),
+                                 ('media', ipp.TAG_KEYWORD,
+                                  ['na_letter_8.5x11in'])])
+    msg.data = stream
+    reply = post(printer, msg)
+    # Measured on paper: 0x0000, nothing in unsupported-attributes, two
+    # impressions, completed -- and two simplex sheets.
+    assert reply.code == 0x0000, hex(reply.code)
+    assert reply.group(ipp.UNSUPPORTED_ATTRS) is None
+    job = printer.jobs[-1]
+    assert job.sides == 'two-sided-long-edge', 'the attribute was accepted'
+    assert job.urf_duplex == 1, job.urf_duplex
+    assert job.duplexed is False, 'the stream must beat the attribute'
+    for _ in range(3):
+        printer.clock.advance(5)
+    assert (job.state, job.impressions) == (9, 2), (job.state, job.impressions)
+PY2
+
+python3 - <<'PY2' && ok 'an unreadable raster stream aborts the job' || bad 'malformed raster'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+from fakeprinter import FakePrinter, job_request, post, urf_document
+
+
+def send(printer, request_id, data):
+    msg = job_request(0x0002, request_id, printer.uri,
+                      document_format=(ipp.TAG_MIMETYPE, ['image/urf']))
+    msg.data = data
+    return post(printer, msg)
+
+
+with FakePrinter() as printer:
+    # A colour space the device does not implement, which is what Ghostscript
+    # produces when nobody passes -dcupsColorSpace. Measured: job-state 8,
+    # aborted, 0 impressions -- and a physical error page, which is the part
+    # this mock cannot model. The job is still accepted at the protocol level.
+    assert send(printer, 1, urf_document(colorspace=7)).code == 0x0000
+    job = printer.jobs[-1]
+    assert (job.state, job.impressions) == (8, 0), (job.state, job.impressions)
+    assert job.state not in (3, 5, 9), 'aborted, not silently dropped'
+    printer.clock.advance(5)
+    assert printer.jobs[-1].state == 8, 'an aborted job does not resume'
+
+    # Truncated, and headerless: neither is something a marking engine can read.
+    assert send(printer, 2, b'UNIRAST\x00\x00\x00\x00\x01').code == 0x0000
+    assert printer.jobs[-1].state == 8
+    assert send(printer, 3, b'not a raster stream at all').code == 0x0000
+    assert printer.jobs[-1].state == 8
+
+    # ...while a stream it can read is not aborted.
+    assert send(printer, 4, urf_document(colorspace=19)).code == 0x0000
+    assert printer.jobs[-1].state == 3, printer.jobs[-1].state
+PY2
+
+python3 - <<'PY2' && ok 'an oversized PDF is accepted unless the cap is enforced' || bad 'pdf cap'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+from fakeprinter import (FakePrinter, declared_pdf_cap, job_request, post)
+
+# The cap comes from the captured attributes, not from a number written here.
+assert declared_pdf_cap() == 75000 * 1024, declared_pdf_cap()
+
+OVERSIZED = b'%PDF-1.4\n' + b'x' * 200
+
+
+def send(printer, request_id, data):
+    msg = job_request(0x0002, request_id, printer.uri,
+                      document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    msg.data = data
+    return post(printer, msg)
+
+
+# A cap small enough to cross in a test. The real one is 76.8 MB, and the
+# device printed a 92.5 MB PDF through it.
+with FakePrinter(pdf_cap=64) as printer:
+    assert send(printer, 1, OVERSIZED).code == 0x0000, 'the cap is advisory'
+    assert len(printer.jobs) == 1
+    printer.clock.advance(5)
+    printer.clock.advance(5)
+
+    # Enforced on demand, which is the only way to test what the proxy does
+    # about a refusal. 0x0408 is client-error-request-entity-too-large.
+    printer.mode = 'enforce_pdf_cap'
+    assert send(printer, 2, OVERSIZED).code == 0x0408
+    assert len(printer.jobs) == 1, 'a refused document must create no job'
+    # Which is what makes sending something else instead safe.
+    assert send(printer, 3, b'%PDF-1.4\n').code == 0x0000
+    assert len(printer.jobs) == 2
+PY2
+
 
 # What the proxy actually puts on the wire for one Print-Job, byte for byte.
 # Every attribute here is either forwarded untouched, rewritten, or stripped,
@@ -970,6 +1137,273 @@ with FakePrinter(mode='accept_then_drop_response') as printer:
     assert queue.lock.acquire(blocking=False), 'the queue lock was not released'
     queue.lock.release()
 PY2
+# The reject-then-rasterise path. It needs a converter, and Ghostscript is slow
+# and its output is not byte-stable, so this stands in for one: it answers the
+# header line rather than the document, which is exactly what is being tested
+# here -- who decides to rasterise, and how that decision is expressed.
+cat > "$work/stubconv" <<'STUB'
+#!/usr/bin/env python3
+"""A converter that only reads its header line. See selftest.sh."""
+import os
+import struct
+import sys
+
+data = sys.stdin.buffer.read()
+line, _, document = data.partition(b'\n')
+fields = dict(f.split(b'=', 1) for f in line.split()[1:] if b'=' in f)
+with open(os.path.abspath(sys.argv[0]) + '.log', 'a') as handle:
+    handle.write(line.decode('utf-8', 'replace') + '\n')
+if fields.get(b'maxpdf') == b'0':
+    # maxpdf=0 is how the proxy asks for raster: everything is over the limit.
+    # The duplex byte follows the sides field, which is the whole reason that
+    # field exists.
+    duplex = 1 if fields.get(b'sides', b'one-sided') == b'one-sided' else 2
+    header = bytes([8, int(fields.get(b'colorspace', b'19')), duplex, 0])
+    sys.stdout.buffer.write(b'UNIRAST\0' + struct.pack('>I', 1)
+                            + header + bytes(28) + bytes(64))
+else:
+    sys.stdout.buffer.write(b'%PDF-1.4\n% outlined\n' + document)
+STUB
+chmod +x "$work/stubconv"
+
+python3 - "$work" <<'PY2' && ok 'a document the printer refuses is resent as raster, once' || bad 'raster retry'
+import logging, os, sys
+work = sys.argv[1]
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)          # the retry is announced loudly
+import ippcodec as ipp
+import ippfix
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+CONVERTER = os.path.join(work, 'stubconv')
+HEADERS = CONVERTER + '.log'
+DOCUMENT = b'%PDF-1.4\n' + b'body line\n' * 20
+
+
+def run(mode):
+    """One Print-Job through the proxy. Returns what everybody saw."""
+    open(HEADERS, 'w').close()
+    with FakePrinter(mode=mode, pdf_cap=64) as printer:
+        cfg, queue = proxy_for(printer, extra=['--converter', CONVERTER])
+        cfg.convert = True             # proxy_for turns it off; this needs it
+        msg = job_request(
+            0x0002, 1, 'ipp://192.0.2.10/ipp/office',
+            document_format=(ipp.TAG_MIMETYPE, ['application/pdf']),
+            job_attrs=[('sides', ipp.TAG_KEYWORD, ['two-sided-long-edge']),
+                       ('media', ipp.TAG_KEYWORD, ['na_letter_8.5x11in'])])
+        msg.data = DOCUMENT
+        answer = relay(cfg, msg)
+        jobs = [ipp.parse(raw) for op, raw in printer.requests if op == 0x0002]
+        with open(HEADERS) as handle:
+            return answer, list(printer.jobs), jobs, handle.read().splitlines()
+
+
+# What the real device does: it declares a cap and does not enforce it. The
+# outlined PDF goes as a PDF, at full fidelity, and nothing is retried.
+answer, jobs, sent, headers = run(None)
+assert answer.ipp.code == 0x0000, hex(answer.ipp.code)
+assert len(sent) == 1, f'the job was sent {len(sent)} times'
+assert sent[0].operation().get_str('document-format') == 'application/pdf'
+assert sent[0].data.startswith(b'%PDF-'), sent[0].data[:16]
+assert len(jobs) == 1
+# Nothing pre-empts the printer's answer any more: the only ceiling the
+# converter is given is the largest document this proxy would take back at all.
+assert len(headers) == 1, headers
+assert f'maxpdf={ippfix.MAX_CONVERTED}' in headers[0], headers[0]
+assert 'sides=two-sided-long-edge' in headers[0], headers[0]
+
+# And the same job against a printer that does enforce it: refused with 0x0408
+# before any job exists, converted again as raster, sent once more, accepted.
+answer, jobs, sent, headers = run('enforce_pdf_cap')
+assert answer.ipp.code == 0x0000, hex(answer.ipp.code)
+assert len(sent) == 2, f'expected one retry, got {len(sent)} attempts'
+assert sent[0].data.startswith(b'%PDF-')
+assert sent[1].operation().get_str('document-format') == 'image/urf'
+assert sent[1].data.startswith(b'UNIRAST'), sent[1].data[:16]
+# One job on the printer, not two. The refused attempt created nothing, which
+# is the only reason resending is allowed at all.
+assert len(jobs) == 1, f'{len(jobs)} jobs exist upstream'
+assert jobs[0].urf_duplex is not None, 'the raster was not readable'
+# The retry asks for raster by saying everything is too large, and carries the
+# client's sides with it so the stream's duplex byte can follow.
+assert 'maxpdf=0' not in headers[0] and 'maxpdf=0' in headers[1], headers
+assert 'sides=two-sided-long-edge' in headers[1], headers[1]
+# The client is told about the job that exists, not about the refusal.
+assert answer.ipp.group(ipp.JOB_ATTRS).get_int('job-id') == jobs[0].id
+
+
+# And the list of answers that justify any of that, which is the thing that
+# must not grow carelessly. Each of these means the printer created no job and
+# the document was the reason; everything else reaches the client untouched.
+def reply(code):
+    return ipp.serialize(ipp.Message(code=code, request_id=1))
+
+
+for code in (0x0408, 0x040A, 0x0411):
+    assert ippfix.refused_document(200, reply(code)) == code, hex(code)
+# Busy, out of paper, too many jobs, a plain success: none of them say the
+# document was unacceptable, and several would be a second try at the same job.
+for code in (0x0000, 0x0001, 0x0400, 0x0404, 0x0500, 0x0502, 0x0505, 0x0506,
+             0x0507, 0x0509, 0x050B):
+    assert ippfix.refused_document(200, reply(code)) is None, hex(code)
+# Nor is anything this proxy could not read, or did not get over HTTP 200.
+assert ippfix.refused_document(200, b'not an IPP message') is None
+assert ippfix.refused_document(500, reply(0x0408)) is None
+PY2
+
+# The distinction the retry rests on, in the one case where it must not fire.
+python3 - "$work" <<'PY2' && ok 'a lost answer is not resent, with the retry armed' || bad 'lost response with retry'
+import logging, os, sys
+work = sys.argv[1]
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+logging.disable(logging.CRITICAL)
+import ippcodec as ipp
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+CONVERTER = os.path.join(work, 'stubconv')
+HEADERS = CONVERTER + '.log'
+open(HEADERS, 'w').close()
+
+# Everything the retry needs is available here -- conversion is on, a raster
+# format is learned, the printer would take a raster. The only thing missing is
+# an answer, and that is the whole point: the printer has read the document and
+# may be printing it. Resending would print it twice.
+with FakePrinter(mode='accept_then_drop_response', pdf_cap=64) as printer:
+    cfg, queue = proxy_for(printer, extra=['--converter', CONVERTER])
+    cfg.convert = True
+    msg = job_request(0x0002, 1, 'ipp://192.0.2.10/ipp/office',
+                      document_format=(ipp.TAG_MIMETYPE, ['application/pdf']))
+    msg.data = b'%PDF-1.4\n' + b'lost\n' * 20
+    answer = relay(cfg, msg)
+
+    assert answer.ipp.code == 0x0502, hex(answer.ipp.code)
+    assert [op for op, _raw in printer.requests].count(0x0002) == 1, \
+        'the job was sent again after a lost answer'
+    assert len(printer.jobs) == 1, printer.jobs
+    with open(HEADERS) as handle:
+        assert len(handle.read().splitlines()) == 1, 'it converted again'
+    assert queue.lock.acquire(blocking=False), 'the queue lock was not released'
+    queue.lock.release()
+PY2
+
+python3 - <<'PY2' && ok 'sides reaches the converter, and a retry asks for raster' || bad 'converter sides header'
+import sys
+sys.path.insert(0, '.')
+import ippfix
+
+args = ippfix.build_parser().parse_args(['t=ipp://p.example/ipp/print'])
+queue = ippfix.parse_queue('t=ipp://p.example/ipp/print')
+cfg = ippfix.Config(args, [queue])
+queue.learned = True          # do not go to the network for this
+
+plain = ippfix.converter_header(queue, cfg)
+assert b'sides=' not in plain, 'a sides nobody asked for was invented'
+# No pre-emptive ceiling by default: the printer answers for itself now.
+assert f'maxpdf={ippfix.MAX_CONVERTED}'.encode() in plain, plain
+
+for value in ippfix.SIDES_VALUES:
+    header = ippfix.converter_header(queue, cfg, sides=value)
+    assert f'sides={value}'.encode() in header, header
+
+# Anything else is dropped rather than substituted. The value is written into a
+# line of whitespace-separated fields the converter parses, so one carrying a
+# space would let whoever sent the job add a field of their own.
+for bogus in ('two-sided', '', 'ONE-SIDED', 'one-sided device=uniprint',
+              'one-sided\nmaxpdf=0'):
+    assert b'sides=' not in ippfix.converter_header(queue, cfg, sides=bogus), \
+        repr(bogus)
+
+# A retry asks for raster the only way there is to ask: everything is over the
+# limit. The client's sides goes with it, because the stream's duplex byte is
+# what the printer will actually obey.
+forced = ippfix.converter_header(queue, cfg, sides='one-sided',
+                                 force_raster=True)
+assert b'maxpdf=0' in forced and b'sides=one-sided' in forced, forced
+
+# A site that has measured a printer which really does refuse oversized jobs
+# can still put the ceiling back.
+cfg.max_pdf_bytes = 1234
+assert b'maxpdf=1234' in ippfix.converter_header(queue, cfg)
+PY2
+
+python3 - <<'PY2' && ok 'sides without media is logged, not quietly fixed' || bad 'sides without media'
+import logging, sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+import ippfix
+from fakeprinter import FakePrinter, proxy_for, relay, job_request
+
+seen = []
+
+
+class Grab(logging.Handler):
+    def emit(self, record):
+        seen.append(record.getMessage())
+
+
+ippfix.log.addHandler(Grab())
+ippfix.log.propagate = False          # keep the test's own output clean
+ippfix.log.setLevel(logging.WARNING)
+
+SIDES = ('sides', ipp.TAG_KEYWORD, ['two-sided-long-edge'])
+MEDIA = ('media', ipp.TAG_KEYWORD, ['na_letter_8.5x11in'])
+
+
+def warned():
+    return [m for m in seen if 'print one-sided' in m]
+
+
+with FakePrinter() as printer:
+    cfg, queue = proxy_for(printer)
+
+    def send(request_id, job_attrs):
+        seen.clear()
+        msg = job_request(
+            0x0002, request_id, 'ipp://192.0.2.10/ipp/office',
+            document_format=(ipp.TAG_MIMETYPE, ['application/pdf']),
+            job_attrs=job_attrs)
+        msg.data = b'%PDF-1.4\nduplex\n'
+        answer = relay(cfg, msg)
+        printer.clock.advance(5)
+        printer.clock.advance(5)
+        return answer
+
+    send(1, [SIDES])
+    assert len(warned()) == 1, seen
+    # ...and nothing was done about it. The printer sees exactly what the
+    # client sent: a sides, and no media. There is no neutral media value to
+    # add, and adding one would choose the user's paper for them.
+    upstream = ipp.parse(printer.requests[-1][1]).group(ipp.JOB_ATTRS)
+    assert upstream.get_str('sides') == 'two-sided-long-edge'
+    assert upstream.index_of('media') < 0, 'a media value was invented'
+    assert upstream.index_of('media-col') < 0, 'a media-col was invented'
+
+    # Nothing to warn about when the client named paper itself...
+    send(2, [SIDES, MEDIA])
+    assert not warned(), seen
+    # ...nor when it asked for one-sided, which this printer does honour...
+    send(3, [('sides', ipp.TAG_KEYWORD, ['one-sided'])])
+    assert not warned(), seen
+    # ...nor when it asked for nothing at all.
+    send(4, [])
+    assert not warned(), seen
+
+    # A client using Create-Job names its sides on the operation that carries
+    # no document, so the warning has to come from the job attributes rather
+    # than from the path a document takes.
+    seen.clear()
+    created = relay(cfg, job_request(0x0005, 5, 'ipp://192.0.2.10/ipp/office',
+                                     job_attrs=[SIDES]))
+    # 0x0001, because the printer dropped the sides -- which is precisely what
+    # the journal line is there to explain, and it is relayed to the client
+    # untouched.
+    assert created.ipp.code == 0x0001, hex(created.ipp.code)
+    assert len(warned()) == 1, seen
+PY2
+
 
 # One job at a time, per printer. A second job arriving while one is in flight
 # has to be refused quickly rather than queued behind it, because the client is
