@@ -313,6 +313,105 @@ indistinguishable from a network problem; with one, the cause is not in doubt.
 It is worth spending an hour finding the equivalent on your hardware before
 theorising.
 
+## What this printer actually does
+
+Measured on an HP Color LaserJet Pro MFP M283fdw, firmware 20251014, and where
+noted confirmed on paper. Written down because almost none of it can be derived
+from the specification, and several items contradict what the device itself
+advertises. A printer of another make will differ; the method is the point.
+
+### Sizes and limits
+
+| | |
+|---|---|
+| `pdf-k-octets-supported` | `0..75000`, i.e. a 76.8 MB ceiling |
+| what actually printed | **92.5 MB**, 20% over, rendered completely |
+| `job-k-octets` | not supported; `Validate-Job` cannot be used to probe a size |
+| any raster size limit | none declared — no `urf-k-octets-supported`, no `job-k-octets-supported` |
+| reported memory | `MEM:MEM=213MB` in `printer-device-id` |
+
+**The declared PDF cap is advisory.** Both images in that 92.5 MB document
+rendered, including one occupying the second half of the file, so nothing was
+truncated. Do not treat the declared figure as a limit to design around without
+testing it; equally, do not assume the next printer ignores it.
+
+Only PDF declares a ceiling at all, which is probably not a coincidence: a PDF
+cannot be streamed, because the cross-reference table is at the end, so a
+printer must buffer or spool the whole thing. Raster is self-describing per page
+with no backward references and can be consumed as it arrives.
+
+### Page complexity
+
+250,000 filled paths on a single page rendered to completion. The test puts one
+marker as the first drawing operation of the page and another as the last; both
+appeared on paper. A renderer that gave up part way through a page would print
+the first and not the second. Nothing we can produce provokes it.
+
+### Duplex, and two ways to get it silently wrong
+
+**`sides` is ignored unless `media` is sent in the same job group.** Alone it
+comes back `0x0001` with `sides` in unsupported-attributes; with
+`media=na_letter_8.5x11in` beside it, `0x0000` and a genuinely duplexed sheet.
+This is a firmware defect: the device publishes
+`job-constraints-supported: duplex-unsupported-media` and fails closed when
+`media` is absent, where RFC 8011 §5.2 requires it to apply `media-default`.
+Every mainstream client always sends `media`, which is why nobody has noticed.
+
+That constraint is an exact-size allowlist, so **a custom page size cannot be
+duplexed at all**.
+
+**On the raster path the URF stream wins.** Ghostscript writes a duplex byte
+into each URF page header and defaults it to one-sided. A two-page URF carrying
+that default was sent with `sides=two-sided-long-edge`; the printer answered
+`0x0000` with nothing unsupported, reported two impressions, completed
+successfully — **and printed two simplex sheets**. So on raster the document
+decides and the IPP attribute is ignored. The converter must therefore be told
+what the job asked for; see the `sides=` field on the `%%ippfix` header.
+
+### Never synthesise a media value
+
+`media-supported` advertises `custom_min_3x5in` and `custom_max_8.5x14in`, and
+the printer **rejects both when they are requested**. They are range
+descriptors, not selectable media. So "choose a supported size" can choose one
+the device refuses.
+
+More generally, the absence of `media` is a client asking for automatic
+selection, not a gap to be filled. Supplying one pins the tray, suppresses the
+device's own size matching, and can scale A4 onto Letter without saying so. This
+proxy relays `media` and `sides` untouched and adds neither.
+
+### Failure and status
+
+| condition | what the printer reports |
+|---|---|
+| out of paper | `job-state 6` processing-stopped, **held indefinitely**, reason `printer-stopped` |
+| why it stopped | not in IPP — `other-error` only. The tray is visible **only over SNMP** (`prtInputStatus`) |
+| malformed PDF | `job-state 8` aborted, `document-format-error`, within three seconds |
+| malformed raster | `job-state 8` aborted, 0 impressions, **and a physical error page** naming a URP parser fault |
+| `Cancel-Job` on a held job | `0x0000`, clears cleanly |
+| `Cancel-Job` on a terminal job | `0x0404` client-error-not-possible |
+| unknown requested-attributes | silently dropped; no `unsupported-attributes` group, so absence is not evidence of a bad request |
+
+### Counters, and which to believe
+
+`job-media-sheets-completed` reported **2** for a job that physically produced
+**one** duplex sheet. It counts impressions. Do not use it.
+
+`prtMarkerCounterUnit` is 7 — impressions — on all three HP printers tested
+(M283fdw, M553, M430 MFP), so `prtMarkerLifeCount` compares directly with
+`job-impressions-completed` even on duplex jobs. **None of the three exposes a
+page counter over IPP at all**, which is why the cross-check reads it over SNMP.
+
+`hrPrinterStatus` is `other(1)` on a sleeping printer, not `idle(3)`. A
+readiness check built on it would call a healthy printer broken.
+
+### Jobs
+
+`multiple-document-jobs-supported` is false, so a job carries exactly one
+document. `multiple-operation-time-out` is 120 seconds with action
+`abort-job` — shorter than a large conversion takes, so Create-Job followed by
+Send-Document is not a way to hold a job open while working on it.
+
 ## Collecting evidence from real jobs
 
 If jobs are still being lost, the useful thing is the document itself.

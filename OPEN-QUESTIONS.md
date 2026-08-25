@@ -4,126 +4,41 @@ What is not solved, what is not understood, and what would be worth
 investigating next. Kept separate from `DIAGNOSING.md`, which records what *is*
 established.
 
-## The raster tier almost never helps, and long documents fall through it
+## The over-limit path, after splitting was abandoned
 
-Measured on this printer (`pdf-k-octets-supported = 0..75000`, so a 61.4 MB
-working limit) with synthetic body copy at two densities:
+The measurements that killed job splitting are in
+[DIAGNOSING.md](DIAGNOSING.md) under *What this printer actually does*. In
+short: the declared PDF cap is advisory, a 92.5 MB document printed, and a
+quarter of a million paths on one page rendered to completion.
 
-| | outlined PDF | URF raster 600 dpi | outlining time |
-|---|---|---|---|
-| dense, ~4200 chars/page | 649 KB/page | 2.46 MB/page | 0.51 s/page |
-| report, ~2500 chars/page | 387 KB/page | 1.53 MB/page | 0.31 s/page |
+What remains open is narrower and worth stating plainly.
 
-Three ceilings apply, and they are much closer together than they look:
+**Where the real limit is, nobody knows.** One success at 92.5 MB does not
+locate a ceiling; it only shows the declared one is not it. The design response
+is to stop guessing — send the outlined PDF and rasterise only if the printer
+refuses it — rather than to substitute a better guess. A refusal is a returned
+status, which means no job was created, which is what makes resending safe. A
+*lost* response is a different thing entirely and must never be retried: the
+printer may well have the job.
 
-| ceiling | dense | report |
-|---|---|---|
-| outlined PDF exceeds what the printer accepts | 92 pages | 155 pages |
-| raster exceeds `MAX_CONVERTED` (256 MB) | 109 pages | 175 pages |
-| conversion exceeds `--timeout` / `RuntimeMaxSec` (300 s) | 395 pages | 579 pages |
+**Raster page geometry against a job-level `media` has not been measured.**
+`defont` passes no `-dFIXEDMEDIA`, so Ghostscript writes each page's own
+MediaBox into the URF, and a mixed-size document produces a stream of
+differently-sized raster pages. On the PDF path a disagreement between document
+geometry and the job's `media` is resolved by interpretation; on the raster path
+the bitmap is already at device resolution and the printer can only scale, clip
+or reject. Which of the three this device does is unknown and would cost paper
+to find out.
 
-**The raster tier therefore only helps for documents between about 155 and 175
-pages** (92–109 for dense text) — a window under twenty pages wide. Shorter
-documents never reach it. Longer ones produce a raster larger than
-`MAX_CONVERTED`, so conversion is abandoned and the **original is relayed
-unconverted**, which is the one outcome the proxy exists to avoid. Verified by
-lowering the ceiling and watching `convert()` return `relayed (too large)`.
+If geometry ever does need normalising, `-dFIXEDMEDIA` alone **clips** — a
+Legal page truncated at 792pt, which looks like a successful print.
+`-dPDFFitPage` is required with it.
 
-So a 200-page report is sent to the printer with its fonts intact today. It
-will usually print, because most pages are ordinary — but it is exactly the
-unprotected case, and it is reached by an ordinary document rather than a
-pathological one.
-
-Raising `MAX_CONVERTED` widens the window but does not fix the shape: 500 report
-pages would mean pushing 765 MB of raster at a printer, and the timeout ceiling
-arrives soon after. The tier is the wrong shape for the problem.
-
-**Splitting is the fix that has the right shape.** Convert everything, as now,
-and when the outlined result will not fit, send it as several upstream jobs
-whose pages add up to the original. That keeps vector text, keeps every page
-converted, and has no size ceiling at all. What it costs is in
-[the note below](#splitting-an-over-large-job).
-
-### Splitting an over-large job
-
-Not yet implemented; recorded so the design questions are not rediscovered.
-
-`multiple-document-jobs-supported` is **false** on this printer, so several
-chunks cannot be sent as one job with repeated `Send-Document`. It has to be
-several separate jobs, and the client must not be able to tell:
-
-- **Identity.** The client is told one job id and polls it. The proxy has to map
-  that id onto N upstream ids, and answer `Get-Job-Attributes` by aggregating:
-  the state of the chunk still running, and `job-impressions-completed` summed
-  across those finished.
-- **Cancellation.** `Cancel-Job` on the client's id must cancel every chunk not
-  yet printed, and there is no way to recall what already came out.
-- **Ordering.** Nothing else may interleave, so the queue lock has to be held
-  across the whole sequence rather than around one exchange.
-- **Partial failure.** If chunk three is rejected, chunks one and two are
-  already on paper. The client has to be told the job failed, and the report
-  needs to say how far it got.
-- **Where the split happens.** Splitting a PDF means parsing one, which is
-  deliberately confined to the converter. The cleanest form is a page range
-  passed to the converter (`-dFirstPage`/`-dLastPage`) and called once per
-  chunk, which re-reads a small input rather than inventing a framing protocol
-  for several documents on one socket.
-- **When it triggers.** Only when the outlined result would exceed what the
-  printer declares it accepts. Never on page count, and never as a way to avoid
-  converting.
-
-### Two costs accepted deliberately
-
-Both were put to the operator and accepted, on the reasoning that they apply
-only to documents past about a hundred pages, which are rare, and that wanting
-several copies of one is rarer still.
-
-- **The queue is held for the whole sequence.** `multiple-document-jobs-supported`
-  is false, so the chunks cannot share a job and nothing else may interleave
-  between them. A 200-page job holds the printer for roughly two minutes, and
-  other clients get `503` for that time rather than being queued.
-- **`copies > 1` is refused rather than split.** Sending each chunk N times
-  yields fragments in the order 1,1,1,2,2,2 instead of collated sets, and
-  collation across separate jobs cannot be verified without printing it.
-
-### What the printer does when it cannot get paper — measured
-
-Asked for A4 while only `na_letter` was loaded, with a valid one-page document
-(2026-08-24, firmware 20251014). No sheet was consumed.
-
-```
-job-state = 6 (processing-stopped)   held for the full 48s observed, indefinitely
-job-state-reasons = printer-stopped
-printer-state-reasons = toner-low-warning, other-error
-SNMP prtInputStatus(tray 1) = 9 -> 48   (offline + critical alert)
-Cancel-Job on the held job -> 0x0000, cleared cleanly
-```
-
-Three consequences for splitting, none of them optional:
-
-1. **It holds; it does not abort.** A chunk can stall forever. A sequencer that
-   waits for chunk *k* before sending *k+1* therefore wedges the queue
-   indefinitely, and with the queue lock held that is a whole-printer outage
-   rather than one stuck job. There must be a bound on how long a chunk may sit
-   in `processing-stopped`, after which the remaining chunks are abandoned and
-   the job reported as failed.
-
-2. **IPP will not tell you why.** `printer-stopped` and `other-error` are all it
-   offers -- no `media-needed`, no `job-media-needed`, and this printer publishes
-   no `job-state-reasons-supported` to enumerate against. The tray state is
-   visible only over SNMP. Reports about a stalled job should say what SNMP saw,
-   because the IPP answer is not actionable on its own.
-
-3. **A client that is configured to retry will retry.** The client sees
-   `processing-stopped`, which is exactly what it should see; the aggregate
-   state must report it faithfully rather than inventing a terminal state to
-   tidy up. Whether the user's client fails or retries is then the client's
-   decision, made on honest information.
-
-Separately measured: `Cancel-Job` on a job that has already reached a terminal
-state returns `0x0404` (client-error-not-possible), and a malformed PDF is
-rejected as `aborted` with `document-format-error` within three seconds -- the
-printer validates before it looks at media.
+**Whether this printer streams raster or spools it** is likewise unmeasured. The
+format permits streaming and Ghostscript emits it in streamable form — it writes
+zero into the page-count field and the printer accepts that, so the device
+plainly is not validating it. That is evidence about the format, not about the
+firmware.
 
 ## Two things in the relay path left alone, deliberately
 
