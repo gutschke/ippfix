@@ -173,10 +173,13 @@ size and saves CPU (0.18 s/page against 0.49 for outlining). Do not describe it
 as equivalent to "print as image"; that path is blurry because Chrome encodes
 the page as JPEG at a hardcoded quality of 40, which is a different problem.
 
-The proxy observes what the printer does with a job — see *Following a job* —
-but nothing *reacts* to it: there is no retry, no re-conversion and no change of
-tier based on an outcome. See the structural limit in
-[OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
+Keep two cases apart here, because they are easy to run together. A printer that
+**refuses** a job is reacted to: the document is converted again as raster and
+sent once more, and that is safe precisely because a refusal means no job was
+created. A printer that **accepts a job and does not print it** is not reacted
+to at all — it is observed, reported, and nothing more. That is not an omission
+but the structural limit: a failure that reports success offers nothing to
+trigger on. See [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md).
 
 **Every conversion is checked before it is used.** `defont` discards its own
 output and passes the original through if the output is empty, if any

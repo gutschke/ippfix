@@ -1736,6 +1736,104 @@ for bad_uri in ('t=ipp://p/ipp/print?pagecounter=off',
     raise AssertionError(bad_uri)
 PY2
 
+python3 - <<'PY2' && ok 'one SNMP listener speaks for exactly one printer' || bad 'relay queue selection'
+import sys
+sys.path.insert(0, '.')
+import ippfix
+
+# Restored after being deleted by mistake. These cover choose_relay_queue, which
+# is live code called from start_snmp_relays -- they were removed by a commit
+# that was only meant to take out the abandoned job-splitting planner, and the
+# loss was invisible because the suite still passed. Their failure mode is a
+# monitoring system reading the wrong printer's page counter.
+def qs(*specs):
+    return [ippfix.parse_queue(s) for s in specs]
+
+# SNMP carries nothing that names a printer, so one listener speaks for one
+# printer -- and with several the daemon must refuse rather than pick.
+one = qs('a=ipp://p1/ipp/print')
+assert ippfix.choose_relay_queue(one)[0] is one[0]
+two = qs('a=ipp://p1/ipp/print', 'b=ipp://p2/ipp/print')
+picked, why = ippfix.choose_relay_queue(two)
+assert picked is None and 'snmp-relay' in why, why
+marked = qs('a=ipp://p1/ipp/print?snmp-relay=on', 'b=ipp://p2/ipp/print')
+assert ippfix.choose_relay_queue(marked)[0].name == 'a'
+both = qs('a=ipp://p1/ipp/print?snmp-relay=on', 'b=ipp://p2/ipp/print?snmp-relay=on')
+assert ippfix.choose_relay_queue(both)[0] is None
+
+# One address per printer is the way to serve several at once: the address does
+# the naming the protocol will not.
+pair = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1',
+          'b=ipp://p2/ipp/print?snmp-relay=10.0.0.2')
+assert ippfix.choose_relay_queue(pair, '10.0.0.1')[0].name == 'a'
+assert ippfix.choose_relay_queue(pair, '10.0.0.2')[0].name == 'b'
+assert ippfix.choose_relay_queue(pair, '10.0.0.3')[0] is None
+# A printer with its own listener must not also be answered by the wildcard.
+assert ippfix.choose_relay_queue(pair, None)[0] is None
+mixed = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1', 'c=ipp://p3/ipp/print')
+assert ippfix.choose_relay_queue(mixed, None)[0].name == 'c'
+# Two printers claiming one address is a configuration error, not a coin toss.
+clash = qs('a=ipp://p1/ipp/print?snmp-relay=10.0.0.1',
+           'b=ipp://p2/ipp/print?snmp-relay=10.0.0.1')
+assert ippfix.choose_relay_queue(clash, '10.0.0.1')[0] is None
+try:
+    ippfix.parse_queue('a=ipp://p/ipp/print?snmp-relay=nonsense')
+except ValueError:
+    pass
+else:
+    raise AssertionError('an unparseable listen address must not be accepted')
+PY2
+
+python3 - <<'PY2' && ok 'a document too large is refused out loud, not in silence' || bad 'oversized body'
+import io, sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippfix
+from fakeprinter import FakePrinter, proxy_for
+
+# A body over MAX_BODY used to raise BadRequest, which serve() swallowed, so the
+# connection closed with no HTTP status and no IPP status at all. The client saw
+# a network fault where the truth was a limit here -- the exact silence this
+# program exists to remove, in the program itself.
+with FakePrinter() as printer:
+    cfg, queue = proxy_for(printer)
+    handler = ippfix.Handler.__new__(ippfix.Handler)
+    handler.client_address = ('192.0.2.50', 5555)
+    body = b'x' * (ippfix.MAX_BODY + 1)
+    request = (b'POST /ipp/office HTTP/1.1\r\nHost: h\r\n'
+               b'Content-Type: application/ipp\r\n'
+               b'Content-Length: %d\r\n\r\n' % len(body)) + body
+
+    # A socket just real enough for serve(): it peeks one byte to tell TLS from
+    # plaintext, then makes file objects out of it.
+    class Recording(io.BytesIO):
+        # serve() closes its handles on the way out, so keep what was written.
+        written = b''
+        def close(self):
+            Recording.written = self.getvalue()
+            super().close()
+
+    class Sock:
+        def __init__(self, data):
+            self.rfile = io.BytesIO(data)
+            self.wfile = Recording()
+        def settimeout(self, _t): pass
+        def recv(self, n, flags=0): return self.rfile.getvalue()[:n]
+        def makefile(self, mode, _bufsize=0):
+            return self.rfile if 'r' in mode else self.wfile
+        def close(self): pass
+        def shutdown(self, _how): pass
+
+    handler.request = Sock(request)
+    handler.server = None
+    handler.serve(cfg)
+    answer = Recording.written
+
+assert answer, 'the client was told nothing at all'
+assert answer.startswith(b'HTTP/1.1 413'), answer[:60]
+assert printer.requests == [], 'an oversized body reached the printer'
+PY2
+
 echo 'snmp relay'
 python3 - <<'PY2' && ok 'the relay answers only what it promised to' || bad 'snmp relay policy'
 import ipaddress, logging, sys

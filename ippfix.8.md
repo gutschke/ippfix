@@ -401,10 +401,13 @@ converter has no network and cannot ask. The environment variables
 composite-black fringing on text) supply the defaults used when `defont` is run
 by hand, without that header.
 
-The raster tier is chosen from the size of the converted document before the
-job is sent. Nothing reacts to what the printer does with a job afterwards, so
-a document the printer rejects, or accepts and does not print, is not retried
-in another form.
+The raster tier is chosen from the printer's own answer, not from a size guessed
+in advance. A job the printer **refuses** for a reason about the document is
+converted again as raster and sent once more — safe only because a refusal means
+no job was created. A job the printer **accepts and does not print** is a
+different matter entirely: it is reported, by the page-counter cross-check, and
+never retried. Nothing can react to a failure that reports success, because
+there is nothing to react to.
 
 <a name="calibration"></a>
 

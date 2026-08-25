@@ -2653,6 +2653,19 @@ def rewrite_response(cfg, queue, msg):
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
+class BodyTooLarge(Exception):
+    """The client's document is larger than this proxy will read.
+
+    Kept apart from BadRequest because the two deserve different answers. A
+    malformed request cannot be answered reliably -- the framing is what has
+    gone wrong, so there may be no request to reply to. A body that is merely
+    too large arrived on a connection that is working perfectly, and closing it
+    without a word is the silence this whole program exists to remove: the
+    client sees a dropped connection and reports a network problem, when what
+    happened is that a limit here was reached.
+    """
+
+
 class BadRequest(Exception):
     pass
 
@@ -2709,7 +2722,7 @@ def read_body(rfile, headers):
                 rfile.readline(8192)
                 break
             if len(body) + size > MAX_BODY:
-                raise BadRequest('body too large')
+                raise BodyTooLarge('chunked body too large')
             while size > 0:
                 chunk = rfile.read(min(size, 65536))
                 if not chunk:
@@ -2726,7 +2739,7 @@ def read_body(rfile, headers):
     if remaining < 0:
         raise BadRequest('negative content-length')
     if remaining > MAX_BODY:
-        raise BadRequest('body too large')
+        raise BodyTooLarge('body too large')
     body = bytearray()
     while len(body) < remaining:
         chunk = rfile.read(min(remaining - len(body), 65536))
@@ -2805,6 +2818,17 @@ class Handler(socketserver.BaseRequestHandler):
                 served += 1
                 if served >= MAX_KEEPALIVE:
                     break
+        except BodyTooLarge as exc:
+            # Say so, then close. The request cannot be served, but a client
+            # that is told 413 reports a document too large for the server;
+            # one that is told nothing reports the network.
+            log.warning('%s from %s: refusing a document larger than %d bytes',
+                        exc, self.client_address[0], MAX_BODY)
+            try:
+                respond(wfile, '413 Content Too Large', 'text/plain',
+                        b'the document is larger than this proxy will relay\n')
+            except OSError:
+                pass
         except (BadRequest, OSError, ssl.SSLError, socket.timeout):
             pass
         finally:
