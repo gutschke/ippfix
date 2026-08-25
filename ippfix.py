@@ -2212,13 +2212,17 @@ def converter_header(queue, cfg, sides=None, force_raster=False):
             fields.append('raster=only')
     # What the printer declares it accepts is not used here; it was measured not
     # to be what the printer enforces (see Queue.learn), so a job is offered
-    # whole and rasterised only if the printer actually refuses it. The
-    # converter still needs a number for its own last resort, and the only
-    # honest one left is the largest converted document this proxy would accept
-    # back at all: below that, rasterising could only ever throw away fidelity
-    # the printer might have taken. On a `raster=only` call it decides nothing,
-    # because nothing is outlined for it to measure.
-    fields.append(f'maxpdf={cfg.max_pdf_bytes or MAX_CONVERTED}')
+    # whole and rasterised only if the printer actually refuses it -- so no
+    # number is sent at all unless an administrator supplied one.
+    #
+    # This used to send MAX_CONVERTED as "the only honest number left". It was
+    # not honest, it was inert: the converter would have rasterised a document
+    # whose outlined form passed 256 MB, and raster runs about 3.8 times the
+    # size of outlined output, so the result was another 970 MB that this proxy
+    # would refuse in turn. A branch that can only fire where its own output is
+    # unusable is not a fallback.
+    if cfg.max_pdf_bytes:
+        fields.append(f'maxpdf={cfg.max_pdf_bytes}')
     if sides is not None:
         if sides in SIDES_VALUES:
             fields.append(f'sides={sides}')

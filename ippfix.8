@@ -547,7 +547,8 @@ format is updated to match.
 Which raster format, colour space, resolution and PDF size limit apply is read
 from the printer's own attributes and travels with each document, because the
 converter has no network and cannot ask. The environment variables
-.BR MAX_PDF_BYTES " (default 60000000),"
+.BR MAX_PDF_BYTES " (default: no limit, so a document is never rasterised on
+size alone),"
 .BR RASTER_DPI " (600) and"
 .B RASTER_COLORSPACE
 (19 for sRGB; 18 for 8\-bit grey, which halves the size and avoids

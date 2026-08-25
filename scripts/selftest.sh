@@ -1291,7 +1291,7 @@ assert len(jobs) == 1
 # converter is given is the largest document this proxy would take back at all,
 # and nothing has asked for raster.
 assert len(headers) == 1, headers
-assert f'maxpdf={ippfix.MAX_CONVERTED}' in headers[0], headers[0]
+assert 'maxpdf=' not in headers[0], headers[0]
 assert 'raster=only' not in headers[0], headers[0]
 assert 'sides=two-sided-long-edge' in headers[0], headers[0]
 
@@ -1313,7 +1313,7 @@ assert jobs[0].urf_duplex is not None, 'the raster was not readable'
 # converter that reached it would be outlining, which is what the retry exists
 # to stop.
 assert 'raster=only' not in headers[0] and 'raster=only' in headers[1], headers
-assert f'maxpdf={ippfix.MAX_CONVERTED}' in headers[1], headers[1]
+assert 'maxpdf=' not in headers[1], headers[1]
 assert 'sides=two-sided-long-edge' in headers[1], headers[1]
 # The client is told about the job that exists, not about the refusal.
 assert answer.ipp.group(ipp.JOB_ATTRS).get_int('job-id') == jobs[0].id
@@ -1512,7 +1512,11 @@ queue.learned = True          # do not go to the network for this
 plain = ippfix.converter_header(queue, cfg)
 assert b'sides=' not in plain, 'a sides nobody asked for was invented'
 # No pre-emptive ceiling by default: the printer answers for itself now.
-assert f'maxpdf={ippfix.MAX_CONVERTED}'.encode() in plain, plain
+# No ceiling is invented. One is sent only when an administrator set one:
+# sending MAX_CONVERTED looked prudent and was inert, because rasterising a
+# document whose outlined form passed it produces roughly 3.8x that again,
+# which this proxy refuses in turn.
+assert b'maxpdf=' not in plain, plain
 
 for value in ippfix.SIDES_VALUES:
     header = ippfix.converter_header(queue, cfg, sides=value)
@@ -1546,7 +1550,7 @@ queue.raster_dpi = 600
 forced = ippfix.converter_header(queue, cfg, sides='one-sided',
                                  force_raster=True)
 assert b'raster=only' in forced and b'sides=one-sided' in forced, forced
-assert f'maxpdf={ippfix.MAX_CONVERTED}'.encode() in forced, forced
+assert b'maxpdf=' not in forced, forced
 assert b'raster=only' not in ippfix.converter_header(queue, cfg)
 
 # A site that has measured a printer which really does refuse oversized jobs

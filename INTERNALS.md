@@ -114,8 +114,15 @@ useful in a log, but nothing acts on it by default. See
 version is that four models were fitted and all four were falsified.
 
 **The converter is told what the printer accepts**, because it cannot ask: a
-one-line `%%ippfix device=… colorspace=… dpi=… maxpdf=…` header precedes the
-document. `sides=` carries the job's own `sides` value, because on the raster
+one-line `%%ippfix device=… colorspace=… dpi=…` header precedes the
+document. No size is sent unless an administrator set `--max-pdf-bytes`, and the converter
+has no built-in ceiling either: a document is offered to the printer whole and
+rasterised only if the printer refuses it. The proxy briefly sent `MAX_CONVERTED`
+here as "the only honest number left", which was inert rather than honest —
+raster runs about 3.8× the size of outlined output, so the branch could only
+fire where its own result would be refused in turn.
+
+`sides=` carries the job's own `sides` value, because on the raster
 path the URF stream's duplex field overrides the IPP attribute — measured on
 paper, see [DIAGNOSING.md](DIAGNOSING.md). It is passed through verbatim and
 never invented; if the client did not ask for a side, nothing is sent.
@@ -123,7 +130,8 @@ never invented; if the client did not ask for a side, nothing is sent.
 `raster=only` says "rasterise the input, do not outline it first". It is what
 a document the printer has already refused is asked for again, and it is a
 field of its own rather than `maxpdf=0` because the two are not the same
-request: `maxpdf` is compared against the *outlined* copy, after three
+request — and `maxpdf=0` now means *no limit*, which is what the daemon wants
+by default. `maxpdf` is compared against the *outlined* copy, after three
 fail-safes that each answer with the original document, so a document that
 loses a shading in Ghostscript would come back as the very PDF the printer just
 refused. Those fail-safes guard outlining, which can lose content; the raster

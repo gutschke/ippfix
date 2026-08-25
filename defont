@@ -25,7 +25,14 @@ GS="${GS:-gs}"
 # put them. It is not the blurry "print as image" path, which is blurry from
 # JPEG quality 40 rather than from rastering. A job that prints slightly less
 # precisely beats one the printer rejects outright.
-MAX_PDF_BYTES="${MAX_PDF_BYTES:-60000000}"
+# No limit unless one is given. There used to be 60000000 here, and the daemon
+# used to work out a smaller number from what the printer declares -- both were
+# guesses at a ceiling that turned out not to exist. An M283fdw declares 76.8 MB
+# and prints 92.5 MB, so a document is now offered to the printer whole and
+# rasterised only if the printer itself refuses it. Set this, or send maxpdf=,
+# only for a device measured to enforce a limit. Empty means never rasterise on
+# size; raster=only is how a caller asks for raster outright.
+MAX_PDF_BYTES="${MAX_PDF_BYTES:-}"
 RASTER_DPI="${RASTER_DPI:-600}"
 # 19 = SRGB24, the colour space these printers advertise first. 18 is W8 grey,
 # which halves the size and avoids composite-black fringing on text.
@@ -35,8 +42,8 @@ RASTER_COLORSPACE="${RASTER_COLORSPACE:-19}"
 RASTER_DEVICE="${RASTER_DEVICE:-appleraster}"
 
 # Rasterise the input straight away instead of outlining it first. Empty means
-# the normal path: outline, and rasterise only if the result is over
-# MAX_PDF_BYTES.
+# the normal path: outline, and rasterise only if MAX_PDF_BYTES is set and the
+# result is over it.
 #
 # This exists because "rasterise this document" and "the size limit is zero"
 # are not the same request, though they look alike. A size of zero is only
@@ -191,7 +198,16 @@ if [ "$(head -c 9 "$infile")" = '%%ippfix ' ]; then
                       && RASTER_COLORSPACE="$value" ;;
       dpi=*)        [ "$value" -ge 72 ] 2>/dev/null && [ "$value" -le 2400 ] \
                       && RASTER_DPI="$value" ;;
-      maxpdf=*)     [ "$value" -ge 0 ] 2>/dev/null && MAX_PDF_BYTES="$value" ;;
+      # 0 means no limit, the same as omitting the field. It briefly meant the
+      # opposite -- "everything is over the limit", i.e. rasterise -- and that
+      # request is now spelled raster=only, which says what it wants.
+      maxpdf=*)     if [ "$value" -ge 0 ] 2>/dev/null; then
+                      if [ "$value" -eq 0 ]; then
+                        MAX_PDF_BYTES=''
+                      else
+                        MAX_PDF_BYTES="$value"
+                      fi
+                    fi ;;
       # An endpoint that is present but empty is a caller that meant to say
       # something and failed. Reading it as "no range" would convert the whole
       # document in answer to a request for part of one, which is the failure
@@ -651,20 +667,22 @@ outsize="$(stat -c%s "$outfile")"
 # the one case where there is nothing left to cut, and there rasterising is the
 # only thing left that prints at all, so it happens, loudly.
 if [ -n "$FIRST_PAGE$LAST_PAGE" ] && [ "$expect_pages" -gt 1 ] \
-   && [ "$outsize" -gt "$MAX_PDF_BYTES" ]; then
+   && [ -n "$MAX_PDF_BYTES" ] && [ "$outsize" -gt "$MAX_PDF_BYTES" ]; then
   echo "defont: pages ${expect_first}-${expect_last} outlined to ${outsize}" \
        "bytes, over ${MAX_PDF_BYTES}; nothing written. Ask again for a" \
        "smaller range" >&2
   exit 4
 fi
-if [ "$expect_pages" = 1 ] && [ "$outsize" -gt "$MAX_PDF_BYTES" ] \
+if [ "$expect_pages" = 1 ] && [ -n "$MAX_PDF_BYTES" ] \
+   && [ "$outsize" -gt "$MAX_PDF_BYTES" ] \
    && [ -n "$RASTER_DEVICE" ]; then
   echo "defont: page ${expect_first} on its own is over ${MAX_PDF_BYTES}" \
        "outlined, so it comes back as raster while the rest of the document" \
        "is vector. It will not look quite like its neighbours" >&2
 fi
 
-if [ "$outsize" -gt "$MAX_PDF_BYTES" ] && [ -n "$RASTER_DEVICE" ]; then
+if [ -n "$MAX_PDF_BYTES" ] && [ "$outsize" -gt "$MAX_PDF_BYTES" ] \
+   && [ -n "$RASTER_DEVICE" ]; then
   echo "defont: outlined output ${outsize} bytes exceeds ${MAX_PDF_BYTES};" \
        "rasterising instead" >&2
   if rasterise; then
@@ -674,7 +692,7 @@ if [ "$outsize" -gt "$MAX_PDF_BYTES" ] && [ -n "$RASTER_DEVICE" ]; then
   fi
   echo "defont: rasterising failed; sending the outlined PDF anyway" >&2
   rm -f "$rasterfile"
-elif [ "$outsize" -gt "$MAX_PDF_BYTES" ]; then
+elif [ -n "$MAX_PDF_BYTES" ] && [ "$outsize" -gt "$MAX_PDF_BYTES" ]; then
   echo "defont: outlined output ${outsize} bytes exceeds ${MAX_PDF_BYTES} but" \
        "this printer accepts no raster format; sending it anyway" >&2
 fi

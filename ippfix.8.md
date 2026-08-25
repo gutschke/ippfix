@@ -396,7 +396,8 @@ A job passes through up to three stages, stopping at the first that suffices.
 Which raster format, colour space, resolution and PDF size limit apply is read
 from the printer's own attributes and travels with each document, because the
 converter has no network and cannot ask. The environment variables
-`MAX_PDF_BYTES` (default 60000000), `RASTER_DPI` (600) and `RASTER_COLORSPACE`
+`MAX_PDF_BYTES` (default: no limit, so a document is never rasterised on size
+alone), `RASTER_DPI` (600) and `RASTER_COLORSPACE`
 (19 for sRGB; 18 for 8-bit grey, which halves the size and avoids
 composite-black fringing on text) supply the defaults used when `defont` is run
 by hand, without that header.
