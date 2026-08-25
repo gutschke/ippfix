@@ -36,6 +36,12 @@ ALLOWED_ADDRESSES = {
     # the assertions harder to read than the risk justifies. They are the
     # only private addresses the tree is allowed to contain.
     '10.0.0.0', '10.0.0.1', '10.0.0.2', '10.0.0.3', '10.1.2.3',
+    # Not in the current tree at all: a usage example in the docstring of
+    # scripts/probe-printer.py, which was deleted long ago but is still in
+    # eleven historic commits. Listed so that running this over every tree in
+    # the history -- the way to check a scrub without naming what you are
+    # looking for -- comes back clean and nobody investigates it twice.
+    '10.0.0.5',
 }
 ALLOWED_ADDRESSES |= {'::', '::1', '::ffff:0:0', '2001:db8::1', 'fe80::1'}
 
