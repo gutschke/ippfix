@@ -360,6 +360,193 @@ check 'with no raster format the single page is sent as PDF anyway' \
       "head -c 5 '$work/out' | grep -qa '%PDF-'"
 check 'and it is still only the one page' "[ \"\$(typepages '$work/out')\" = 1 ]"
 
+echo 'the raster stream says which side of the sheet each page lands on'
+# The IPP sides attribute travels with the request, but the raster stream
+# carries a duplex field of its own in every page header, and the printer
+# believes the stream. A two page URF built without these flags was accepted
+# with status 0x0000, an empty unsupported-attributes and two impressions, and
+# printed as two simplex sheets. Every layer said it had worked. So what is
+# asserted here is the actual bytes of the page headers: an exit status and a
+# happy log are exactly what the broken version produced.
+#
+# dpi=75 throughout, only to keep the test quick. The duplex field is nowhere
+# near the resolution field and does not depend on it.
+
+# Every duplex byte in a URF stream, one per page header. The stream is eight
+# bytes of "UNIRAST\0" magic and a four byte page count, then a 32 byte header
+# in front of each page's data; the duplex field is byte 2 of that header,
+# which is file offset 14 for the first page. The later headers cannot be
+# reached by arithmetic without decoding the compressed rows in between, so
+# they are found by looking for the first header repeated: every page in one
+# stream has the same geometry, so 31 of its 32 bytes recur exactly, and the
+# byte that is allowed to differ is the one being read out.
+urfduplex() {   # $1 = URF file; echoes one byte per page, e.g. "3 3"
+  python3 -c '
+import sys
+d = open(sys.argv[1], "rb").read()
+h = d[12:44]
+print(" ".join(str(d[i + 2]) for i in range(12, len(d) - 31)
+               if d[i:i + 2] == h[:2] and d[i + 3:i + 32] == h[3:]))
+' "$1"
+}
+
+# A two page document whose pages are the SAME size, which the ones built at
+# the top of this file deliberately are not. Finding the second page header in
+# a URF stream without decoding the compressed rows in between relies on the
+# two headers being identical apart from the duplex byte, and that only holds
+# when the pages share their geometry. Nothing here needs to tell page 1 from
+# page 2, so the per-page width fingerprint is not wanted.
+{
+  printf '<</PageSize [200 400]>> setpagedevice\n'
+  printf '/Helvetica 24 selectfont 20 200 moveto (Page 1) show showpage\n'
+  printf '<</PageSize [200 400]>> setpagedevice\n'
+  printf '/Helvetica 24 selectfont 20 200 moveto (Page 2) show showpage\n'
+} > "$work/same.ps"
+topdf "$work/same.ps" "$work/same.pdf"
+
+# What the raster path produced before this field existed: the same command
+# line the converter builds, minus the new flags. Built here and now rather
+# than committed as a fixture, so that the pin is against the Ghostscript that
+# is actually installed rather than against the one that was installed on the
+# day somebody generated a fixture.
+gs -q -dNOPAUSE -dBATCH -dSAFER -K400000 -sDEVICE=appleraster -r75 \
+   -dcupsColorSpace=19 -dcupsBitsPerColor=8 \
+   -sOutputFile="$work/ref.urf" "$work/same.pdf" >/dev/null 2>&1
+
+run "maxpdf=1000 dpi=75" "$work/same.pdf"
+check 'a two page document over the limit comes back as URF' \
+      "head -c 7 '$work/out' | grep -qa UNIRAST"
+check 'both page headers are found' \
+      "[ \"\$(urfduplex '$work/out' | wc -w)\" = 2 ]"
+check 'no sides field still means one-sided, as it always has' \
+      "[ \"\$(urfduplex '$work/out')\" = '1 1' ]"
+check 'no sides field is byte for byte what the converter produced before' \
+      "cmp -s '$work/out' '$work/ref.urf'"
+
+# The measured values, restated as assertions. Offset 14 and these three bytes
+# are the whole of what the fix rests on, and nobody re-reading this will have
+# a printer to check them against.
+run "maxpdf=1000 dpi=75 sides=one-sided" "$work/same.pdf"
+check 'sides=one-sided writes duplex byte 1 in every page header' \
+      "[ \"\$(urfduplex '$work/out')\" = '1 1' ]"
+check 'sides=one-sided is the same stream as no sides field at all' \
+      "cmp -s '$work/out' '$work/ref.urf'"
+run "maxpdf=1000 dpi=75 sides=two-sided-long-edge" "$work/same.pdf"
+check 'sides=two-sided-long-edge writes duplex byte 3 in every page header' \
+      "[ \"\$(urfduplex '$work/out')\" = '3 3' ]"
+check 'the long edge byte is at file offset 14' \
+      "[ \"\$(od -An -tu1 -j14 -N1 '$work/out' | tr -d ' ')\" = 3 ]"
+cp "$work/out" "$work/long.urf"
+run "maxpdf=1000 dpi=75 sides=two-sided-short-edge" "$work/same.pdf"
+check 'sides=two-sided-short-edge writes duplex byte 2 in every page header' \
+      "[ \"\$(urfduplex '$work/out')\" = '2 2' ]"
+# A device that accepted -dDuplex but ignored -dTumble would still pass the
+# long edge check on its own, and would then send every short edge job out
+# bound on the wrong edge. The two streams differing is what rules that out.
+check 'long edge and short edge are not the same stream' \
+      "! cmp -s '$work/out' '$work/long.urf'"
+check 'neither two-sided value leaves the stream saying one-sided' \
+      "[ \"\$(urfduplex '$work/long.urf')\" != '1 1' ] && [ \"\$(urfduplex '$work/out')\" != '1 1' ]"
+
+echo 'an unrecognised sides value never reaches Ghostscript'
+# A value that was dropped before the command line was built and a value that
+# was placed on the command line and then ignored by the device look identical
+# from outside, and only one of them is safe -- Ghostscript has devices and
+# options that have been used to defeat -dSAFER. So the command lines are
+# recorded rather than inferred.
+cat > "$work/gs-argv" <<'STUB'
+#!/bin/bash
+# Records every command line the converter builds, then does the real work.
+printf '%s\n' "$*" >> "$GSARGV"
+exec gs "$@"
+STUB
+chmod +x "$work/gs-argv"
+export GSARGV="$work/argv"
+
+# The command line that used a given device, out of the several the converter
+# builds for one document.
+gsline() {   # $1 = device name
+  grep -- "-sDEVICE=$1" "$GSARGV" | head -n 1
+}
+
+: > "$GSARGV"
+stubrun gs-argv "maxpdf=1000 dpi=75 sides=two-sided-long-edge" "$work/same.pdf"
+check 'the raster command line carries the long edge flags' \
+      "gsline appleraster | grep -q -- '-dDuplex=true' && \
+       gsline appleraster | grep -q -- '-dTumble=false'"
+: > "$GSARGV"
+stubrun gs-argv "maxpdf=1000 dpi=75 sides=two-sided-short-edge" "$work/same.pdf"
+check 'the raster command line carries the short edge flags' \
+      "gsline appleraster | grep -q -- '-dDuplex=true' && \
+       gsline appleraster | grep -q -- '-dTumble=true'"
+
+# Every one of these degrades to the default rather than killing the job -- the
+# default is what an absent field gives, so there is a safe answer, which is
+# not true of a page range. What must not happen is the word arriving on a
+# Ghostscript command line, so the last two are shaped like flags.
+for value in bogus two-sided One-Sided one-sided-long-edge '' '-dDuplex=true' \
+             '-sDEVICE=uniprint'; do
+  : > "$GSARGV"
+  stubrun gs-argv "maxpdf=1000 dpi=75 sides=$value" "$work/same.pdf"
+  check "sides=${value:-<empty>} still produces a document" "[ \"\$rc\" = 0 ]"
+  check "sides=${value:-<empty>} says on stderr that it was refused" \
+        "grep -q 'refusing unknown sides' '$work/err'"
+  check "sides=${value:-<empty>} leaves the stream exactly as it was" \
+        "cmp -s '$work/out' '$work/ref.urf'"
+  check "sides=${value:-<empty>} reaches no Ghostscript command line" \
+        "! grep -q -- '-dDuplex' '$GSARGV' && ! grep -q -- '-dTumble' '$GSARGV'"
+done
+: > "$GSARGV"
+stubrun gs-argv "maxpdf=1000 dpi=75 sides=-sDEVICE=uniprint" "$work/same.pdf"
+check 'a device name smuggled through sides does not become the device' \
+      "! grep -q -- 'uniprint' '$GSARGV'"
+check 'and the raster device is still the one that was asked for' \
+      "gsline appleraster | grep -q -- '-sDEVICE=appleraster'"
+
+echo 'sides is raster-only and never reaches the document'
+# On the PDF path the printer interprets the document itself and honours the
+# IPP attribute in the normal way, which is why this bug only affects raster.
+# Putting -dDuplex on the pdfwrite call would stamp a page-device setting into
+# a PDF that nothing reads back, while making the two paths look alike.
+: > "$GSARGV"
+stubrun gs-argv "sides=two-sided-long-edge" "$work/p9.pdf"
+check 'sides does not disturb the PDF path' "[ \"\$rc\" = 0 ]"
+check 'the PDF path still returns a PDF' \
+      "head -c 5 '$work/out' | grep -qa '%PDF-'"
+check 'the PDF path still returns every page' \
+      "[ \"\$(typepages '$work/out')\" = 9 ]"
+check 'the duplex flags stay off the pdfwrite command line' \
+      "! gsline pdfwrite | grep -q -- '-dDuplex' && \
+       ! gsline pdfwrite | grep -q -- '-dTumble'"
+check 'sides is not reported as an unknown header field' \
+      "! grep -q 'unknown header field' '$work/err'"
+check 'no sides= text survives into the converted PDF' \
+      "! grep -qa 'sides=' '$work/out'"
+check 'no %%ippfix line survives into the converted PDF' \
+      "! grep -qa '%%ippfix ' '$work/out'"
+# The raster path is where the flags belong, but the header line itself must
+# not turn up in the stream either.
+run "maxpdf=1000 dpi=75 sides=two-sided-short-edge" "$work/same.pdf"
+check 'no sides= text survives into the raster stream' \
+      "! grep -qa 'sides=' '$work/out'"
+check 'no %%ippfix line survives into the raster stream' \
+      "! grep -qa '%%ippfix ' '$work/out'"
+# A printer with no raster format we can produce never rasterises at all, so
+# there is nothing for sides to say and nothing must break for saying it.
+run "maxpdf=1000 dpi=75 sides=two-sided-long-edge raster=none" "$work/p9.pdf"
+check 'sides is harmless when there is no raster fallback' "[ \"\$rc\" = 0 ]"
+check 'and the document still comes back as PDF' \
+      "head -c 5 '$work/out' | grep -qa '%PDF-'"
+# Ranges and sides are independent, and a chunk of a document still has to say
+# which side its pages land on or a split job goes simplex one chunk at a time.
+# A single page is the only range that ever reaches the raster path at all --
+# anything larger that is still over the limit is handed back for the caller to
+# cut smaller -- so that is the case to check.
+run "first=2 last=2 maxpdf=1000 dpi=75 sides=two-sided-long-edge" "$work/same.pdf"
+check 'a single page range rasterises with the sides value applied' \
+      "[ \"\$(urfduplex '$work/out')\" = '3' ]"
+unset GSARGV
+
 echo 'nothing changes for a caller that never mentions a range'
 run "" "$work/p9.pdf"
 check 'a headerless document converts as before' "[ \"\$rc\" = 0 ]"
