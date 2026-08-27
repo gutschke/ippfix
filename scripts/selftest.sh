@@ -610,7 +610,112 @@ assert 'application/vnd.hp-PCLXL' in SAFE_FORMATS
 assert 'application/pdf' in SAFE_FORMATS
 PY2
 
-echo 'relay path'
+echo 'supply levels'
+# Every case here runs against the CAPTURED reply, not a hand-built one, so the
+# contradiction under test is the real firmware's and not one this suite made
+# up to be convenient.
+python3 - <<'PY2' && ok 'corrects a printer that contradicts its own supply gauge' || bad 'supply clamp'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+import ippfix
+from fakeprinter import captured_attributes
+
+def group(**edits):
+    g = ipp.parse(captured_attributes()).group(ipp.PRINTER_ATTRS)
+    for name, (tag, vals) in edits.items():
+        g.replace(name.replace('_', '-'), tag, vals)
+    return g
+
+def levels(g):
+    return [int.from_bytes(v, 'big', signed=True) for v in g.get('marker-levels')]
+
+INTS = ipp.TAG_INTEGER
+KW = ipp.TAG_KEYWORD
+
+# The printer as captured: three colours at 0, a low mark of 1, and a reason
+# that says only that toner is low. It is calling them empty and warning that
+# they are low in the same breath.
+g = group()
+assert levels(g) == [0, 0, 0, 55], levels(g)
+assert ippfix.clamp_supply_levels(g) is not None
+assert levels(g) == [1, 1, 1, 55], levels(g)
+
+# The supply it does NOT contradict itself about is left exactly alone. This is
+# the whole point: the correction must not cost the one reading worth having.
+assert levels(g)[3] == 55
+
+# Once the printer says a supply is really empty it has stopped contradicting
+# itself, and its numbers are the truth again.
+for reason in ('toner-empty-warning', 'toner-empty-error',
+               'marker-supply-empty-warning'):
+    g = group(printer_state_reasons=(KW, [reason]))
+    assert ippfix.clamp_supply_levels(g) is None, reason
+    assert levels(g) == [0, 0, 0, 55], (reason, levels(g))
+
+# A level at or above the mark is not a contradiction and is not touched.
+g = group(marker_levels=(INTS, [ipp.i32(1), ipp.i32(9), ipp.i32(0), ipp.i32(55)]))
+ippfix.clamp_supply_levels(g)
+assert levels(g) == [1, 9, 1, 55], levels(g)
+
+# RFC 8011 uses -1, -2 and -3 for "unknown". A printer admitting it does not
+# know is not contradicting itself, and inventing a level for it would be the
+# very thing this function exists to avoid.
+g = group(marker_levels=(INTS, [ipp.i32(-1), ipp.i32(-2), ipp.i32(-3), ipp.i32(55)]))
+assert ippfix.clamp_supply_levels(g) is None
+assert levels(g) == [-1, -2, -3, 55], levels(g)
+
+# Nothing to compare against means nothing to correct.
+g = group()
+g.remove('marker-low-levels')
+assert ippfix.clamp_supply_levels(g) is None
+assert levels(g) == [0, 0, 0, 55]
+
+# Arrays that do not line up cannot be reasoned about pairwise.
+g = group(marker_low_levels=(INTS, [ipp.i32(1), ipp.i32(1)]))
+assert ippfix.clamp_supply_levels(g) is None
+assert levels(g) == [0, 0, 0, 55]
+
+# A mark outside 1..100 is not a threshold worth trusting.
+g = group(marker_low_levels=(INTS, [ipp.i32(200)] * 4))
+assert ippfix.clamp_supply_levels(g) is None
+
+# Correcting it must leave a message a printer will still accept.
+g = group()
+ippfix.clamp_supply_levels(g)
+msg = ipp.parse(captured_attributes())
+for i, grp in enumerate(msg.groups):
+    if grp.tag == ipp.PRINTER_ATTRS:
+        msg.groups[i] = g
+assert ipp.parse(ipp.serialize(msg)).group(ipp.PRINTER_ATTRS).get('marker-levels')
+
+# Running it twice must not walk the numbers upward.
+g = group()
+ippfix.clamp_supply_levels(g)
+assert ippfix.clamp_supply_levels(g) is None
+assert levels(g) == [1, 1, 1, 55]
+PY2
+
+python3 - <<'PY2' && ok 'the correction can be turned off per printer' || bad 'supply-levels option'
+import sys
+sys.path.insert(0, '.')
+import ippfix
+
+assert ippfix.Queue('a', 'ipp://p/ipp/print').clamp_supplies is True
+assert ippfix.Queue('a', 'ipp://p/ipp/print?supply-levels=clamped').clamp_supplies is True
+assert ippfix.Queue('a', 'ipp://p/ipp/print?supply-levels=raw').clamp_supplies is False
+assert ippfix.Queue('a', 'ipp://p/ipp/print?supply-levels=RAW').clamp_supplies is False
+# A mistyped value must be refused, not quietly taken as one of the two.
+for bad in ('yes', 'off', ''):
+    try:
+        ippfix.Queue('a', f'ipp://p/ipp/print?supply-levels={bad}')
+    except ValueError:
+        continue
+    raise AssertionError(f'accepted supply-levels={bad!r}')
+PY2
+
+echo 'relay path' 
 # The mock the rest of this section runs against. If it stops behaving like the
 # printer it was captured from, every test built on it quietly stops meaning
 # anything, so it is checked first and on its own.
@@ -1004,6 +1109,15 @@ expect = {
                                   b'application/pdf',
                                   b'application/vnd.hp-PCL',
                                   b'application/vnd.hp-PCLXL', b'image/jpeg'],
+    # The one status attribute that is not passed through verbatim, and only
+    # because the captured printer contradicts itself: it reports three colour
+    # supplies at 0 -- below its own low mark of 1, which is it calling them
+    # empty -- while warning merely that toner is low, staying idle and
+    # accepting jobs. Clients that believe the number refuse to print at all.
+    # Each of those three is reported at the printer's own low mark; black,
+    # which the printer does not contradict itself about, keeps its real 55.
+    'marker-levels': [b'\x00\x00\x00\x01', b'\x00\x00\x00\x01',
+                      b'\x00\x00\x00\x01', b'\x00\x00\x007'],
 }
 changed = {n: new.get(n) for n in new.names() if old.get(n) != new.get(n)}
 assert changed == expect, ('unexpected attribute changes: '

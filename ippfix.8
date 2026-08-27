@@ -145,6 +145,29 @@ See
 .I ippfix\-snmp\-per\-printer.socket.example
 in the package documentation, and
 .BR \-\-no\-snmp\-relay .
+.TP
+.B supply\-levels=clamped|raw
+Whether to correct a printer that reports a supply level it would itself call
+empty while warning only that toner is low. Default
+.BR clamped .
+.IP
+Some firmware reports a cartridge below its own
+.B marker\-low\-levels
+mark \(em which is the printer calling that cartridge empty \(em while in the
+same message warning merely of low toner, staying idle and accepting jobs. A
+client that reads the reason keeps printing; a client that believes the number
+decides the cartridge is empty and refuses to submit anything at all. The same
+printer then works from one operating system and returns "printer error" on
+another, with no job ever reaching this proxy to explain itself.
+.IP
+Where the printer contradicts itself like that, the level is reported at the
+printer's own low mark instead. The client still sees a low supply and still
+sees the warning, and the figure it sees is still the printer's own. Supplies
+the printer does not contradict itself about are left untouched, and as soon as
+it reports a supply as genuinely empty its real levels are passed through
+unchanged. Use
+.B raw
+to see the printer's numbers exactly as it sends them.
 .PP
 An unrecognised option is an error rather than something ignored: a mistyped
 setting that is silently dropped is how a printer ends up not doing what its

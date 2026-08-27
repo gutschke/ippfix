@@ -221,6 +221,16 @@ switched off with an error in the journal saying so. It is never trusted enough
 to accuse a printer until it has been seen to move for a job that did print.
 `--no-page-counter` turns it off, or `?page-counter=off` on one printer's URI.
 
+Supply levels get one similar correction. A printer that reports a cartridge
+below its own low-water mark is calling that cartridge empty; some firmware
+does so while, in the same message, warning only that toner is low and
+continuing to accept jobs. Clients that believe the number refuse to print at
+all, which is why a printer can work from one operating system and report
+"printer error" on another. Where the printer contradicts itself the level is
+reported at its own low mark, so the client still sees a low supply and still
+sees the warning. Real empty conditions pass through untouched, and
+`?supply-levels=raw` turns the correction off.
+
 That also means a report can carry something somebody printed. Send it
 somewhere that reflects how sensitive the printing is, and see
 `--alert-max-attachment` for the size bound.

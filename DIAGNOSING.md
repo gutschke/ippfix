@@ -406,6 +406,43 @@ page counter over IPP at all**, which is why the cross-check reads it over SNMP.
 `hrPrinterStatus` is `other(1)` on a sleeping printer, not `idle(3)`. A
 readiness check built on it would call a healthy printer broken.
 
+### Supply levels, and a printer that argues with itself
+
+Measured 2026-08-26. The M283fdw reports:
+
+```
+marker-names               Cyan | Magenta | Yellow | Black
+marker-levels              0, 0, 0, 54
+marker-low-levels          1, 1, 1, 1
+printer-state              3 (idle)
+printer-is-accepting-jobs  true
+printer-state-reasons      toner-low-warning
+printer-alert              code=markerTonerAlmostEmpty
+```
+
+Three supplies at **0**, which is below the printer's own low mark of 1 — that
+is the printer calling them empty — while every other field in the same message
+says it is idle, taking jobs, and merely *low*. It has read this way for months
+and prints colour perfectly well, so the levels are the part that is wrong.
+
+This is not cosmetic. Clients split on which half they believe:
+
+* ChromeOS reads the reason, shows a low-toner warning, and prints.
+* Android's Mopria service believes the number, decides three cartridges are
+  empty, and **refuses to create a job at all**. The proxy's log shows
+  `Get-Printer-Attributes` polled every 1.3 s and not one `Validate-Job` — the
+  refusal happens client-side, before anything is submitted.
+
+The pre-flight check runs in the print dialog. A job created while the printer
+was unreachable — so the dialog had no attributes to object to — is handed to
+the spooler and submitted later without that gate being re-applied. That is why
+one queued job printed normally through the same proxy, with the same supply
+levels, minutes before the next attempt was refused.
+
+The proxy therefore reports a level the printer would call empty at the
+printer's own low mark instead, and only while the printer is contradicting
+itself. See `supply-levels=clamped|raw` in **ippfix(8)**.
+
 ### Jobs
 
 `multiple-document-jobs-supported` is false, so a job carries exactly one

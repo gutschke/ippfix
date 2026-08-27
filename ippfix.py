@@ -247,7 +247,8 @@ class Queue:
     # flag applies to. Unknown keys are an error: a mistyped option that is
     # silently ignored is how a printer ends up not doing what its
     # configuration says it does.
-    URI_OPTIONS = ('page-counter', 'community', 'snmp-relay')
+    URI_OPTIONS = ('page-counter', 'community', 'snmp-relay',
+                   'supply-levels')
 
     def __init__(self, name, uri):
         parts = urllib.parse.urlsplit(uri)
@@ -271,6 +272,15 @@ class Queue:
         # printer. An address says which listener speaks for this printer,
         # which is the only way to serve several of them at once -- one
         # address each, one socket each.
+        # Whether to correct a printer that reports a supply level it would
+        # itself call empty while warning only that toner is low. See
+        # clamp_supply_levels(). "raw" passes the printer's numbers through
+        # untouched, for anyone who would rather see the device lie plainly.
+        levels = options.get('supply-levels', ['clamped'])[0].lower()
+        if levels not in ('clamped', 'raw'):
+            raise ValueError(f'{name}: supply-levels must be clamped or raw, '
+                             f'not {levels!r}')
+        self.clamp_supplies = levels == 'clamped'
         relay = options.get('snmp-relay', [None])[0]
         if relay is None:
             self.snmp_relay = None
@@ -290,6 +300,7 @@ class Queue:
         self.port = parts.port or 631
         self.path = parts.path or '/ipp/print'
         self.preferred = None        # address that last connected
+        self.supply_note = None      # last supply correction logged, if any
         # Affected printers report multiple-document-jobs-supported=false, so
         # jobs are serialised -- but per printer, not globally, and only around
         # the upstream exchange. Conversion happens outside the lock so one
@@ -1261,6 +1272,67 @@ PRINTER_FACTS = (
     'printer-up-time', 'printer-alert', 'printer-alert-description',
     'marker-names', 'marker-levels', 'marker-types',
 )
+
+
+def clamp_supply_levels(group):
+    """Stop a printer that says "almost empty" from also saying "empty".
+
+    A supply level below the printer's own `marker-low-levels` mark is the
+    printer calling that cartridge empty. Some firmware reports exactly that
+    while, in the same message, warning only of *low* toner, staying idle and
+    continuing to accept jobs. The M283fdw this proxy was built for has read 0%
+    on all three colour supplies for months while printing perfectly well.
+
+    That contradiction is not academic. A client that reads the reason keeps
+    working; a client that believes the number decides three cartridges are
+    empty and refuses to submit anything at all. It is why the same printer
+    prints from ChromeOS and returns "printer error" on Android, with the
+    proxy never seeing so much as a Validate-Job.
+
+    So where the printer contradicts itself, believe the half it is acting on.
+    A level it would call empty is reported as the lowest level it would not,
+    which is its own low-water mark. Nothing here is invented: the client still
+    sees a low supply, still sees the warning, and the number it sees is still
+    the printer's. The moment the printer says a supply is genuinely empty it
+    has stopped contradicting itself, and the real levels go through untouched.
+
+    Returns a description of what was corrected, or None if nothing was.
+    """
+    levels = group.get('marker-levels')
+    lows = group.get('marker-low-levels')
+    if not levels or not lows or len(levels) != len(lows):
+        return None
+    # An explicit empty condition is the printer agreeing with its own gauge.
+    # Believe it. RFC 8011 spells these `...-empty-warning`/`-error`, so the
+    # stem is what matters, not the severity.
+    reasons = [r.decode('utf-8', 'replace').lower()
+               for r in (group.get('printer-state-reasons') or [])]
+    if any('empty' in r for r in reasons):
+        return None
+    try:
+        have = [int.from_bytes(v, 'big', signed=True) for v in levels]
+        marks = [int.from_bytes(v, 'big', signed=True) for v in lows]
+    except (TypeError, ValueError):
+        return None
+    names = [n.decode('utf-8', 'replace')
+             for n in (group.get('marker-names') or [])]
+
+    fixed, corrected = [], []
+    for i, (level, mark) in enumerate(zip(have, marks)):
+        # A negative level is "unknown" (RFC 8011 uses -1, -2 and -3). A
+        # printer admitting it does not know is not contradicting itself, and
+        # a mark outside 1..100 is not a threshold worth trusting either.
+        if 0 <= level < mark <= 100:
+            fixed.append(mark)
+            corrected.append(names[i] if i < len(names) else f'supply {i + 1}')
+        else:
+            fixed.append(level)
+    if not corrected:
+        return None
+    group.replace('marker-levels', ipp.TAG_INTEGER, [ipp.i32(v) for v in fixed])
+    return (f"{', '.join(corrected)} reported below the printer's own low mark "
+            f"while it warns only of low toner; reported at that mark instead, "
+            f"so clients do not read the supply as empty")
 
 
 def printer_snapshot(queue, timeout=20):
@@ -2626,6 +2698,13 @@ def rewrite_response(cfg, queue, msg):
                                   ipp.TAG_MIMETYPE,
                                   ['application/pdf' if 'application/pdf' in kept
                                    else kept[0]])
+            # Status is otherwise passed through verbatim; this is the one
+            # exception, and only where the printer disagrees with itself.
+            if queue.clamp_supplies:
+                note = clamp_supply_levels(group)
+                if note and note != queue.supply_note:
+                    log.info('%s: %s', queue.name, note)
+                queue.supply_note = note
             group.replace('printer-name', ipp.TAG_NAME, [queue.name])
             group.replace('printer-dns-sd-name', ipp.TAG_NAME, [queue.name])
             group.replace('printer-more-info', ipp.TAG_URI, [base + '/'])

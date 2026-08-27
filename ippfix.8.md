@@ -95,6 +95,25 @@ ippfix 'Front Desk=ipp://192.0.2.10/ipp/print?page-counter=off'
   are matched to printers by the address they bound, not by what the units are
   called.
 
+* `supply-levels=clamped|raw`: whether to correct a printer that reports a
+  supply level it would itself call empty while warning only that toner is low.
+  Default `clamped`.
+
+  Some firmware reports a cartridge below its own `marker-low-levels` mark --
+  which is the printer calling that cartridge empty -- while in the same
+  message warning merely of low toner, staying idle and accepting jobs. A
+  client that reads the reason keeps printing; a client that believes the
+  number decides the cartridge is empty and refuses to submit anything at all.
+  The same printer then works from one operating system and returns "printer
+  error" on another, with no job ever reaching this proxy.
+
+  Where the printer contradicts itself like that, the level is reported at the
+  printer's own low mark instead: the client still sees a low supply and still
+  sees the warning, and the figure it sees is still the printer's own. Supplies
+  the printer does not contradict itself about are untouched, and as soon as it
+  reports a supply as genuinely empty its real levels are passed through. Use
+  `raw` to see the printer's numbers exactly as it sends them.
+
 An unrecognised option is an error rather than something ignored.
 
 # Options
