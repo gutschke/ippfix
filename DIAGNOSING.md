@@ -545,6 +545,15 @@ Later captures answered two things that had been open:
   book pages set two to a sheet rendered with nothing clipped. The demand that
   `/Matrix` be a pure translation is what keeps the repair away from it.
 
+One captured job settles a question about what to trigger on. Content landing
+outside the page box is the tempting signal -- nobody asks for a document
+shifted off the paper -- but an A4 document sent to a Com-10 envelope with
+scaling off is exactly that, and it is correct: the sender chose the envelope,
+chose not to scale, and accepted the loss. Its content runs off all four edges
+and its form `/Matrix` is the identity, so there is no second placement to
+undo. Off-page content is a symptom here, not the fault; the fault is the same
+origin being subtracted twice, and that is what is tested for.
+
 Two limits worth knowing, both of which cost a repair rather than risk one:
 
 - The fit rectangle is centred in the **printable area**, not on the sheet, so

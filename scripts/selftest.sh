@@ -2393,7 +2393,8 @@ import fakeprinter as fp
 
 
 def make(media, bbox, matrix, clip, scale, tx, ty, rotate=None, crop=None,
-         annots=None, page_cm=b'1 0 0 1 0 0 cm', prefix=b'', pages=1):
+         annots=None, page_cm=b'1 0 0 1 0 0 cm', prefix=b'', pages=1,
+         form_head=None):
     """A whole PDF with a real cross-reference table, which the repair appends to."""
     def num(v):
         # PDF has no exponent notation (7.3.3), and Python's repr reaches for
@@ -2424,10 +2425,11 @@ def make(media, bbox, matrix, clip, scale, tx, ty, rotate=None, crop=None,
         stream = prefix + b'q\nq\n' + page_cm + b'\n/X1 Do\nQ\nQ\n'
         objs[content_n] = (b'<< /Length %d >>\nstream\n' % len(stream) + stream
                            + b'endstream')
-        fit = (b'q %s %s %s %s re W* n\n%s 0 0 %s %s %s cm\n'
-               % tuple(num(v) for v in
-                       (clip[0], clip[1], clip[2], clip[3], scale, scale,
-                        tx, ty)))
+        fit = form_head if form_head is not None else (
+            b'q %s %s %s %s re W* n\n%s 0 0 %s %s %s cm\n'
+            % tuple(num(v) for v in
+                    (clip[0], clip[1], clip[2], clip[3], scale, scale,
+                     tx, ty)))
         art = fit + b'0 0 1 rg 40 40 120 120 re f\n'
         objs[form_n] = (b'<< /Type /XObject /Subtype /Form /BBox ' + nums(bbox)
                         + b' /Matrix ' + nums(matrix)
@@ -2571,6 +2573,26 @@ expect('a landscape sheet, where the matrix carries the rotation',
        make(media=[0, 0, 612, 792], bbox=[0, 0, 792, 612],
             matrix=[0, -1, 1, 0, 0, 792],
             clip=[15.5, 12, 761, 588], scale=0.96078432, tx=0, ty=0),
+       'untouched')
+# An A4 document sent to a Com-10 envelope with no scaling: the content runs
+# off all four edges and most of it is lost. That is what was asked for -- the
+# sender picked the envelope and picked no scaling -- and the /Matrix is the
+# identity, so there is no second placement to undo. It earns a test of its own
+# because "the content lands off the page" is the tempting thing to trigger on,
+# and this is a correct document where exactly that is true.
+expect('an A4 document sent to an envelope, unscaled',
+       make(media=[0, 0, 297, 684], bbox=[0, 0, 297, 684],
+            matrix=[1, 0, 0, 1, 0, 0], clip=[0, -158, 595, 842],
+            scale=1.0, tx=0, ty=-158), 'untouched')
+# The other renderer in the same client transforms before it clips, and flips
+# the y axis on the way. Reading its opening operators as a fit would be
+# reading them in the wrong order.
+expect('a renderer that transforms before it clips',
+       make(media=[0, 0, 297.12, 684], bbox=[0, 0, 684, 297.12],
+            matrix=[1, 0, 0, 1, -12, -12], clip=[0, 0, 1, 1], scale=1, tx=0,
+            ty=0,
+            form_head=b'q\n.23999999 0 0 -.23999999 0 297.12 cm\n'
+                      b'q\n118.75 118.75 2614.0625 1001.5625 re\nW* n\n'),
        'untouched')
 expect('a page that also moves the form itself',
        make(page_cm=b'1 0 0 1 40 0 cm', **REAL), 'untouched')
