@@ -1358,26 +1358,31 @@ def ticket_sheet(msg):
     return None
 
 
-def _sheet_agrees(sheet, wanted):
-    """Whether a derived sheet is the one asked for, in either orientation.
+def _matched_sheet(sheet, wanted):
+    """The real sheet a derived one is, or None if it is not one.
 
-    `wanted` is None whenever the job did not say, which is not an unusual case
-    to design around: a client that opens with Create-Job puts its media there,
-    and the Send-Document carrying the pages repeats nothing. This proxy holds
-    no per-job state to remember it with, so on that path the ticket is silent
-    and a sheet is only accepted if it is a size paper actually comes in.
+    The derived numbers come from doubling a margin, so they carry whatever
+    rounding the producer wrote; A4 arrives as 595x841 rather than
+    595.276x841.89. What goes back into the file is the size paper actually
+    comes in, not the arithmetic that recognised it.
+
+    `wanted` is None whenever the job did not say, which is the ordinary case
+    rather than an edge one: a client that opens with Create-Job states its
+    media there, and the Send-Document carrying the pages repeats nothing --
+    all four jobs captured off the wire were like that. This proxy holds no
+    per-job state to remember it with, so on that path a sheet is believed only
+    if it is a size paper comes in.
     """
-    if wanted is None:
-        return any(
-            (_near(sheet[0], w, PLACEMENT_TOLERANCE)
-             and _near(sheet[1], h, PLACEMENT_TOLERANCE))
-            or (_near(sheet[0], h, PLACEMENT_TOLERANCE)
-                and _near(sheet[1], w, PLACEMENT_TOLERANCE))
-            for w, h, _ in STANDARD_SHEETS)
-    return ((_near(sheet[0], wanted[0], PLACEMENT_TOLERANCE)
-             and _near(sheet[1], wanted[1], PLACEMENT_TOLERANCE))
-            or (_near(sheet[0], wanted[1], PLACEMENT_TOLERANCE)
-                and _near(sheet[1], wanted[0], PLACEMENT_TOLERANCE)))
+    candidates = ([wanted] if wanted is not None
+                  else [(w, h) for w, h, _ in STANDARD_SHEETS])
+    for w, h in candidates:
+        if (_near(sheet[0], w, PLACEMENT_TOLERANCE)
+                and _near(sheet[1], h, PLACEMENT_TOLERANCE)):
+            return (w, h)
+        if (_near(sheet[0], h, PLACEMENT_TOLERANCE)
+                and _near(sheet[1], w, PLACEMENT_TOLERANCE)):
+            return (h, w)
+    return None
 
 
 def _page_plan(data, index, num, body, inherited, wanted, used_forms):
@@ -1480,9 +1485,11 @@ def _page_plan(data, index, num, body, inherited, wanted, used_forms):
     # it stays this way until there is a printer here to measure.
     sheet = (2 * clip[0] + (clip[2] - clip[0]),
              2 * clip[1] + (clip[3] - clip[1]))
-    if not _sheet_agrees(sheet, wanted):
+    matched = _matched_sheet(sheet, wanted)
+    if matched is None:
         return None, (f'the implied sheet {sheet[0]:.1f}x{sheet[1]:.1f}pt is '
                       f'not the media asked for')
+    sheet = matched
     if _boxes_near(_size(media) + _size(media), sheet + sheet,
                    PLACEMENT_TOLERANCE):
         return None, None               # already the right size: nothing wrong

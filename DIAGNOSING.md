@@ -497,6 +497,21 @@ Useful facts when reading one of these:
   on its own -- no flag has to be cleared. If jobs from a fixed client are
   still being repaired, that is a bug here, not there.
 
+Four jobs captured off the wire against a printer that marks no paper say two
+more things, both of which shaped what the proxy will and will not do:
+
+- **The Send-Document carries no media.** Every one of them opened with
+  Create-Job, stated the media there, and repeated nothing on the request that
+  carried the pages. So on the path this fault actually arrives by, the ticket
+  is silent, and the sheet has to be recognised as a size paper comes in rather
+  than read from the job.
+- **A sender-chosen scale is not repairable.** Three of the four carried the
+  identical wrapper -- the same fault -- differing only in the leading scale:
+  1.5, 0.9, and 1.03298616. The clip is always the scaled page box; it
+  describes a sheet only when the scale was the one that made it fit. At 150%
+  and 90% the content is placed at the origin rather than centred, no sheet can
+  be derived, and the job is left alone. The fourth, fitted to A4, is repaired.
+
 Two limits worth knowing, both of which cost a repair rather than risk one:
 
 - The fit rectangle is centred in the **printable area**, not on the sheet, so

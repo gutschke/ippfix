@@ -2395,10 +2395,16 @@ import fakeprinter as fp
 def make(media, bbox, matrix, clip, scale, tx, ty, rotate=None, crop=None,
          annots=None, page_cm=b'1 0 0 1 0 0 cm', prefix=b'', pages=1):
     """A whole PDF with a real cross-reference table, which the repair appends to."""
+    def num(v):
+        # PDF has no exponent notation (7.3.3), and Python's repr reaches for
+        # it below 1e-4 -- which the real jobs sail past, one of them opening
+        # its clip at -.000030517578.
+        if float(v).is_integer():
+            return b'%d' % v
+        return f'{v:.9f}'.rstrip('0').rstrip('.').encode() or b'0'
+
     def nums(vals):
-        return b'[ ' + b' '.join(
-            (b'%d' % v if float(v).is_integer() else repr(v).encode())
-            for v in vals) + b' ]'
+        return b'[ ' + b' '.join(num(v) for v in vals) + b' ]'
     objs, kids, n = {}, [], 3
     for _ in range(pages):
         page_n, content_n, form_n = n, n + 1, n + 2
@@ -2419,7 +2425,7 @@ def make(media, bbox, matrix, clip, scale, tx, ty, rotate=None, crop=None,
         objs[content_n] = (b'<< /Length %d >>\nstream\n' % len(stream) + stream
                            + b'endstream')
         fit = (b'q %s %s %s %s re W* n\n%s 0 0 %s %s %s cm\n'
-               % tuple(repr(v).encode() for v in
+               % tuple(num(v) for v in
                        (clip[0], clip[1], clip[2], clip[3], scale, scale,
                         tx, ty)))
         art = fit + b'0 0 1 rg 40 40 120 120 re f\n'
@@ -2471,7 +2477,7 @@ PY2
 python3 - <<'PY2' && ok 'a page placed off the sheet is put back where its producer meant' || bad 'page placement repair'
 import os, sys
 sys.path.insert(0, os.environ['PLACED'])
-from placed import make, REAL, expect
+from placed import make, REAL, expect, ticket
 doc = make(**REAL)
 out = expect('a page placed off the sheet', doc, 'repaired')
 # The document we were handed is still in the one we send, byte for byte: the
@@ -2487,6 +2493,17 @@ assert b'/Matrix [ 1 0 0 1 0 0 ]' in tail, tail[:400]
 # Twice is once: the contradiction is gone, so there is nothing left to see.
 expect('a repaired page', out, 'untouched')
 expect('a whole document of them', make(pages=6, **REAL), 'repaired')
+# The numbers a four-page A4 job carried off the wire. The sheet is derived by
+# doubling a margin, so it arrives carrying the producer's rounding -- 595x841
+# rather than 595.276x841.89 -- and what goes into the file has to be the size
+# paper comes in, not the arithmetic that recognised it.
+a4 = expect('a job fitted to A4',
+            make(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
+                 matrix=[1, 0, 0, 1, -72, -103.5],
+                 clip=[-0.000030517578, 80.606262, 595, 679.78748],
+                 scale=1.03298616, tx=-74.375031, ty=-25.749992, pages=4),
+            'repaired', msg=ticket(None))
+assert b'/MediaBox [ 0 0 595.276 841.89 ]' in a4, 'the sheet was not snapped'
 PY2
 
 python3 - <<'PY2' && ok 'a document that only resembles one is left alone' || bad 'page placement false positives'
@@ -2502,6 +2519,22 @@ expect('a cropped page flattened by an import tool',
             matrix=[1, 0, 0, 1, -36, -36], clip=[0, 0, 612, 792],
             scale=1.0, tx=0, ty=0),
        'declined', 'in its own space')
+# Two shapes a survey of real print pipelines turned up, both correct as
+# authored and both reaching here from programs that never imposed anything:
+# Ghostscript writing a form from `execform` or a /BP../EP pdfmark, where a
+# non-zero /BBox origin is ordinary and right; and a stamping library wrapping
+# a page something else had already fitted, so the wrapper and the fit come
+# from different programs and neither is wrong. Both are turned away by the
+# equation rather than by an incidental guard, which is the point of having it.
+expect('a form written from a PostScript form or a pdfmark',
+       make(media=[0, 0, 612, 792], bbox=[20, 30, 520, 730],
+            matrix=[1, 0, 0, 1, -20, -30], clip=[70, 130, 400, 500],
+            scale=1.0, tx=0, ty=0), 'declined', 'in its own space')
+expect('a stamp laid over an already-fitted page',
+       make(media=[0, 0, 576, 657], bbox=[36, 36, 612, 693],
+            matrix=[1, 0, 0, 1, -36, -36],
+            clip=[12, 60.10498, 588, 671.79004], scale=1.02083337,
+            tx=-61.5, ty=-45.000023), 'declined', 'in its own space')
 # Each guard on the real numbers, so that only the named thing differs.
 expect('a page already the size of its sheet',
        make(**dict(REAL, media=[0, 0, 612, 792], bbox=[0, 0, 612, 792],
@@ -2524,6 +2557,23 @@ expect('a page that also moves the form itself',
        make(page_cm=b'1 0 0 1 40 0 cm', **REAL), 'untouched')
 expect('a page with anything else in its content stream',
        make(prefix=b'0.1 w\n', **REAL), 'untouched')
+# Two more sets of numbers off the wire, carrying the identical wrapper and so
+# the identical fault, but scaled by a sender who chose 150% and 90% rather
+# than by a fit. The clip is always the scaled page box; it describes a sheet
+# only when the scale was the one that made it fit, and these were placed at
+# the origin rather than centred. Left alone -- a job not repaired, which is
+# what happens today anyway.
+expect('the same fault at a sender-chosen 150%',
+       make(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
+            matrix=[1, 0, 0, 1, -72, -103.5],
+            clip=[0, -195.11993, 864, 987.11993], scale=1.5,
+            tx=-108, ty=-349.55994), 'declined', 'outside the sheet')
+expect('the same fault at a sender-chosen 90%',
+       make(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
+            matrix=[1, 0, 0, 1, -72, -103.5],
+            clip=[0, 199.72803, 518.40002, 592.27197], scale=0.89999998,
+            tx=-64.799995, ty=107.064026),
+       'declined', 'not the media asked for')
 PY2
 
 python3 - <<'PY2' && ok 'the sheet comes from the ticket, and the repair can be turned off' || bad 'page-geometry option'
