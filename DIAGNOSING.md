@@ -531,6 +531,20 @@ more things, both of which shaped what the proxy will and will not do:
   -- is stated on the Create-Job, which is why `scripts/fakeprinter.py` is
   worth pointing a client at: it can record that half.
 
+Later captures answered two things that had been open:
+
+- **The sheet derived from the clip is the sheet the client asked for.** The
+  proxy cannot see the media on the request that carries the pages, so it
+  recognises the sheet from the fit rectangle instead. Against tickets recorded
+  on the Create-Job, that inference has agreed every time -- Letter where the
+  client sent 612x792, A4 where it sent 210x297mm. The recognition is doing the
+  same job the ticket would.
+- **Landscape is not affected.** A client turning pages on their side puts the
+  rotation in the form's `/Matrix`, which absorbs the source box's origin
+  instead of applying it a second time, and the page comes out correct. Two
+  book pages set two to a sheet rendered with nothing clipped. The demand that
+  `/Matrix` be a pure translation is what keeps the repair away from it.
+
 Two limits worth knowing, both of which cost a repair rather than risk one:
 
 - The fit rectangle is centred in the **printable area**, not on the sheet, so

@@ -2504,6 +2504,15 @@ a4 = expect('a job fitted to A4',
                  scale=1.03298616, tx=-74.375031, ty=-25.749992, pages=4),
             'repaired', msg=ticket(None))
 assert b'/MediaBox [ 0 0 595.276 841.89 ]' in a4, 'the sheet was not snapped'
+# A sender that asked for no margins fits to the paper edge rather than to the
+# printable area, so the clip starts at zero and the scale is the whole width
+# over the page width. Still centred, still the same fault, still repairable --
+# the repaired page just runs ink to both edges, which is what was asked for.
+expect('a job fitted to the paper edge rather than the printable area',
+       make(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
+            matrix=[1, 0, 0, 1, -72, -103.5],
+            clip=[0, 46.395, 612, 699.21], scale=1.0625,
+            tx=-76.5, ty=-63.548438), 'repaired')
 PY2
 
 python3 - <<'PY2' && ok 'a document that only resembles one is left alone' || bad 'page placement false positives'
@@ -2553,6 +2562,16 @@ expect('a document whose pages disagree', mixed, 'declined',
 # Not this shape at all, and silent about it: a page that was never somebody
 # else's page re-placed is an ordinary page, and a report per ordinary page
 # would bury the reports that mean something.
+# Two pages of a book turned on their side and set two to a sheet, as a client
+# does for landscape. The rotation goes into the form's /Matrix, which absorbs
+# the source box's origin instead of applying it a second time -- so this shape
+# is correct as sent, and the demand that /Matrix be a pure translation is what
+# keeps hands off it.
+expect('a landscape sheet, where the matrix carries the rotation',
+       make(media=[0, 0, 612, 792], bbox=[0, 0, 792, 612],
+            matrix=[0, -1, 1, 0, 0, 792],
+            clip=[15.5, 12, 761, 588], scale=0.96078432, tx=0, ty=0),
+       'untouched')
 expect('a page that also moves the form itself',
        make(page_cm=b'1 0 0 1 40 0 cm', **REAL), 'untouched')
 expect('a page with anything else in its content stream',
