@@ -114,6 +114,36 @@ ippfix 'Front Desk=ipp://192.0.2.10/ipp/print?page-counter=off'
   reports a supply as genuinely empty its real levels are passed through. Use
   `raw` to see the printer's numbers exactly as it sends them.
 
+* `page-geometry=repair|raw`: whether to put back a page whose sender placed it
+  off the sheet. Default `repair`.
+
+  A print path that imports a page and then fits it to the paper makes two
+  placement decisions, and can end up applying both. The page then declares one
+  size while its content was arranged for another: the printer believes the
+  declaration, and a band down one edge is never printed. Seen from `pdftopdf`,
+  which wraps an imported page in a form XObject whose `/BBox` is one of the
+  source page's boxes and whose `/Matrix` translates by that box's negated
+  corner, and then prepends a fit-to-printable-area transform without resetting
+  either.
+
+  Nothing here keys on a producer name; a job carrying this fault names in
+  `/Producer` whichever program produced the input, not the one that placed the
+  page. What is recognised is arithmetic. A page whose whole content is one form
+  drawn once, whose `/Matrix` undoes its own `/BBox`, and whose content opens
+  with a clip and a uniform scale, is a page somebody re-placed. It is repaired
+  only if pushing the `/BBox` through that scale lands it on that clip -- which
+  is the mistake stated as an equation -- and only if the sheet the clip is
+  centred on is the media the job asked for, and the page says it is a different
+  size. Every page must qualify or none is touched.
+
+  The repair is an append: the document that arrived is still present, byte for
+  byte, inside the one that is sent. Before sending, the region of the page that
+  reaches paper is computed both ways and the job goes unrepaired unless the new
+  one contains the old and is larger. Whether repaired or not, a page of this
+  shape is logged and, with `--alert-mail`, reported -- including the near
+  misses, because a shape nobody has seen yet is the thing worth having a copy
+  of. Use `raw` to send what arrived.
+
 An unrecognised option is an error rather than something ignored.
 
 # Options

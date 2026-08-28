@@ -2376,6 +2376,190 @@ else
   bad 'scripts/selftest-pagerange.sh is missing or not executable'
 fi
 
+# A print path that imports a page and then fits it to the paper can apply
+# both placements at once, leaving the page declaring one size while its
+# content was arranged for another. The documents here are assembled rather
+# than captured: the shapes are what is under test, and nobody's document
+# belongs in this tree.
+echo 'page placement'
+export PLACED="$work"
+cat > "$work/placed.py" <<'PY2'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippfix
+import ippcodec as ipp
+import fakeprinter as fp
+
+
+def make(media, bbox, matrix, clip, scale, tx, ty, rotate=None, crop=None,
+         annots=None, page_cm=b'1 0 0 1 0 0 cm', prefix=b'', pages=1):
+    """A whole PDF with a real cross-reference table, which the repair appends to."""
+    def nums(vals):
+        return b'[ ' + b' '.join(
+            (b'%d' % v if float(v).is_integer() else repr(v).encode())
+            for v in vals) + b' ]'
+    objs, kids, n = {}, [], 3
+    for _ in range(pages):
+        page_n, content_n, form_n = n, n + 1, n + 2
+        n += 3
+        kids.append(page_n)
+        extra = b''
+        if rotate is not None:
+            extra += b' /Rotate %d' % rotate
+        if crop is not None:
+            extra += b' /CropBox ' + nums(crop)
+        if annots is not None:
+            extra += b' /Annots ' + annots
+        objs[page_n] = (b'<< /Type /Page /Parent 2 0 R /MediaBox ' + nums(media)
+                        + extra
+                        + b' /Resources << /XObject << /X1 %d 0 R >> >>' % form_n
+                        + b' /Contents %d 0 R >>' % content_n)
+        stream = prefix + b'q\nq\n' + page_cm + b'\n/X1 Do\nQ\nQ\n'
+        objs[content_n] = (b'<< /Length %d >>\nstream\n' % len(stream) + stream
+                           + b'endstream')
+        fit = (b'q %s %s %s %s re W* n\n%s 0 0 %s %s %s cm\n'
+               % tuple(repr(v).encode() for v in
+                       (clip[0], clip[1], clip[2], clip[3], scale, scale,
+                        tx, ty)))
+        art = fit + b'0 0 1 rg 40 40 120 120 re f\n'
+        objs[form_n] = (b'<< /Type /XObject /Subtype /Form /BBox ' + nums(bbox)
+                        + b' /Matrix ' + nums(matrix)
+                        + b' /Length %d >>\nstream\n' % len(art) + art
+                        + b'endstream')
+    objs[1] = b'<< /Type /Catalog /Pages 2 0 R >>'
+    objs[2] = (b'<< /Type /Pages /Count %d /Kids [ ' % pages
+               + b' '.join(b'%d 0 R' % k for k in kids) + b' ] >>')
+    out = bytearray(b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n')
+    offsets = {}
+    for num in sorted(objs):
+        offsets[num] = len(out)
+        out += b'%d 0 obj\n' % num + objs[num] + b'\nendobj\n'
+    at = len(out)
+    out += b'xref\n0 %d\n0000000000 65535 f \n' % (max(objs) + 1)
+    for num in range(1, max(objs) + 1):
+        out += b'%010d 00000 n \n' % offsets[num]
+    out += (b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n'
+            % (max(objs) + 1, at))
+    return bytes(out)
+
+
+# The numbers two real jobs carried, so the case that matters is pinned as it
+# was measured and not as it is remembered.
+REAL = dict(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
+            matrix=[1, 0, 0, 1, -72, -103.5],
+            clip=[12, 60.10498, 588, 671.79004], scale=1.02083337,
+            tx=-61.5, ty=-45.000023)
+
+
+def ticket(media=b'na_letter_8.5x11in'):
+    if media is None:
+        return fp.job_request(fp.OP_PRINT_JOB, 1, 'ipp://p/ipp/print')
+    return fp.job_request(fp.OP_PRINT_JOB, 1, 'ipp://p/ipp/print',
+                          media=(ipp.TAG_KEYWORD, [media]))
+
+
+def expect(what, doc, want, contains='', msg=None):
+    out, note, notes = ippfix.repair_placement(doc, msg or ticket())
+    got = 'repaired' if note else ('declined' if notes else 'untouched')
+    why = note or '; '.join(notes)
+    assert got == want, f'{what}: expected {want}, got {got} ({why})'
+    assert contains in why, f'{what}: expected {contains!r} in {why!r}'
+    return out
+PY2
+
+python3 - <<'PY2' && ok 'a page placed off the sheet is put back where its producer meant' || bad 'page placement repair'
+import os, sys
+sys.path.insert(0, os.environ['PLACED'])
+from placed import make, REAL, expect
+doc = make(**REAL)
+out = expect('a page placed off the sheet', doc, 'repaired')
+# The document we were handed is still in the one we send, byte for byte: the
+# repair is an append, so nothing it did not understand can have been lost.
+assert out.startswith(doc), 'the repair rewrote bytes it was given'
+tail = out[len(doc):]
+assert b'/MediaBox [ 0 0 612 792 ]' in tail, tail[:400]
+# /BBox becomes the producer's own clip, not the whole sheet: the two print
+# alike, and this way nothing the form can paint escapes the region its
+# producer already chose.
+assert b'/BBox [ 12 60.10498 600 731.89502 ]' in tail, tail[:400]
+assert b'/Matrix [ 1 0 0 1 0 0 ]' in tail, tail[:400]
+# Twice is once: the contradiction is gone, so there is nothing left to see.
+expect('a repaired page', out, 'untouched')
+expect('a whole document of them', make(pages=6, **REAL), 'repaired')
+PY2
+
+python3 - <<'PY2' && ok 'a document that only resembles one is left alone' || bad 'page placement false positives'
+import os, sys
+sys.path.insert(0, os.environ['PLACED'])
+from placed import make, REAL, expect, ticket
+# The discriminator. A page cropped and flattened by an import tool has the
+# same wrapper and a clip that is centred on Letter by construction -- and
+# repairing it would print exactly what the crop was there to remove. What
+# separates it is that its /BBox is in the space it says it is in.
+expect('a cropped page flattened by an import tool',
+       make(media=[0, 0, 540, 720], bbox=[36, 36, 576, 756],
+            matrix=[1, 0, 0, 1, -36, -36], clip=[0, 0, 612, 792],
+            scale=1.0, tx=0, ty=0),
+       'declined', 'in its own space')
+# Each guard on the real numbers, so that only the named thing differs.
+expect('a page already the size of its sheet',
+       make(**dict(REAL, media=[0, 0, 612, 792], bbox=[0, 0, 612, 792],
+                   matrix=[1, 0, 0, 1, 0, 0])), 'untouched')
+expect('a rotated page', make(rotate=90, **REAL), 'declined', 'rotated')
+expect('a page carrying annotations', make(annots=b'[ 99 0 R ]', **REAL),
+       'declined', 'annotations')
+expect('a page with a CropBox of its own',
+       make(crop=[10, 10, 500, 600], **REAL), 'declined', 'CropBox of its own')
+expect('a sheet that is not the media asked for', make(**REAL), 'declined',
+       'not the media asked for', msg=ticket(b'iso_a4_210x297mm'))
+mixed = make(pages=2, **REAL).replace(b'/Matrix [ 1 0 0 1 -72 -103.5 ]',
+                                      b'/Matrix [ 1 0 0 1 0 0 ]     ', 1)
+expect('a document whose pages disagree', mixed, 'declined',
+       'a mixed document is left alone')
+# Not this shape at all, and silent about it: a page that was never somebody
+# else's page re-placed is an ordinary page, and a report per ordinary page
+# would bury the reports that mean something.
+expect('a page that also moves the form itself',
+       make(page_cm=b'1 0 0 1 40 0 cm', **REAL), 'untouched')
+expect('a page with anything else in its content stream',
+       make(prefix=b'0.1 w\n', **REAL), 'untouched')
+PY2
+
+python3 - <<'PY2' && ok 'the sheet comes from the ticket, and the repair can be turned off' || bad 'page-geometry option'
+import os, sys
+sys.path.insert(0, os.environ['PLACED'])
+sys.path.insert(0, '.')
+import ippfix
+from placed import make, REAL, expect, ticket
+assert ippfix.ticket_sheet(ticket()) == (612.0, 792.0)
+a4 = ippfix.ticket_sheet(ticket(b'iso_a4_210x297mm'))
+assert abs(a4[0] - 595.28) < 0.1 and abs(a4[1] - 841.89) < 0.1, a4
+# A client that names no media is not a client to invent one for, but a sheet
+# that is a standard size is still recognised for what it is.
+assert ippfix.ticket_sheet(ticket(None)) is None
+expect('a job whose ticket names no media', make(**REAL), 'repaired',
+       msg=ticket(None))
+assert ippfix.Queue('a', 'ipp://p/ipp/print').repair_placement is True
+assert ippfix.Queue(
+    'a', 'ipp://p/ipp/print?page-geometry=repair').repair_placement is True
+assert ippfix.Queue(
+    'a', 'ipp://p/ipp/print?page-geometry=RAW').repair_placement is False
+for typo in ('yes', 'off', ''):
+    try:
+        ippfix.Queue('a', f'ipp://p/ipp/print?page-geometry={typo}')
+    except ValueError:
+        continue
+    raise AssertionError(f'accepted page-geometry={typo!r}')
+# Anything it cannot read is refused rather than guessed at.
+for junk in (b'%PDF-1.7\nnothing here\n', b'not a pdf at all'):
+    try:
+        ippfix.repair_placement(junk, ticket())
+    except ippfix.NotPlaced:
+        continue
+    raise AssertionError('unreadable input was not refused')
+PY2
+
 echo 'documentation'
 check 'man page renders without warnings' \
       "[ -z \"\$(man --warnings -l ./ippfix.8 2>&1 >/dev/null)\" ]"

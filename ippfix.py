@@ -248,7 +248,7 @@ class Queue:
     # silently ignored is how a printer ends up not doing what its
     # configuration says it does.
     URI_OPTIONS = ('page-counter', 'community', 'snmp-relay',
-                   'supply-levels')
+                   'supply-levels', 'page-geometry')
 
     def __init__(self, name, uri):
         parts = urllib.parse.urlsplit(uri)
@@ -281,6 +281,14 @@ class Queue:
             raise ValueError(f'{name}: supply-levels must be clamped or raw, '
                              f'not {levels!r}')
         self.clamp_supplies = levels == 'clamped'
+        # Whether to put back a page whose sender placed it off the sheet. See
+        # repair_placement(). "raw" sends what arrived, which is what to set
+        # if a repaired sheet ever comes out worse than an unrepaired one.
+        geometry = options.get('page-geometry', ['repair'])[0].lower()
+        if geometry not in ('repair', 'raw'):
+            raise ValueError(f'{name}: page-geometry must be repair or raw, '
+                             f'not {geometry!r}')
+        self.repair_placement = geometry == 'repair'
         relay = options.get('snmp-relay', [None])[0]
         if relay is None:
             self.snmp_relay = None
@@ -1009,6 +1017,788 @@ def normalise_pdf(data):
 
 def looks_like_pdf(data):
     return normalise_pdf(data) is not None
+
+
+# ---------------------------------------------------------------------------
+# Page placement
+#
+# A print path that imports a page and then fits it to the paper has to make
+# two decisions -- where the imported page's own origin is, and where the fit
+# puts it on the sheet -- and it is possible to make both and apply both. When
+# that happens the document says two incompatible things about itself, and the
+# printer believes the wrong one: content lands off the sheet, and a band down
+# one edge is never printed at all.
+#
+# This has been seen from cups-filters' pdftopdf, which wraps an imported page
+# in a form XObject using qpdf's idiom -- /BBox is one of the source page's
+# boxes and /Matrix translates by that box's negated lower-left -- and then
+# prepends a fit-to-printable-area transform to the form's content without
+# resetting either. Nothing here keys on that, or on any producer string: the
+# captured jobs carry /Producer (PDFium) because pdftopdf preserved the Info
+# dictionary of its own input, so the producer names a program that had nothing
+# to do with the geometry. The signature that matters is arithmetic.
+# ---------------------------------------------------------------------------
+
+# How close two placements have to be before they are called the same. The
+# real jobs miss by 1.1pt, because pdftopdf wrapped the page using its TrimBox
+# while computing the fit from its CropBox; healthy files that resemble this
+# shape miss by 6 to 594pt. So the gap between "is this" and "is not this" is
+# wide, and the threshold only has to sit inside it.
+PLACEMENT_TOLERANCE = 2.0
+# Where a value is meant to be the same number written twice, it is.
+EXACT_TOLERANCE = 0.01
+# A job with more pages than this is not inspected. The check is cheap, but a
+# document is attacker-supplied and a bound that exists is worth more than one
+# that is argued to be unnecessary.
+MAX_PLACEMENT_PAGES = 512
+
+# Sheets recognised when the job ticket does not name its media. Widths and
+# heights in points, portrait; both orientations are matched.
+STANDARD_SHEETS = (
+    (612.0, 792.0, 'na_letter_8.5x11in'),
+    (612.0, 1008.0, 'na_legal_8.5x14in'),
+    (595.276, 841.89, 'iso_a4_210x297mm'),
+    (419.528, 595.276, 'iso_a5_148x210mm'),
+    (841.89, 1190.55, 'iso_a3_297x420mm'),
+    (522.0, 756.0, 'na_executive_7.25x10.5in'),
+    (792.0, 1224.0, 'na_ledger_11x17in'),
+)
+
+_TOKEN = re.compile(rb"""
+      (?P<comment>%[^\r\n]*)
+    | (?P<name>/[^\s/\[\]<>(){}%]*)
+    | (?P<number>[-+]?(?:\d+\.\d*|\.\d+|\d+))
+    | (?P<other>[\[\]<>(){}]|[^\s/\[\]<>(){}%]+)
+""", re.X)
+
+
+class NotPlaced(Exception):
+    """This document is not the shape the repair knows how to reason about."""
+
+
+def _tokens(blob, limit=None):
+    """Operands and operators, in order. Comments are not tokens.
+
+    Stops at the first delimiter that starts something this cannot read -- a
+    string, a dictionary, an inline image. Every use here is a fixed opening
+    sequence of operators, so meeting one of those means the answer is "no"
+    rather than "look harder".
+    """
+    out = []
+    for m in _TOKEN.finditer(blob):
+        kind = m.lastgroup
+        if kind == 'comment':
+            continue
+        text = m.group()
+        if kind == 'other' and text in (b'[', b']', b'<', b'>', b'(', b')',
+                                        b'{', b'}'):
+            break
+        out.append((kind, text))
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
+def _numbers(text):
+    """Every number in a PDF array, in order. Returns None if any is not one."""
+    body = text.strip()
+    if body[:1] == b'[':
+        body = body[1:-1] if body[-1:] == b']' else body[1:]
+    out = []
+    for word in body.split():
+        try:
+            out.append(float(word))
+        except ValueError:
+            return None
+    return out
+
+
+def _box(nums):
+    """A rectangle as (x0, y0, x1, y1), normalised.
+
+    7.9.5 allows any two diagonally opposite corners, so the numbers as written
+    are not necessarily lower-left first, and arithmetic that assumes they are
+    is arithmetic on a rectangle the file does not contain.
+    """
+    if not nums or len(nums) != 4:
+        return None
+    x0, y0, x1, y1 = nums
+    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
+
+def _rect(x, y, w, h):
+    """The `re` operator's rectangle. Negative width and height are legal."""
+    return (min(x, x + w), min(y, y + h), max(x, x + w), max(y, y + h))
+
+
+def _size(box):
+    return (box[2] - box[0], box[3] - box[1])
+
+
+def _near(a, b, tol):
+    return abs(a - b) <= tol
+
+
+def _boxes_near(a, b, tol):
+    return all(_near(p, q, tol) for p, q in zip(a, b))
+
+
+def _intersect(a, b):
+    out = (max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3]))
+    return out if out[2] > out[0] and out[3] > out[1] else None
+
+
+def _contains(outer, inner, tol=EXACT_TOLERANCE):
+    return (inner[0] >= outer[0] - tol and inner[1] >= outer[1] - tol
+            and inner[2] <= outer[2] + tol and inner[3] <= outer[3] + tol)
+
+
+def _area(box):
+    return (box[2] - box[0]) * (box[3] - box[1]) if box else 0.0
+
+
+# Attributes a page inherits from its ancestors in the page tree
+# (7.7.3, inheritance of page attributes).
+# Reading MediaBox off the page object alone is wrong whenever it was written
+# once on the /Pages node, which is the common way to write it.
+_INHERITABLE = (b'Resources', b'MediaBox', b'CropBox', b'Rotate')
+
+
+def _raw_value(body, key):
+    """The bytes of `key`'s value in a dictionary, whatever kind it is."""
+    m = re.search(rb'/' + key + rb'(?![A-Za-z0-9])\s*', body)
+    if not m:
+        return None
+    rest = body[m.end():]
+    if rest[:1] == b'[':
+        depth, i = 0, 0
+        while i < len(rest):
+            if rest[i:i + 1] == b'[':
+                depth += 1
+            elif rest[i:i + 1] == b']':
+                depth -= 1
+                if depth == 0:
+                    return rest[:i + 1]
+            i += 1
+        return None
+    if rest[:2] == b'<<':
+        return _balanced_dict(rest, 0) or None
+    m = re.match(rb'\d+\s+\d+\s+R\b|/[^\s/\[\]<>(){}%]*|[-+]?[\d.]+|\w+', rest)
+    return m.group() if m else None
+
+
+def _pages(data, index):
+    """Every page object, in document order, with inherited attributes.
+
+    Yields (objnum, body, inherited) where `inherited` holds the attributes an
+    ancestor supplied. Raises NotPlaced rather than guessing at anything it
+    cannot follow.
+    """
+    root = None
+    for num, start in index.items():
+        end = data.find(b'endobj', start)
+        body = data[start:end if end > 0 else start + 4096]
+        if re.search(rb'/Type\s*/Catalog\b', body):
+            root = _raw_value(body, b'Pages')
+            break
+    if root is None:
+        raise NotPlaced('no catalogue')
+    out = []
+
+    def walk(ref, inherited, depth):
+        if depth > 32 or len(out) > MAX_PLACEMENT_PAGES:
+            raise NotPlaced('page tree too deep or too large')
+        m = re.match(rb'(\d+)\s+\d+\s+R\b', ref.strip())
+        if not m:
+            raise NotPlaced('page tree holds something that is not a reference')
+        num = int(m.group(1))
+        start = index.get(num)
+        if start is None:
+            raise NotPlaced(f'object {num} is not in the file')
+        end = data.find(b'endobj', start)
+        body = data[start:end if end > 0 else start + 4096]
+        here = dict(inherited)
+        for key in _INHERITABLE:
+            value = _raw_value(body, key)
+            if value is not None:
+                here[key] = value
+        if re.search(rb'/Type\s*/Pages\b', body):
+            kids = _raw_value(body, b'Kids')
+            if kids is None:
+                raise NotPlaced('a /Pages node with no /Kids')
+            for kid in re.findall(rb'\d+\s+\d+\s+R', kids):
+                walk(kid, here, depth + 1)
+            return
+        if not re.search(rb'/Type\s*/Page(?![a-zA-Z])', body):
+            raise NotPlaced('page tree holds something that is not a page')
+        out.append((num, body, here))
+
+    walk(root, {}, 0)
+    if not out:
+        raise NotPlaced('no pages')
+    return out
+
+
+def _single_form_invocation(data, index, body, inherited):
+    """The one form a page draws and nothing else, or None.
+
+    The page's whole content has to be `q q [identity cm] /X Do Q Q`. Anything
+    else -- a leading `0.1 w`, a watermark drawn afterwards, a second `Do` --
+    means the page is not simply somebody else's page re-placed, and the
+    reasoning below does not apply to it. A translation in that `cm` is
+    refused too: it is a placement decision this cannot see the intent of, and
+    the repair would silently drop it.
+    """
+    contents = _raw_value(body, b'Contents')
+    if contents is None:
+        return None
+    refs = [int(n) for n in re.findall(rb'(\d+)\s+\d+\s+R', contents)]
+    if len(refs) != 1:
+        return None                      # an array of streams: not this shape
+    try:
+        stream = _stream_payload(data, index, refs[0])
+    except Unreadable:
+        return None
+    want = [b'q', b'q', b'/X', b'Do', b'Q', b'Q']
+    got = _tokens(stream, limit=16)
+    words = [t for _, t in got]
+    if words[:2] != [b'q', b'q']:
+        return None
+    rest = words[2:]
+    if rest[:7] == [b'1', b'0', b'0', b'1', b'0', b'0', b'cm']:
+        rest = rest[7:]
+    if len(rest) != 4 or rest[1] != b'Do' or rest[2:] != [b'Q', b'Q']:
+        return None
+    if not rest[0].startswith(b'/'):
+        return None
+    name = rest[0]
+    resources = inherited.get(b'Resources')
+    if resources is None:
+        return None
+    if resources.strip().endswith(b'R'):
+        resources = _resolve(data, index, resources)
+        start = resources.find(b'<<')
+        resources = _balanced_dict(resources, start) if start >= 0 else b''
+    xobjects = _sub_dict(data, index, resources, b'XObject')
+    if not xobjects:
+        return None
+    entries = re.findall(rb'(/[^\s/\[\]<>(){}%]+)\s+(\d+)\s+\d+\s+R', xobjects)
+    if len(entries) != 1 or entries[0][0] != name:
+        return None
+    return int(entries[0][1])
+
+
+def _leading_fit(stream):
+    """The clip rectangle and uniform scale a fit-to-paper transform opens with.
+
+    Returns (clip, scale, tx, ty). The clip is only established by the painting
+    operator that follows `W`/`W*` (8.5.4), so that operator has to be there.
+    """
+    words = [t for _, t in _tokens(stream, limit=24)]
+    if words[:1] != [b'q']:
+        return None
+    try:
+        x, y, w, h = (float(v) for v in words[1:5])
+    except (ValueError, IndexError):
+        return None
+    if words[5:6] not in ([b're'],):
+        return None
+    if words[6:7] not in ([b'W'], [b'W*']):
+        return None
+    if words[7:8] != [b'n']:
+        return None
+    try:
+        a, b, c, d, tx, ty = (float(v) for v in words[8:14])
+    except (ValueError, IndexError):
+        return None
+    if words[14:15] != [b'cm']:
+        return None
+    # Uniform, positive, no rotation or skew. A flip or a rotation is a
+    # placement this does not know how to undo, so it is not one to touch.
+    if b != 0 or c != 0 or a <= 0 or not _near(a, d, 1e-9):
+        return None
+    return _rect(x, y, w, h), a, tx, ty
+
+
+_MEDIA_NAME = re.compile(rb'_([0-9.]+)x([0-9.]+)(in|mm)$')
+
+
+def ticket_sheet(msg):
+    """The sheet the client asked for, in points, or None if it did not say.
+
+    `media` is a PWG 5101.1 self-describing name and carries its own
+    dimensions, so no table of paper sizes has to be right for this to work.
+    `media-col` carries them as hundredths of a millimetre.
+    """
+    for group in msg.groups:
+        col = group.get('media-col') or []
+        want = {}
+        for i, item in enumerate(col):
+            if item in (b'x-dimension', b'y-dimension') and i + 1 < len(col):
+                value = col[i + 1]
+                if isinstance(value, bytes) and len(value) == 4:
+                    want[item] = int.from_bytes(value, 'big', signed=True)
+        if len(want) == 2:
+            x, y = want[b'x-dimension'], want[b'y-dimension']
+            if x > 0 and y > 0:
+                return (x * 72.0 / 2540.0, y * 72.0 / 2540.0)
+    for group in msg.groups:
+        for value in (group.get('media') or []):
+            m = _MEDIA_NAME.search(value if isinstance(value, bytes)
+                                   else str(value).encode())
+            if not m:
+                continue
+            try:
+                w, h = float(m.group(1)), float(m.group(2))
+            except ValueError:
+                continue
+            per = 72.0 if m.group(3) == b'in' else 72.0 / 25.4
+            if w > 0 and h > 0:
+                return (w * per, h * per)
+    return None
+
+
+def _sheet_agrees(sheet, wanted):
+    """Whether a derived sheet is the one asked for, in either orientation.
+
+    `wanted` is None whenever the job did not say, which is not an unusual case
+    to design around: a client that opens with Create-Job puts its media there,
+    and the Send-Document carrying the pages repeats nothing. This proxy holds
+    no per-job state to remember it with, so on that path the ticket is silent
+    and a sheet is only accepted if it is a size paper actually comes in.
+    """
+    if wanted is None:
+        return any(
+            (_near(sheet[0], w, PLACEMENT_TOLERANCE)
+             and _near(sheet[1], h, PLACEMENT_TOLERANCE))
+            or (_near(sheet[0], h, PLACEMENT_TOLERANCE)
+                and _near(sheet[1], w, PLACEMENT_TOLERANCE))
+            for w, h, _ in STANDARD_SHEETS)
+    return ((_near(sheet[0], wanted[0], PLACEMENT_TOLERANCE)
+             and _near(sheet[1], wanted[1], PLACEMENT_TOLERANCE))
+            or (_near(sheet[0], wanted[1], PLACEMENT_TOLERANCE)
+                and _near(sheet[1], wanted[0], PLACEMENT_TOLERANCE)))
+
+
+def _page_plan(data, index, num, body, inherited, wanted, used_forms):
+    """What to rewrite on one page, or a reason not to.
+
+    Returns (plan, None) or (None, reason). `plan` carries every number the
+    repair and the check afterwards need, so neither has to parse anything a
+    second time and reach a different answer.
+    """
+    # The shape first, and quietly. Every guard below this reports itself,
+    # because past this point the page IS somebody else's page re-placed and a
+    # near miss is evidence worth keeping; a page that was never that shape is
+    # simply an ordinary page and saying so about each one would bury the
+    # reports that matter.
+    form_num = _single_form_invocation(data, index, body, inherited)
+    if form_num is None:
+        return None, None               # not this shape at all: stay quiet
+    if form_num in used_forms:
+        return None, 'the same form is drawn by more than one page'
+    start = index.get(form_num)
+    if start is None:
+        return None, 'the form is not in the file'
+    end = data.find(b'endobj', start)
+    form = data[start:end if end > 0 else start + 4096]
+    if not re.search(rb'/Subtype\s*/Form\b', form):
+        return None, None
+    bbox = _box(_numbers(_raw_value(form, b'BBox') or b''))
+    matrix = _numbers(_raw_value(form, b'Matrix') or b'')
+    if bbox is None or matrix is None or len(matrix) != 6:
+        return None, None
+    a, b, c, d, mx, my = matrix
+    if (a, b, c, d) != (1.0, 0.0, 0.0, 1.0):
+        return None, None               # not a pure translation
+    if _near(mx, 0, EXACT_TOLERANCE) and _near(my, 0, EXACT_TOLERANCE):
+        return None, None               # nothing was normalised away
+    # The import idiom: /Matrix undoes /BBox's own origin. From here on the
+    # page is one somebody else's page re-placed, and a report is owed whether
+    # or not it turns out to be repairable.
+    if not (_near(mx, -bbox[0], EXACT_TOLERANCE)
+            and _near(my, -bbox[1], EXACT_TOLERANCE)):
+        return None, None
+
+    rotate = inherited.get(b'Rotate')
+    if rotate is not None and rotate.strip() != b'0':
+        # Rotation is applied to the whole composed page, so a repair that set
+        # the page to the sheet would deliver the sheet turned on its side.
+        return None, 'the page is rotated'
+    if _raw_value(body, b'UserUnit') is not None:
+        return None, 'the page sets /UserUnit'
+    annots = _raw_value(body, b'Annots')
+    if annots is not None and annots.strip() not in (b'[]', b'[ ]'):
+        # /Rect is in default user space and does not follow the content, so
+        # moving the content under an annotation misregisters it (12.5.2).
+        return None, 'the page carries annotations'
+    media = _box(_numbers(inherited.get(b'MediaBox') or b''))
+    if media is None or _size(media)[0] <= 0 or _size(media)[1] <= 0:
+        return None, 'no usable /MediaBox'
+    crop_box = _box(_numbers(inherited.get(b'CropBox') or b''))
+    if crop_box is not None and not _boxes_near(crop_box, media,
+                                                EXACT_TOLERANCE):
+        # CropBox is what clips (14.11.2, page boundaries). One that differs
+        # from MediaBox is a second placement decision, and undoing only the
+        # ones understood here would leave the page clipped by the one that
+        # is not.
+        return None, 'the page has a /CropBox of its own'
+
+    try:
+        stream = _stream_payload(data, index, form_num)
+    except Unreadable:
+        return None, 'the form content could not be read'
+    fit = _leading_fit(stream)
+    if fit is None:
+        return None, 'the form does not open with a fit transform'
+    clip, scale, tx, ty = fit
+
+    # The discriminator. If /BBox is in the space the content was in BEFORE the
+    # fit, then pushing it through the fit lands it on the fit's own clip --
+    # which is exactly the mistake, stated as an equation. A file whose /BBox
+    # is in the space it claims to be in misses this by tens to hundreds of
+    # points.
+    imaged = (scale * bbox[0] + tx, scale * bbox[1] + ty,
+              scale * bbox[2] + tx, scale * bbox[3] + ty)
+    error = max(abs(p - q) for p, q in zip(imaged, clip))
+    if error > PLACEMENT_TOLERANCE:
+        return None, (f'the form /BBox is in its own space '
+                      f'(off by {error:.1f}pt)')
+    if not _boxes_near(_size(media) + _size(media), _size(bbox) + _size(bbox),
+                       EXACT_TOLERANCE):
+        return None, 'the page is not the size of the form /BBox'
+    if clip[0] < -EXACT_TOLERANCE or clip[1] < -EXACT_TOLERANCE:
+        return None, 'the fit rectangle starts outside the sheet'
+    # The fit rectangle is centred, so the sheet is what it is centred on.
+    #
+    # Centred in the printable area, strictly, not on the sheet -- which is the
+    # same thing only while the hardware margins are symmetric. They are on the
+    # printer this was measured against, which advertises the same 4.23mm on
+    # all four edges; on a printer with a deeper bottom margin, as many inkjets
+    # have, this arrives at a sheet that is not a real one and the job is left
+    # alone. That is a job not repaired rather than a job repaired wrongly, so
+    # it stays this way until there is a printer here to measure.
+    sheet = (2 * clip[0] + (clip[2] - clip[0]),
+             2 * clip[1] + (clip[3] - clip[1]))
+    if not _sheet_agrees(sheet, wanted):
+        return None, (f'the implied sheet {sheet[0]:.1f}x{sheet[1]:.1f}pt is '
+                      f'not the media asked for')
+    if _boxes_near(_size(media) + _size(media), sheet + sheet,
+                   PLACEMENT_TOLERANCE):
+        return None, None               # already the right size: nothing wrong
+    return {'page': num, 'form': form_num, 'media': media, 'crop': crop_box,
+            'bbox': bbox, 'matrix': (mx, my), 'clip': clip, 'scale': scale,
+            'sheet': sheet, 'error': error}, None
+
+
+def plan_placement(data, msg):
+    """Every page that needs re-placing, or why none does.
+
+    Returns (plans, notes). `notes` holds a line for each page that was the
+    import idiom and was still not repaired -- the near misses are the evidence
+    worth having, so they are reported rather than dropped.
+    """
+    if re.search(rb'/Type\s*/ObjStm\b', data) or re.search(rb'/Type\s*/XRef\b',
+                                                           data):
+        # Objects inside an object stream are not byte-addressable, so the
+        # rewrite below could not reach them and would silently do nothing.
+        raise NotPlaced('the file uses object or cross-reference streams')
+    index = _object_index(data)
+    if not index:
+        raise NotPlaced('no objects could be indexed')
+    wanted = ticket_sheet(msg) if msg is not None else None
+    pages = _pages(data, index)
+    plans, notes, used = [], [], set()
+    for num, body, inherited in pages:
+        plan, why = _page_plan(data, index, num, body, inherited, wanted, used)
+        if plan is not None:
+            used.add(plan['form'])
+            plans.append(plan)
+        elif why:
+            notes.append(f'page object {num}: {why}')
+    if not plans:
+        return [], notes
+    if len(plans) != len(pages):
+        # All or nothing. A file where only some pages match is a file this
+        # does not understand, and half a repair is the worst of both.
+        notes.append(f'{len(plans)} of {len(pages)} pages matched; '
+                     f'a mixed document is left alone')
+        return [], notes
+    sheets = {(round(p['sheet'][0], 1), round(p['sheet'][1], 1)) for p in plans}
+    if len(sheets) != 1:
+        notes.append('the pages imply different sheets')
+        return [], notes
+    return plans, notes
+
+
+def _trailer(data):
+    i = data.rfind(b'trailer')
+    if i < 0:
+        raise NotPlaced('no trailer: not a plain cross-reference file')
+    j = data.find(b'<<', i)
+    out = _balanced_dict(data, j) if j >= 0 else b''
+    if not out:
+        raise NotPlaced('unterminated trailer')
+    return out
+
+
+def _incremental_update(data, replacements):
+    """Append new copies of whole objects, leaving every original byte alone.
+
+    An object is the smallest thing a cross-reference table can address, so a
+    replacement is the whole object; and appending means the file we hand on
+    still contains, byte for byte, the file we were given.
+    """
+    old = _trailer(data)
+    m = re.search(rb'startxref\s+(\d+)\s*%%EOF\s*$', data)
+    if not m:
+        raise NotPlaced('no startxref at the end of the file')
+    root = _raw_value(old, b'Root')
+    size = _raw_value(old, b'Size')
+    if root is None or size is None:
+        raise NotPlaced('the trailer names no /Root or /Size')
+    out = bytearray(data)
+    if not out.endswith(b'\n'):
+        out += b'\n'
+    offsets = {}
+    for num in sorted(replacements):
+        offsets[num] = len(out)
+        out += b'%d 0 obj\n' % num + replacements[num].strip() + b'\nendobj\n'
+    at = len(out)
+    out += b'xref\n'
+    nums = sorted(offsets)
+    runs, run = [], [nums[0]]
+    for n in nums[1:]:
+        if n == run[-1] + 1:
+            run.append(n)
+        else:
+            runs.append(run)
+            run = [n]
+    runs.append(run)
+    for run in runs:
+        out += b'%d %d\n' % (run[0], len(run))
+        for n in run:
+            out += b'%010d 00000 n \n' % offsets[n]
+    parts = [b'/Size ' + size, b'/Root ' + root, b'/Prev %d' % int(m.group(1))]
+    for key in (b'Info', b'ID', b'Encrypt'):
+        value = _raw_value(old, key)
+        if value is not None:
+            parts.append(b'/' + key + b' ' + value)
+    out += (b'trailer\n<< ' + b' '.join(parts) + b' >>\nstartxref\n%d\n%%%%EOF\n'
+            % at)
+    return bytes(out)
+
+
+def _fmt(value):
+    """A number written the way PDF wants it: no exponent, no trailing zeros."""
+    text = f'{value:.5f}'.rstrip('0').rstrip('.')
+    return (text or '0').encode()
+
+
+def _write_box(body, key, box, add_if_missing):
+    """Set one rectangle in a dictionary body, adding the key if asked."""
+    written = (b'/' + key + b' [ ' + b' '.join(_fmt(v) for v in box) + b' ]')
+    m = re.search(rb'/' + key + rb'(?![A-Za-z0-9])\s*\[[^\]]*\]', body)
+    if m:
+        return body[:m.start()] + written + body[m.end():]
+    if not add_if_missing:
+        return body
+    at = body.find(b'<<')
+    if at < 0:
+        raise NotPlaced(f'no dictionary to write /{key.decode()} into')
+    return body[:at + 2] + b' ' + written + body[at + 2:]
+
+
+def _visible(bbox, clip, page, offset):
+    """The part of the form's own space that reaches paper.
+
+    Everything that decides this is a rectangle: the form's /BBox and the clip
+    the content opens with, both in form space, and the page box, which is in
+    user space and so arrives here shifted by the form's /Matrix. Intersecting
+    them is exact, which is worth more than sampling it with a renderer -- and
+    this daemon has no renderer to sample it with, conversion being another
+    unit's job entirely.
+    """
+    shifted = (page[0] - offset[0], page[1] - offset[1],
+               page[2] - offset[0], page[3] - offset[1])
+    both = _intersect(bbox, clip)
+    return _intersect(both, shifted) if both else None
+
+
+def repair_placement(data, msg):
+    """Put every re-placed page back where its own producer meant to put it.
+
+    Returns (document, note, notes). `document` is the original unless every
+    check below passed, because a job that prints the old way beats one that
+    prints a new way nobody has looked at.
+    """
+    plans, notes = plan_placement(data, msg)
+    if not plans:
+        return data, None, notes
+    sheet = plans[0]['sheet']
+    box = (0.0, 0.0, sheet[0], sheet[1])
+    replacements, index = {}, _object_index(data)
+    for plan in plans:
+        start = index[plan['page']]
+        end = data.find(b'endobj', start)
+        body = data[start:end]
+        body = _write_box(body, b'MediaBox', box, add_if_missing=True)
+        if plan['crop'] is not None:
+            body = _write_box(body, b'CropBox', box, add_if_missing=False)
+        replacements[plan['page']] = body
+        start = index[plan['form']]
+        end = data.find(b'endobj', start)
+        form = data[start:end]
+        # /BBox becomes the producer's own clip rather than the whole sheet.
+        # The two render identically, because the clip is inside the sheet --
+        # but this way nothing the form can paint escapes the region its
+        # producer already chose, whatever the rest of the stream does with
+        # q and Q. The no-reveal property stops being an argument about the
+        # content and becomes a property of the file.
+        form = _write_box(form, b'BBox', plan['clip'], add_if_missing=False)
+        # Any residue between /Matrix and /BBox's corner was a placement
+        # somebody meant; it is kept rather than rounded away.
+        residual = (plan['matrix'][0] + plan['bbox'][0],
+                    plan['matrix'][1] + plan['bbox'][1])
+        written = (b'/Matrix [ 1 0 0 1 ' + _fmt(residual[0]) + b' '
+                   + _fmt(residual[1]) + b' ]')
+        m = re.search(rb'/Matrix(?![A-Za-z0-9])\s*\[[^\]]*\]', form)
+        if not m:
+            raise NotPlaced('the form lost its /Matrix')
+        replacements[plan['form']] = form[:m.start()] + written + form[m.end():]
+        plan['residual'] = residual
+
+    out = _incremental_update(data, replacements)
+
+    # Everything from here is the check that this did not make the job worse.
+    # It runs on the bytes about to be sent, not on the intention behind them.
+    if not out.startswith(data):
+        return data, None, notes + ['the rewrite did not leave the original '
+                                    'bytes intact']
+    for plan in plans:
+        before = _visible(plan['bbox'], plan['clip'], plan['media'],
+                          plan['matrix'])
+        after = _visible(plan['clip'], plan['clip'], box, plan['residual'])
+        if after is None:
+            return data, None, notes + ['the repaired page would show nothing']
+        if before is not None and not _contains(after, before):
+            return data, None, notes + ['the repaired page would lose part of '
+                                        'what prints today']
+        if _area(after) <= _area(before) + 1.0:
+            return data, None, notes + ['the repair would recover nothing']
+        if not _contains(box, plan['clip']):
+            return data, None, notes + ['the repaired content would still run '
+                                        'off the sheet']
+    try:
+        again, _ = plan_placement(out, msg)
+    except NotPlaced as exc:
+        return data, None, notes + [f'the repaired document no longer parses '
+                                    f'({exc})']
+    if again:
+        return data, None, notes + ['the repair did not settle']
+
+    first = plans[0]
+    note = (f'{len(plans)} page(s) placed off the sheet by their own producer; '
+            f'page box {_size(first["media"])[0]:.0f}x'
+            f'{_size(first["media"])[1]:.0f}pt restored to the '
+            f'{sheet[0]:.0f}x{sheet[1]:.0f}pt sheet the fit was computed for, '
+            f'moving content {abs(first["matrix"][0]):.0f}pt right and '
+            f'{abs(first["matrix"][1]):.0f}pt up (/BBox off by '
+            f'{first["error"]:.2f}pt)')
+    return out, note, notes
+
+
+def report_placement(cfg, queue, msg, data, fmt, note, notes):
+    """Mail what was found, whether or not anything was changed.
+
+    A document that reaches this code at all is one whose producer made two
+    placement decisions and applied both. That is rare enough to be worth a
+    message every time -- both when it was repaired, so the repair can be
+    checked against the sheet that comes out, and when it was not, because a
+    near miss is a sample of a shape nobody has seen yet.
+    """
+    if not cfg.alerter:
+        return
+    name = queue.name if queue else 'a queue'
+    group = msg.operation() if msg is not None else None
+    job = (group.get_str('job-name') if group else None) or '(unnamed)'
+    lines = [f'A job on {name} was placed on the sheet by its sender in a way',
+             'that needed looking at.',
+             '',
+             f'  job          {job}',
+             f'  format       {fmt or "unknown"}',
+             f'  bytes        {len(data)}',
+             f'  media asked  {ticket_sheet(msg) or "not stated by the client"}',
+             '']
+    if note:
+        lines += ['  REPAIRED', f'    {note}', '',
+                  '  The page went to the printer re-placed. Compare the sheet',
+                  '  with what the client previewed: they should now agree. If',
+                  '  they do not, set page-geometry=raw on the printer URI and',
+                  '  keep the attached document.']
+    else:
+        lines += ['  LEFT ALONE',
+                  '    The document has the shape a misplaced page has, and',
+                  '    one of the checks said no. It went to the printer',
+                  '    exactly as it arrived.']
+    for line in notes:
+        lines.append(f'    - {line}')
+    lines += ['', 'What this is:', '',
+              '  A print path that imports a page and then fits it to the',
+              '  paper can end up applying both placements at once. The page',
+              '  then declares one size while its content was arranged for',
+              '  another, and the printer believes the declaration.',
+              '  See ippfix(8), page-geometry, and DIAGNOSING.md.', '']
+    lines += ['The document itself:', '']
+    try:
+        lines += ['  ' + line for line in describe_document(data, fmt)]
+    except Exception:                        # a report must not fail on this
+        lines += ['  (could not be described)']
+    parts = []
+    if cfg.archive:
+        parts.append((f'{queue.slug if queue else "job"}-placement.pdf',
+                      'application/pdf', data))
+    else:
+        lines += ['', '  --archive is off, so the document could not be',
+                  '  attached. Turning it on keeps the next one.']
+    verdict = 'repaired' if note else 'left alone'
+    cfg.alerter.send(f'ippfix: page placement {verdict} on {name}',
+                     '\n'.join(lines) + '\n', parts)
+
+
+def place_pages(cfg, queue, msg, data, fmt):
+    """Put a misplaced page back, or hand the document on untouched.
+
+    Returns (document, note). The note is None whenever nothing was changed,
+    which is every job but the rare one -- and the rare one is reported.
+    """
+    if queue is not None and not queue.repair_placement:
+        return data, None
+    payload = normalise_pdf(data)
+    if payload is None:
+        return data, None
+    try:
+        out, note, notes = repair_placement(payload, msg)
+    except NotPlaced:
+        # Not a file this can reason about -- an object-stream PDF, or one with
+        # no plain trailer. Silent on purpose: that describes a great many
+        # ordinary documents, and a report about each would bury the ones that
+        # mean something.
+        return data, None
+    except Exception:
+        # The document came from somebody else. A bug in reading it must cost
+        # the job nothing.
+        log.exception('page placement could not be checked; job relayed as is')
+        return data, None
+    if note is None and not notes:
+        return data, None
+    name = queue.name if queue else 'job'
+    if note:
+        log.info('%s: %s', name, note)
+    for line in notes:
+        log.info('%s: page placement left alone: %s', name, line)
+    report_placement(cfg, queue, msg, data, fmt, note, notes)
+    return (out, note) if note else (data, None)
 
 
 def archive_document(cfg, queue, job_name, fmt, data, note):
@@ -3074,12 +3864,19 @@ class Handler(socketserver.BaseRequestHandler):
             # multiple-document-jobs-supported = false, and a second job
             # arriving mid-transfer confuses them.
             original = msg.data
+            # Before conversion, because the converter flattens the form
+            # XObject the repair works on: afterwards there is nothing left to
+            # put back. The archive still keeps the document as it arrived.
+            msg.data, placed = place_pages(cfg, queue, msg, msg.data, fmt)
+            submitted = msg.data
             try:
                 msg.data, note = convert(cfg, msg.data, fmt, queue, sides=sides)
+                if placed:
+                    note = f'{placed}; {note}'
                 # Conversion may legitimately change the format: a document
                 # the converter would not hand over whole comes back as raster
                 # instead. Say so, rather than mislabelling it.
-                if msg.data is not original:
+                if msg.data is not submitted:
                     produced = sniff_format(msg.data)
                     if produced and produced != fmt and group is not None:
                         group.replace('document-format', ipp.TAG_MIMETYPE,

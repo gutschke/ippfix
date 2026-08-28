@@ -231,6 +231,19 @@ reported at its own low mark, so the client still sees a low supply and still
 sees the warning. Real empty conditions pass through untouched, and
 `?supply-levels=raw` turns the correction off.
 
+One correction changes the document rather than what the printer says about
+itself. A print path that imports a page and then fits it to the paper makes
+two placement decisions, and can end up applying both -- so the page declares
+one size while its content was arranged for another, and the printer believes
+the declaration. The result is a wide gap along one edge and content clipped
+off the opposite one, while the sender's own preview looks right. Where the
+arithmetic in the file says that unambiguously, the page is put back on the
+sheet its producer computed the fit for. The repair is an append, so the
+document that arrived is still inside the one that is sent; the visible area is
+compared both ways first and the job goes unrepaired unless the new one
+contains the old; and every page of this shape is logged and mailed whether or
+not it was changed. `?page-geometry=raw` turns it off.
+
 That also means a report can carry something somebody printed. Send it
 somewhere that reflects how sensitive the printing is, and see
 `--alert-max-attachment` for the size bound.
