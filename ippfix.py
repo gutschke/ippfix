@@ -325,6 +325,7 @@ class Queue:
         # "the printer has not said", which is not the same as False and is
         # advertised as neither: see discovery_txt().
         self.formats = []              # document-format-supported, verbatim
+        self.media = []                # sizes in points, from media-supported
         self.colour = None
         self.duplex = None
         self.learned = False
@@ -370,6 +371,7 @@ class Queue:
                 ['document-format-supported', 'urf-supported',
                  'printer-resolution-supported', 'pdf-k-octets-supported',
                  'color-supported', 'sides-supported',
+                 'media-supported',
                  'pwg-raster-document-resolution-supported'])
             status, raw = upstream_ipp(self, ipp.serialize(request), timeout)
             if status != 200:
@@ -389,6 +391,17 @@ class Queue:
         formats = [f.decode('utf-8', 'replace')
                    for f in (group.get('document-format-supported') or [])]
         self.formats = formats
+
+        # The sizes this device will actually take, from the PWG names it
+        # publishes, which carry their own dimensions. Used to recognise the
+        # sheet a misplaced page was fitted to -- see repair_placement(). A
+        # list of every paper in the world would make that recognition
+        # ambiguous where this printer's own list does not: a page 792pt tall
+        # is Letter here, because nothing this device accepts is 792pt wide.
+        self.media = [size for size in
+                      (media_size(m.decode('utf-8', 'replace'))
+                       for m in (group.get('media-supported') or []))
+                      if size is not None]
         for candidate in RASTER_PREFERENCE:
             if candidate in formats:
                 self.raster_format = candidate
@@ -1039,12 +1052,16 @@ def looks_like_pdf(data):
 # to do with the geometry. The signature that matters is arithmetic.
 # ---------------------------------------------------------------------------
 
-# How close two placements have to be before they are called the same. The
-# real jobs miss by 1.1pt, because pdftopdf wrapped the page using its TrimBox
-# while computing the fit from its CropBox; healthy files that resemble this
-# shape miss by 6 to 594pt. So the gap between "is this" and "is not this" is
-# wide, and the threshold only has to sit inside it.
-PLACEMENT_TOLERANCE = 2.0
+# How close two placements have to be before they are called the same.
+#
+# The miss is not noise: it is the gap between two of the source page's own
+# boxes, because the wrapper is built from one and the fit computed from the
+# other. That gap is a property of the document. In the body of one book it is
+# 0.55pt; in its front matter, where the trim sits differently inside the crop,
+# it is 2.9pt. Files that merely resemble this shape miss by 6pt and upwards.
+# So the threshold sits above what a page's own boxes differ by and below what
+# a different placement costs -- and every other condition still has to hold.
+PLACEMENT_TOLERANCE = 4.0
 # Where a value is meant to be the same number written twice, it is.
 EXACT_TOLERANCE = 0.01
 # A job with more pages than this is not inspected. The check is cheap, but a
@@ -1052,16 +1069,14 @@ EXACT_TOLERANCE = 0.01
 # that is argued to be unnecessary.
 MAX_PLACEMENT_PAGES = 512
 
-# Sheets recognised when the job ticket does not name its media. Widths and
-# heights in points, portrait; both orientations are matched.
+# Sheets recognised when neither the job ticket nor the printer has said what
+# paper is in use. Written as the PWG names, which carry their own dimensions,
+# so that there is one place in this file where a paper size is a number and
+# it is media_size(). Both orientations are matched.
 STANDARD_SHEETS = (
-    (612.0, 792.0, 'na_letter_8.5x11in'),
-    (612.0, 1008.0, 'na_legal_8.5x14in'),
-    (595.276, 841.89, 'iso_a4_210x297mm'),
-    (419.528, 595.276, 'iso_a5_148x210mm'),
-    (841.89, 1190.55, 'iso_a3_297x420mm'),
-    (522.0, 756.0, 'na_executive_7.25x10.5in'),
-    (792.0, 1224.0, 'na_ledger_11x17in'),
+    'na_letter_8.5x11in', 'na_legal_8.5x14in', 'na_executive_7.25x10.5in',
+    'iso_a4_210x297mm', 'iso_a5_148x210mm', 'iso_a3_297x420mm',
+    'na_ledger_11x17in',
 )
 
 _TOKEN = re.compile(rb"""
@@ -1294,13 +1309,18 @@ def _leading_fit(stream):
     Returns (clip, scale, tx, ty). The clip is only established by the painting
     operator that follows `W`/`W*` (8.5.4), so that operator has to be there.
     """
-    words = [t for _, t in _tokens(stream, limit=24)]
-    if words[:1] != [b'q']:
-        return None
+    words = [t for _, t in _tokens(stream, limit=28)]
+    # Any number of saves may come first. `q` pushes the graphics state and
+    # moves nothing, and a page the client had rotated in the viewer arrives
+    # with two of them rather than one -- which is not a reason to leave the
+    # job alone.
+    while words[:1] == [b'q']:
+        words = words[1:]
     try:
-        x, y, w, h = (float(v) for v in words[1:5])
+        x, y, w, h = (float(v) for v in words[0:4])
     except (ValueError, IndexError):
         return None
+    words = [b'q'] + words          # the reader below counts from the save
     if words[5:6] not in ([b're'],):
         return None
     if words[6:7] not in ([b'W'], [b'W*']):
@@ -1320,7 +1340,26 @@ def _leading_fit(stream):
     return _rect(x, y, w, h), a, tx, ty
 
 
-_MEDIA_NAME = re.compile(rb'_([0-9.]+)x([0-9.]+)(in|mm)$')
+_MEDIA_NAME = re.compile(r'_([0-9.]+)x([0-9.]+)(in|mm)$')
+
+
+def media_size(name):
+    """A PWG 5101.1 self-describing media name as (width, height) in points.
+
+    The name carries its own dimensions, so no table of paper sizes has to be
+    right for this to work -- `na_letter_8.5x11in` and `iso_a4_210x297mm` say
+    what they are. Ranges such as `custom_min_3x5in` parse too and are the
+    caller's to ignore.
+    """
+    m = _MEDIA_NAME.search(name)
+    if not m:
+        return None
+    try:
+        w, h = float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+    per = 72.0 if m.group(3) == 'in' else 72.0 / 25.4
+    return (w * per, h * per) if w > 0 and h > 0 else None
 
 
 def ticket_sheet(msg):
@@ -1344,21 +1383,83 @@ def ticket_sheet(msg):
                 return (x * 72.0 / 2540.0, y * 72.0 / 2540.0)
     for group in msg.groups:
         for value in (group.get('media') or []):
-            m = _MEDIA_NAME.search(value if isinstance(value, bytes)
-                                   else str(value).encode())
-            if not m:
-                continue
-            try:
-                w, h = float(m.group(1)), float(m.group(2))
-            except ValueError:
-                continue
-            per = 72.0 if m.group(3) == b'in' else 72.0 / 25.4
-            if w > 0 and h > 0:
-                return (w * per, h * per)
+            size = media_size(value.decode('utf-8', 'replace')
+                              if isinstance(value, bytes) else str(value))
+            if size is not None:
+                return size
     return None
 
 
-def _matched_sheet(sheet, wanted):
+def _candidates(wanted, sheets):
+    """Every sheet worth considering, in both orientations.
+
+    The printer's own `media-supported` where it has been read, because that
+    is the set of sizes paper can actually arrive in here -- and a smaller set
+    is a set with fewer ways to be ambiguous. A page 792pt tall is Letter on
+    this device because nothing it accepts is 792pt wide; against a list of
+    every paper in the world it could as easily be Ledger turned sideways.
+    """
+    if wanted is not None:
+        base = [wanted]
+    elif sheets:
+        base = list(sheets)
+    else:
+        base = [size for size in (media_size(n) for n in STANDARD_SHEETS)
+                if size is not None]
+    out = []
+    for w, h in base:
+        out.append((w, h))
+        if not _near(w, h, EXACT_TOLERANCE):
+            out.append((h, w))
+    return out
+
+
+def _sheet_by_height(top, wanted, sheets):
+    """The one sheet that tall, or None if none is -- or if several are.
+
+    Less is known here than when a rectangle is centred: a top-left placement
+    fixes where the top edge falls and says nothing about the width. So the
+    width is only believed when the height picks it out on its own.
+    """
+    found = [(w, h) for w, h in _candidates(wanted, sheets)
+             if _near(h, top, PLACEMENT_TOLERANCE)]
+    if not found:
+        return None
+    if any(not _near(w, found[0][0], PLACEMENT_TOLERANCE) for w, _ in found):
+        return None                    # more than one width is that tall
+    return found[0]
+
+
+def _implied_sheet(clip, wanted, sheets):
+    """The sheet a fit rectangle was computed for, or None and why not.
+
+    Two placements have been measured off the wire, and they say different
+    amounts. Where the scale was chosen to make the page fit, what it produced
+    is centred, and doubling either margin gives the sheet -- both dimensions,
+    from the file alone. Where the sender chose the scale instead, the result
+    is placed at the top left: flush to the left edge with its top at the top
+    of the sheet, overflowing or falling short as the scale dictates. That
+    fixes the height and nothing else, so the width has to be recognised.
+
+    Measured at three sizes, the top edge is the sheet's height exactly: 792
+    on Letter, 841 on A4, 1008 on Legal.
+    """
+    width, height = clip[2] - clip[0], clip[3] - clip[1]
+    if clip[0] >= -EXACT_TOLERANCE and clip[1] >= -EXACT_TOLERANCE:
+        centred = _matched_sheet((2 * clip[0] + width, 2 * clip[1] + height),
+                                 wanted, sheets)
+        if centred is not None:
+            return centred, 'centred on'
+    if _near(clip[0], 0, EXACT_TOLERANCE):
+        corner = _sheet_by_height(clip[3], wanted, sheets)
+        if corner is not None:
+            return corner, 'set into the top left of'
+    return None, (f'the fit rectangle {width:.1f}x{height:.1f}pt at '
+                  f'({clip[0]:.1f}, {clip[1]:.1f}) is not centred on, or set '
+                  f'into the corner of, any sheet this printer takes')
+
+
+def _matched_sheet(sheet, wanted, sheets):
     """The real sheet a derived one is, or None if it is not one.
 
     The derived numbers come from doubling a margin, so they carry whatever
@@ -1373,19 +1474,14 @@ def _matched_sheet(sheet, wanted):
     per-job state to remember it with, so on that path a sheet is believed only
     if it is a size paper comes in.
     """
-    candidates = ([wanted] if wanted is not None
-                  else [(w, h) for w, h, _ in STANDARD_SHEETS])
-    for w, h in candidates:
+    for w, h in _candidates(wanted, sheets):
         if (_near(sheet[0], w, PLACEMENT_TOLERANCE)
                 and _near(sheet[1], h, PLACEMENT_TOLERANCE)):
             return (w, h)
-        if (_near(sheet[0], h, PLACEMENT_TOLERANCE)
-                and _near(sheet[1], w, PLACEMENT_TOLERANCE)):
-            return (h, w)
     return None
 
 
-def _page_plan(data, index, num, body, inherited, wanted, used_forms):
+def _page_plan(data, index, num, body, inherited, wanted, used_forms, sheets):
     """What to rewrite on one page, or a reason not to.
 
     Returns (plan, None) or (None, reason). `plan` carries every number the
@@ -1472,33 +1568,26 @@ def _page_plan(data, index, num, body, inherited, wanted, used_forms):
     if not _boxes_near(_size(media) + _size(media), _size(bbox) + _size(bbox),
                        EXACT_TOLERANCE):
         return None, 'the page is not the size of the form /BBox'
-    if clip[0] < -EXACT_TOLERANCE or clip[1] < -EXACT_TOLERANCE:
-        return None, 'the fit rectangle starts outside the sheet'
-    # The fit rectangle is centred, so the sheet is what it is centred on.
-    #
-    # Centred in the printable area, strictly, not on the sheet -- which is the
-    # same thing only while the hardware margins are symmetric. They are on the
-    # printer this was measured against, which advertises the same 4.23mm on
-    # all four edges; on a printer with a deeper bottom margin, as many inkjets
-    # have, this arrives at a sheet that is not a real one and the job is left
-    # alone. That is a job not repaired rather than a job repaired wrongly, so
-    # it stays this way until there is a printer here to measure.
-    sheet = (2 * clip[0] + (clip[2] - clip[0]),
-             2 * clip[1] + (clip[3] - clip[1]))
-    matched = _matched_sheet(sheet, wanted)
-    if matched is None:
-        return None, (f'the implied sheet {sheet[0]:.1f}x{sheet[1]:.1f}pt is '
-                      f'not the media asked for')
-    sheet = matched
+    # Where a fit is centred it is centred in the printable area, strictly,
+    # not on the sheet -- the same thing only while the hardware margins are
+    # symmetric. They are on the printer this was measured against, which
+    # advertises the same 4.23mm on all four edges; on a printer with a deeper
+    # bottom margin, as many inkjets have, neither placement is recognised and
+    # the job is left alone. That is a job not repaired rather than a job
+    # repaired wrongly, so it stays this way until there is such a printer
+    # here to measure.
+    sheet, how = _implied_sheet(clip, wanted, sheets)
+    if sheet is None:
+        return None, how
     if _boxes_near(_size(media) + _size(media), sheet + sheet,
                    PLACEMENT_TOLERANCE):
         return None, None               # already the right size: nothing wrong
     return {'page': num, 'form': form_num, 'media': media, 'crop': crop_box,
             'bbox': bbox, 'matrix': (mx, my), 'clip': clip, 'scale': scale,
-            'sheet': sheet, 'error': error}, None
+            'sheet': sheet, 'error': error, 'how': how}, None
 
 
-def plan_placement(data, msg):
+def plan_placement(data, msg, sheets=()):
     """Every page that needs re-placing, or why none does.
 
     Returns (plans, notes). `notes` holds a line for each page that was the
@@ -1524,7 +1613,8 @@ def plan_placement(data, msg):
     pages = _pages(data, index)
     plans, notes, used = [], [], set()
     for num, body, inherited in pages:
-        plan, why = _page_plan(data, index, num, body, inherited, wanted, used)
+        plan, why = _page_plan(data, index, num, body, inherited, wanted, used,
+                               sheets)
         if plan is not None:
             used.add(plan['form'])
             plans.append(plan)
@@ -1639,14 +1729,14 @@ def _visible(bbox, clip, page, offset):
     return _intersect(both, shifted) if both else None
 
 
-def repair_placement(data, msg):
+def repair_placement(data, msg, sheets=()):
     """Put every re-placed page back where its own producer meant to put it.
 
     Returns (document, note, notes). `document` is the original unless every
     check below passed, because a job that prints the old way beats one that
     prints a new way nobody has looked at.
     """
-    plans, notes = plan_placement(data, msg)
+    plans, notes = plan_placement(data, msg, sheets)
     if not plans:
         return data, None, notes
     sheet = plans[0]['sheet']
@@ -1704,7 +1794,7 @@ def repair_placement(data, msg):
             return data, None, notes + ['the repaired content would still run '
                                         'off the sheet']
     try:
-        again, _ = plan_placement(out, msg)
+        again, _ = plan_placement(out, msg, sheets)
     except NotPlaced as exc:
         return data, None, notes + [f'the repaired document no longer parses '
                                     f'({exc})']
@@ -1715,9 +1805,9 @@ def repair_placement(data, msg):
     note = (f'{len(plans)} page(s) placed off the sheet by their own producer; '
             f'page box {_size(first["media"])[0]:.0f}x'
             f'{_size(first["media"])[1]:.0f}pt restored to the '
-            f'{sheet[0]:.0f}x{sheet[1]:.0f}pt sheet the fit was computed for, '
-            f'moving content {abs(first["matrix"][0]):.0f}pt right and '
-            f'{abs(first["matrix"][1]):.0f}pt up (/BBox off by '
+            f'{sheet[0]:.0f}x{sheet[1]:.0f}pt sheet its content was '
+            f'{first["how"]}, moving it {abs(first["matrix"][0]):.0f}pt right '
+            f'and {abs(first["matrix"][1]):.0f}pt up (/BBox off by '
             f'{first["error"]:.2f}pt)')
     return out, note, notes
 
@@ -1792,7 +1882,8 @@ def place_pages(cfg, queue, msg, data, fmt):
     if payload is None:
         return data, None
     try:
-        out, note, notes = repair_placement(payload, msg)
+        out, note, notes = repair_placement(payload, msg,
+                                            queue.media if queue else ())
     except NotPlaced:
         # Not a file this can reason about -- an object-stream PDF, or one with
         # no plain trailer. Silent on purpose: that describes a great many

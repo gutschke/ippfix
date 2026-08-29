@@ -132,9 +132,19 @@ ippfix 'Front Desk=ipp://192.0.2.10/ipp/print?page-counter=off'
   drawn once, whose `/Matrix` undoes its own `/BBox`, and whose content opens
   with a clip and a uniform scale, is a page somebody re-placed. It is repaired
   only if pushing the `/BBox` through that scale lands it on that clip -- which
-  is the mistake stated as an equation -- and only if the sheet the clip is
-  centred on is the media the job asked for, and the page says it is a different
-  size. Every page must qualify or none is touched.
+  is the mistake stated as an equation -- and only if the sheet that clip was
+  placed on can be recognised, and the page says it is a different size. Every
+  page must qualify or none is touched.
+
+  Two placements are recognised. A scale chosen to make the page fit centres
+  what it produced, so doubling either margin gives the sheet: both dimensions,
+  from the file alone. A scale the sender chose is set into the top left
+  instead, flush to the left edge with its top at the top of the sheet, which
+  fixes the height and nothing else -- so the width is taken from the sizes the
+  printer publishes in `media-supported`, and only where the height picks out
+  exactly one of them. Against a list of every paper in the world a page 792pt
+  tall could be Letter standing up or Ledger lying down; against one printer's
+  own list it is Letter.
 
   The repair is an append: the document that arrived is still present, byte for
   byte, inside the one that is sent. Before sending, the region of the page that

@@ -2467,8 +2467,16 @@ def ticket(media=b'na_letter_8.5x11in'):
                           media=(ipp.TAG_KEYWORD, [media]))
 
 
-def expect(what, doc, want, contains='', msg=None):
-    out, note, notes = ippfix.repair_placement(doc, msg or ticket())
+# The sizes the printer this was measured against publishes, which is what a
+# queue that has asked will be holding. A shorter list than every paper in the
+# world, and so a list with fewer ways to be ambiguous.
+MEDIA = [ippfix.media_size(n) for n in (
+    'na_letter_8.5x11in', 'na_legal_8.5x14in', 'na_executive_7.25x10.5in',
+    'iso_a4_210x297mm', 'iso_a5_148x210mm', 'na_number-10_4.125x9.5in')]
+
+
+def expect(what, doc, want, contains='', msg=None, sheets=MEDIA):
+    out, note, notes = ippfix.repair_placement(doc, msg or ticket(), sheets)
     got = 'repaired' if note else ('declined' if notes else 'untouched')
     why = note or '; '.join(notes)
     assert got == want, f'{what}: expected {want}, got {got} ({why})'
@@ -2477,7 +2485,7 @@ def expect(what, doc, want, contains='', msg=None):
 PY2
 
 python3 - <<'PY2' && ok 'a page placed off the sheet is put back where its producer meant' || bad 'page placement repair'
-import os, sys
+import os, re, sys
 sys.path.insert(0, os.environ['PLACED'])
 from placed import make, REAL, expect, ticket
 doc = make(**REAL)
@@ -2495,6 +2503,45 @@ assert b'/Matrix [ 1 0 0 1 0 0 ]' in tail, tail[:400]
 # Twice is once: the contradiction is gone, so there is nothing left to see.
 expect('a repaired page', out, 'untouched')
 expect('a whole document of them', make(pages=6, **REAL), 'repaired')
+# A scale the sender chose rather than one a fit chose. The result is set into
+# the top left -- flush left, its top at the top of the sheet -- which fixes
+# the height and says nothing about the width, so the width has to be
+# recognised among the sizes the printer takes. These are the numbers three
+# such jobs carried off the wire, at three different sheet heights.
+CORNER = dict(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
+              matrix=[1, 0, 0, 1, -72, -103.5], scale=0.89999998,
+              tx=-64.799995)
+# No media on the ticket, because a Send-Document carries none -- which is
+# how every one of these arrived.
+letter = expect('a scale the sender chose, on Letter',
+                make(clip=[0, 199.72803, 518.40002, 592.27197], ty=107.064026,
+                     **CORNER), 'repaired', msg=ticket(None))
+assert b'/MediaBox [ 0 0 612 792 ]' in letter, 'not put back on Letter'
+a4 = expect('the same, on A4',
+            make(clip=[0, 248.72803, 518.40002, 592.27197], ty=156.064026,
+                 **CORNER), 'repaired', msg=ticket(None))
+assert re.search(rb'/MediaBox \[ 0 0 595\.27\d* 841\.88\d* \]', a4), \
+    'not put back on A4'
+legal = expect('the same, on Legal',
+               make(clip=[0, 415.72803, 518.40002, 592.27197], ty=323.06403,
+                    **CORNER), 'repaired', msg=ticket(None))
+assert b'/MediaBox [ 0 0 612 1008 ]' in legal, 'not put back on Legal'
+# Without having asked the printer what it takes, a height of 792pt is Letter
+# standing up or Ledger lying down, and guessing between them is not something
+# to do with somebody's paper.
+expect('the same, with no media list to recognise the sheet from',
+       make(clip=[0, 199.72803, 518.40002, 592.27197], ty=107.064026,
+            **CORNER),
+       'declined', 'not centred on', sheets=(), msg=ticket(None))
+# Scaled up instead of down, the content is wider than the paper and no
+# placement can show all of it. Putting it where its sender meant would move
+# which part is lost, so the job goes as it arrived.
+expect('a sender-chosen scale that overflows the sheet',
+       make(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
+            matrix=[1, 0, 0, 1, -72, -103.5],
+            clip=[0, 2.3040161, 691.20001, 789.69598], scale=1.2000001,
+            tx=-86.400002, ty=-121.247986),
+       'declined', 'would lose part of what prints today', msg=ticket(None))
 # The numbers a four-page A4 job carried off the wire. The sheet is derived by
 # doubling a margin, so it arrives carrying the producer's rounding -- 595x841
 # rather than 595.276x841.89 -- and what goes into the file has to be the size
@@ -2505,7 +2552,8 @@ a4 = expect('a job fitted to A4',
                  clip=[-0.000030517578, 80.606262, 595, 679.78748],
                  scale=1.03298616, tx=-74.375031, ty=-25.749992, pages=4),
             'repaired', msg=ticket(None))
-assert b'/MediaBox [ 0 0 595.276 841.89 ]' in a4, 'the sheet was not snapped'
+assert re.search(rb'/MediaBox \[ 0 0 595\.27\d* 841\.88\d* \]', a4), \
+    'the sheet was not snapped to the size paper comes in'
 # A sender that asked for no margins fits to the paper edge rather than to the
 # printable area, so the clip starts at zero and the scale is the whole width
 # over the page width. Still centred, still the same fault, still repairable --
@@ -2556,7 +2604,7 @@ expect('a page carrying annotations', make(annots=b'[ 99 0 R ]', **REAL),
 expect('a page with a CropBox of its own',
        make(crop=[10, 10, 500, 600], **REAL), 'declined', 'CropBox of its own')
 expect('a sheet that is not the media asked for', make(**REAL), 'declined',
-       'not the media asked for', msg=ticket(b'iso_a4_210x297mm'))
+       'not centred on', msg=ticket(b'iso_a4_210x297mm'))
 # Padded to the same length, or the cross-reference offsets move and the file
 # is refused as damaged rather than judged on its geometry.
 was = b'/Matrix [ 1 0 0 1 -72 -103.5 ]'
@@ -2611,13 +2659,9 @@ expect('the same fault at a sender-chosen 150%',
        make(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
             matrix=[1, 0, 0, 1, -72, -103.5],
             clip=[0, -195.11993, 864, 987.11993], scale=1.5,
-            tx=-108, ty=-349.55994), 'declined', 'outside the sheet')
-expect('the same fault at a sender-chosen 90%',
-       make(media=[0, 0, 576, 657], bbox=[72, 103.5, 648, 760.5],
-            matrix=[1, 0, 0, 1, -72, -103.5],
-            clip=[0, 199.72803, 518.40002, 592.27197], scale=0.89999998,
-            tx=-64.799995, ty=107.064026),
-       'declined', 'not the media asked for')
+            tx=-108, ty=-349.55994),
+       'declined', 'would lose part of what prints today',
+       msg=ticket(None))
 PY2
 
 python3 - <<'PY2' && ok 'the sheet comes from the ticket, and the repair can be turned off' || bad 'page-geometry option'

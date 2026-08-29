@@ -505,31 +505,37 @@ more things, both of which shaped what the proxy will and will not do:
   carried the pages. So on the path this fault actually arrives by, the ticket
   is silent, and the sheet has to be recognised as a size paper comes in rather
   than read from the job.
-- **There is more than one way a sender places the page, and only one is
-  handled.** Three of the four carried the identical wrapper -- the same fault
-  -- differing only in the leading scale: 1.5, 0.9 and 1.03298616. The clip is
-  always the scaled page box, and where it lands says how the sender placed it:
+- **A sender places the page one of two ways, and the clip says which.** The
+  clip is always the scaled page box, and where it lands is the evidence:
 
   ```
-  scale 1.03298616   clip x  -0.000.. 595.000   y   80.606.. 760.394
-  scale 1.5          clip x   0.000.. 864.000   y -195.120.. 792.000
-  scale 0.9          clip x   0.000.. 518.400   y  199.728.. 792.000
+  scale 1.03298616   clip x  -0.000.. 595.000   y   80.606.. 760.394   centred
+  scale 0.9          clip x   0.000.. 518.400   y  199.728.. 792.000   top left
+  scale 0.9          clip x   0.000.. 518.400   y  248.728.. 841.000   top left
+  scale 0.9          clip x   0.000.. 518.400   y  415.728..1008.000   top left
   ```
 
-  The first is centred -- equal margins top and bottom, flush to the paper
-  edges left and right -- so doubling a margin gives A4 and it is repaired. The
-  other two are **top-left aligned**: left edge exactly 0, top edge exactly
-  792, which is a Letter sheet at a scale the sender chose. That is just as
-  much the same fault, and the discriminator confirms it (0.81pt and 0.49pt).
+  A scale chosen to make the page fit centres what it produced -- equal margins
+  top and bottom, flush to the paper edges left and right -- so doubling either
+  margin gives the sheet, both dimensions, from the file alone. A scale the
+  sender chose is set into the top left instead: left edge exactly 0, top edge
+  exactly the height of the sheet. Measured at three sizes, that top edge is
+  792 on Letter, 841 on A4 and 1008 on Legal.
 
-  They are still left alone, because a centred clip fixes both dimensions of
-  the sheet while a top-left one fixes only the height: nothing in the file
-  says how wide the paper is, and at 150% the content overruns the width
-  anyway. Recognising Letter from a height of 792 alone would be a guess where
-  every other case here is arithmetic. Two samples is not enough to widen the
-  rule on, and the ticket that would settle it -- `media` and `print-scaling`
-  -- is stated on the Create-Job, which is why `scripts/fakeprinter.py` is
-  worth pointing a client at: it can record that half.
+  The corner placement fixes the height and nothing else, so the width has to
+  be recognised -- and it is taken from the sizes the printer publishes in
+  `media-supported`. That list is what makes it safe: against every paper in
+  the world a page 792pt tall could be Letter standing up or Ledger lying down,
+  but nothing this device accepts is 792pt wide, so it is Letter. Where the
+  height picks out more than one width, or the printer has not been asked, the
+  job is left alone.
+
+- **Scaled up, the sender's own placement loses content, and that is theirs to
+  lose.** At 120% or 150% the page is wider than the paper whatever is done
+  with it. The repair is still computed, and then refused, because it would
+  move which part falls off the edge: the check is that the region reaching
+  paper afterwards contains the region reaching it now, and there it does not.
+  Scaled down, everything fits and the job is repaired.
 
 Later captures answered two things that had been open:
 
