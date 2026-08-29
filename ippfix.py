@@ -551,6 +551,7 @@ class Config:
         self.require_tls = args.require_tls
         self.fail_closed = args.fail_closed
         self.archive_max_bytes = args.archive_max_bytes * 1024 * 1024
+        self.archive_max_age = max(0.0, args.archive_max_age) * 86400
         self.convert_threshold = args.convert_threshold
         self.restrict_formats = not args.all_formats
         # Not a prediction of what the printer will take -- nothing here
@@ -1969,9 +1970,21 @@ def archive_document(cfg, queue, job_name, fmt, data, note):
 def prune_archive(cfg):
     """Keep the archive bounded so a forgotten flag cannot fill the disk.
 
-    Bounded by total size as well as by count: fifty files of unbounded size is
-    not a bound, and the documents arriving here are chosen by whoever is
-    printing.
+    Three bounds, and they are not interchangeable.
+
+    **Age is the everyday one.** What makes an archive safe is that it empties
+    itself whether or not anybody remembers it: a copy of somebody's document
+    should stop existing because time passed, not because enough other people
+    printed to push it out. It is the bound that holds when nothing happens.
+
+    **Count keeps the directory a manageable size**, which matters for reading
+    it rather than for safety.
+
+    **Total size is the backstop**, for when something has gone wrong that the
+    other two do not describe -- a burst of very large jobs, a clock that
+    jumped. A hundred files of unbounded size is not a bound.
+
+    Oldest first in every case, and the sidecar goes with the document.
     """
     def drop(path):
         for victim in (path, path + '.txt'):
@@ -1985,9 +1998,24 @@ def prune_archive(cfg):
                    for name in os.listdir(cfg.archive)
                    if not name.endswith('.txt')]
         entries.sort(key=os.path.getmtime)
+
+        if cfg.archive_max_age:
+            stale = time.time() - cfg.archive_max_age
+            keep = []
+            for path in entries:
+                try:
+                    old_enough = os.path.getmtime(path) < stale
+                except OSError:
+                    continue
+                if old_enough:
+                    drop(path)
+                else:
+                    keep.append(path)
+            entries = keep
+
         for path in entries[:max(0, len(entries) - cfg.archive_max)]:
             drop(path)
-            entries = entries[1:]
+        entries = entries[max(0, len(entries) - cfg.archive_max):]
 
         total = 0
         for path in reversed(entries):          # newest first
@@ -1999,6 +2027,24 @@ def prune_archive(cfg):
                 drop(path)
     except OSError:
         pass
+
+
+def sweep_archive(cfg, every=3600):
+    """Apply the archive's bounds on a clock, not only when a job arrives.
+
+    Pruning on write alone means a proxy nobody prints to keeps whatever it
+    last collected for as long as it runs -- which is exactly the case an age
+    limit exists for. A directory listing an hour costs nothing.
+    """
+    def run():
+        while True:
+            time.sleep(every)
+            try:
+                prune_archive(cfg)
+            except Exception as exc:            # a sweep must not end the run
+                log.error('while pruning the archive: %s', exc)
+
+    threading.Thread(target=run, daemon=True, name='archive-sweep').start()
 
 
 MAX_CONVERTED = 256 * 1024 * 1024   # outlining inflates; bound it anyway
@@ -4415,7 +4461,7 @@ def build_parser():
                              'arrived, before conversion. This stores users\' '
                              'documents on disk; see the manual page before '
                              'enabling it, and turn it off afterwards')
-    parser.add_argument('--archive-max', type=int, default=50, metavar='N',
+    parser.add_argument('--archive-max', type=int, default=100, metavar='N',
                         help='keep at most N archived jobs (default: 50)')
     parser.add_argument('--max-connections', type=int, default=64, metavar='N',
                         help='refuse connections beyond N, so that idle ones '
@@ -4456,6 +4502,15 @@ def build_parser():
                              'sender otherwise chooses whether conversion '
                              'happens, but it loses jobs the printer might '
                              'have managed')
+    parser.add_argument('--archive-max-age', type=float, default=30,
+                        metavar='DAYS',
+                        help='discard an archived job once it is this old '
+                             '(default: 30). The bound that holds when nothing '
+                             'happens: a copy of somebody\'s document should '
+                             'stop existing because time passed, not because '
+                             'enough other people printed. Long enough to look '
+                             'into something that surfaces a few weeks later. '
+                             '0 disables it')
     parser.add_argument('--archive-max-bytes', type=int, default=512,
                         metavar='MB',
                         help='total size cap for the archive (default: 512)')
@@ -4508,9 +4563,15 @@ def main(argv=None):
               else f'outline text via {cfg.converter}') if cfg.convert
              else 'DISABLED')
     if cfg.archive:
-        log.warning('  ARCHIVING every job to %s (keeping %d) -- this stores '
-                    'users\' documents; disable when done diagnosing',
-                    cfg.archive, cfg.archive_max)
+        log.warning('  ARCHIVING every job to %s -- this stores users\' '
+                    'documents; disable when done diagnosing', cfg.archive)
+        log.warning('  archived jobs are discarded after %s, and sooner if '
+                    'there are more than %d or they exceed %d MB',
+                    (f'{cfg.archive_max_age / 86400:g} day(s)'
+                     if cfg.archive_max_age else 'no time at all (disabled)'),
+                    cfg.archive_max, cfg.archive_max_bytes // (1024 * 1024))
+        prune_archive(cfg)
+        sweep_archive(cfg)
 
     for queue in queues:
         queue.learn()

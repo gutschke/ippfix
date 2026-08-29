@@ -297,7 +297,10 @@ security` rates the daemon **1.1** and the converter **0.4**.
 
 [INTERNALS.md](INTERNALS.md) describes the split and what each half is trusted
 with. `--archive`, which keeps a copy of every job for diagnosis, stores the
-documents people print; see the manual page before enabling it.
+documents people print; see the manual page before enabling it. What it keeps
+it discards after a month, and sooner if the directory grows past a hundred
+jobs or half a gigabyte -- the age bound being the one that holds when nobody
+is printing and nobody is watching.
 
 ## Requirements
 

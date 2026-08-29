@@ -24,6 +24,7 @@ cache.
 [\fB\-\-max\-pdf\-bytes\fR \fIMB\fR]
 [\fB\-\-all\-formats\fR]
 [\fB\-\-fail\-closed\fR]
+[\fB\-\-archive\-max\-age\fR \fIDAYS\fR]
 [\fB\-\-archive\-max\-bytes\fR \fIMB\fR]
 [\fB\-\-no\-ipv6\fR]
 [\fB\-\-cert\fR \fIFILE\fR]
@@ -483,8 +484,22 @@ it off again afterwards.
 .B \-\-archive\-max " \fIN\fR"
 Keep at most
 .I N
-archived jobs, deleting the oldest first. Default 50. Bounds the disk cost of a
-flag left on by accident.
+archived jobs, deleting the oldest first. Default 100. Keeps the directory a
+size somebody can read; what keeps it safe is
+.B \-\-archive\-max\-age
+and
+.BR \-\-archive\-max\-bytes .
+.TP
+.B \-\-archive\-max\-age " \fIDAYS\fR"
+Discard an archived job once it is this old. Default 30. 0 disables it.
+.IP
+The bound to lean on. What makes an archive of other people's documents safe is
+that it empties itself whether or not anybody remembers it \(em a copy should
+stop existing because time passed, not because enough other people printed to
+push it out. It is the only one of the three that holds while nothing is
+happening, and a month is long enough to look into something that surfaces
+weeks later. Applied at startup and hourly thereafter, as well as whenever a
+job is archived.
 .TP
 .B \-\-cert " \fIFILE\fR"
 TLS certificate. Default
@@ -584,8 +599,10 @@ because whoever sends the document also decides whether conversion fails. This
 option inverts that trade.
 .TP
 .B \-\-archive\-max\-bytes " \fIMB\fR"
-Total size cap for the archive, in megabytes. Default 512. A count alone is not
-a bound when the documents are chosen by whoever is printing.
+Total size cap for the archive, in megabytes. Default 512. The backstop, for
+when something has gone wrong that neither age nor count describes \(em a burst
+of very large jobs, a clock that jumped. A count alone is not a bound when the
+documents are chosen by whoever is printing.
 .TP
 .B \-\-no\-advertise
 Do not publish the queues over DNS\-SD. Useful when discovery is handled

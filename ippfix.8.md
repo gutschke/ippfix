@@ -326,8 +326,20 @@ An unrecognised option is an error rather than something ignored.
   and turn it off again afterwards.
 
 * `--archive-max` *N*:
-  Keep at most *N* archived jobs, deleting the oldest first. Default 50. Bounds
-  the disk cost of a flag left on by accident.
+  Keep at most *N* archived jobs, deleting the oldest first. Default 100. Keeps
+  the directory a size somebody can read; what keeps it safe is
+  `--archive-max-age` and `--archive-max-bytes`.
+
+* `--archive-max-age` *DAYS*:
+  Discard an archived job once it is this old. Default 30. 0 disables it.
+
+  The bound to lean on. What makes an archive of other people's documents safe
+  is that it empties itself whether or not anybody remembers it -- a copy
+  should stop existing because time passed, not because enough other people
+  printed to push it out. It is the only one of the three that holds while
+  nothing is happening, and a month is long enough to look into something that
+  surfaces weeks later. Applied at startup and hourly thereafter, as well as
+  whenever a job is archived.
 
 * `--cert` *FILE*:
   TLS certificate. Default `/etc/ippfix/ippfix.crt`.
@@ -414,8 +426,10 @@ An unrecognised option is an error rather than something ignored.
   This option inverts that trade.
 
 * `--archive-max-bytes` *MB*:
-  Total size cap for the archive, in megabytes. Default 512. A count alone is
-  not a bound when the documents are chosen by whoever is printing.
+  Total size cap for the archive, in megabytes. Default 512. The backstop, for
+  when something has gone wrong that neither age nor count describes -- a burst
+  of very large jobs, a clock that jumped. A count alone is not a bound when
+  the documents are chosen by whoever is printing.
 
 * `--no-advertise`:
   Do not publish the queues over DNS-SD. Useful when discovery is handled

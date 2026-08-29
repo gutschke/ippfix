@@ -2750,6 +2750,88 @@ for junk in (b'%PDF-1.7\nnothing here\n', b'not a pdf at all'):
     raise AssertionError('unreadable input was not refused')
 PY2
 
+# What keeps an archive of other people's documents safe is that it empties
+# itself whether or not anybody remembers it. Three bounds, tested apart.
+echo 'archive bounds'
+python3 - <<'PY2' && ok 'age, count and size each bound the archive on their own' || bad 'archive pruning'
+import os
+import sys
+import time
+sys.path.insert(0, '.')
+import ippfix
+
+
+def build(where, ages_days, size=1024):
+    os.makedirs(where, exist_ok=True)
+    for name in os.listdir(where):
+        os.remove(os.path.join(where, name))
+    for i, age in enumerate(ages_days):
+        doc = os.path.join(where, f'{i:03d}-job.pdf')
+        with open(doc, 'wb') as fh:
+            fh.write(b'%PDF-1.7\n' + b'x' * size)
+        with open(doc + '.txt', 'w') as fh:
+            fh.write('sidecar\n')
+        when = time.time() - age * 86400
+        os.utime(doc, (when, when))
+    return where
+
+
+def held(where):
+    return sorted(n for n in os.listdir(where) if not n.endswith('.txt'))
+
+
+class Cfg:
+    def __init__(self, where, age=30, count=100, mb=512):
+        self.archive = where
+        self.archive_max_age = age * 86400
+        self.archive_max = count
+        self.archive_max_bytes = mb * 1024 * 1024
+
+
+work = os.path.join(os.environ.get('TMPDIR', '/tmp'), f'arch{os.getpid()}')
+
+# Age alone: anything past the cut goes, whatever else is true.
+build(work, [0.5, 3, 40, 90])
+ippfix.prune_archive(Cfg(work))
+assert held(work) == ['000-job.pdf', '001-job.pdf'], held(work)
+# And the sidecar leaves with its document rather than being orphaned.
+assert not [n for n in os.listdir(work) if n.startswith(('002', '003'))]
+
+# Count alone: all fresh, more than the limit, oldest first.
+build(work, [0.5, 0.4, 0.3, 0.2, 0.1])
+ippfix.prune_archive(Cfg(work, count=2))
+assert held(work) == ['003-job.pdf', '004-job.pdf'], held(work)
+
+# Size alone: the backstop, when neither of the others would have fired.
+build(work, [0.5, 0.4, 0.3], size=400 * 1024)
+ippfix.prune_archive(Cfg(work, mb=1))
+assert len(held(work)) < 3, held(work)
+
+# Turning the age bound off leaves the other two in charge.
+build(work, [0.5, 200, 900])
+ippfix.prune_archive(Cfg(work, age=0))
+assert len(held(work)) == 3, held(work)
+
+# A directory that is not there is not an error worth ending a job over.
+ippfix.prune_archive(Cfg(os.path.join(work, 'gone')))
+
+for name in os.listdir(work):
+    os.remove(os.path.join(work, name))
+os.rmdir(work)
+PY2
+
+python3 - <<'PY2' && ok 'the defaults say what they are' || bad 'archive defaults'
+import sys
+sys.path.insert(0, '.')
+import ippfix
+args = ippfix.build_parser().parse_args(['--no-ipv6', 'q=ipp://p/ipp/print'])
+assert args.archive_max == 100, args.archive_max
+assert args.archive_max_age == 30, args.archive_max_age
+assert args.archive_max_bytes == 512, args.archive_max_bytes
+cfg = ippfix.Config(args, [ippfix.parse_queue('q=ipp://p/ipp/print')])
+assert cfg.archive_max_age == 30 * 86400
+PY2
+
 echo 'documentation'
 check 'man page renders without warnings' \
       "[ -z \"\$(man --warnings -l ./ippfix.8 2>&1 >/dev/null)\" ]"
