@@ -114,8 +114,11 @@ ippfix 'Front Desk=ipp://192.0.2.10/ipp/print?page-counter=off'
   reports a supply as genuinely empty its real levels are passed through. Use
   `raw` to see the printer's numbers exactly as it sends them.
 
-* `page-geometry=repair|raw`: whether to put back a page whose sender placed it
-  off the sheet. Default `repair`.
+* `page-geometry=repair|detect|raw`: what to do about a page whose sender
+  placed it off the sheet. Default `raw`, which does not look: the document is
+  relayed without being parsed, so a proxy that has not been asked for this
+  carries none of its cost and none of its risk. `detect` looks, logs and
+  reports, and changes nothing. `repair` acts.
 
   A print path that imports a page and then fits it to the paper makes two
   placement decisions, and can end up applying both. The page then declares one
@@ -152,7 +155,16 @@ ippfix 'Front Desk=ipp://192.0.2.10/ipp/print?page-counter=off'
   one contains the old and is larger. Whether repaired or not, a page of this
   shape is logged and, with `--alert-mail`, reported -- including the near
   misses, because a shape nobody has seen yet is the thing worth having a copy
-  of. Use `raw` to send what arrived.
+  of.
+
+  The fault this repairs is fixed upstream as of Chromium M153, and the filter
+  that read the stale box was replaced independently in libcupsfilters 2.2.0. A
+  client carrying neither leaves nothing to find: the wrapper's `/Matrix`
+  becomes the identity and none of this matches, whatever the option says. It
+  is off by default because a correction nobody needs should cost nothing, not
+  because it expires -- the shape it recognises is an interoperation hazard
+  between a stage that fits and a stage that wraps, and those two stages are
+  not unique to one client.
 
 An unrecognised option is an error rather than something ignored.
 

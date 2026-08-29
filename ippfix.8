@@ -169,9 +169,15 @@ unchanged. Use
 .B raw
 to see the printer's numbers exactly as it sends them.
 .TP
-.B page\-geometry=repair|raw
-Whether to put back a page whose sender placed it off the sheet. Default
-.BR repair .
+.B page\-geometry=repair|detect|raw
+What to do about a page whose sender placed it off the sheet. Default
+.BR raw ,
+which does not look: the document is relayed without being parsed, so a proxy
+that has not been asked for this carries none of its cost and none of its risk.
+.B detect
+looks, logs and reports, and changes nothing.
+.B repair
+acts.
 .IP
 A print path that imports a page and then fits it to the paper makes two
 placement decisions, and can end up applying both. The page then declares one
@@ -219,9 +225,17 @@ one contains the old and is larger. Whether repaired or not, a page of this
 shape is logged and, with
 .BR \-\-alert\-mail ,
 reported \(em including the near misses, because a shape nobody has seen yet is
-the thing worth having a copy of. Use
-.B raw
-to send what arrived.
+the thing worth having a copy of.
+.IP
+The fault this repairs is fixed upstream as of Chromium M153, and the filter
+that read the stale box was replaced independently in libcupsfilters 2.2.0. A
+client carrying neither leaves nothing to find: the wrapper's
+.B /Matrix
+becomes the identity and none of this matches, whatever the option says. It is
+off by default because a correction nobody needs should cost nothing, not
+because it expires \(em the shape it recognises is an interoperation hazard
+between a stage that fits and a stage that wraps, and those two stages are not
+unique to one client.
 .PP
 An unrecognised option is an error rather than something ignored: a mistyped
 setting that is silently dropped is how a printer ends up not doing what its

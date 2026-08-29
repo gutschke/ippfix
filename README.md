@@ -242,7 +242,10 @@ sheet its producer computed the fit for. The repair is an append, so the
 document that arrived is still inside the one that is sent; the visible area is
 compared both ways first and the job goes unrepaired unless the new one
 contains the old; and every page of this shape is logged and mailed whether or
-not it was changed. `?page-geometry=raw` turns it off.
+not it was changed. This one is **off by default**: `?page-geometry=repair` turns it on, and
+`?page-geometry=detect` looks and reports without touching anything. Left at
+`raw` the document is not parsed at all, so a queue that does not want this
+carries none of it.
 
 That also means a report can carry something somebody printed. Send it
 somewhere that reflects how sensitive the printing is, and see

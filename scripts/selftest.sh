@@ -2664,6 +2664,42 @@ expect('the same fault at a sender-chosen 150%',
        msg=ticket(None))
 PY2
 
+python3 - <<'PY2' && ok 'detect looks and reports and changes nothing' || bad 'page-geometry detect'
+import io
+import logging
+import os
+import sys
+sys.path.insert(0, os.environ['PLACED'])
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippfix
+from placed import make, REAL, ticket
+
+captured = io.StringIO()
+handler = logging.StreamHandler(captured)
+ippfix.log.addHandler(handler)
+ippfix.log.setLevel(logging.INFO)
+try:
+    args = ippfix.build_parser().parse_args(
+        ['--no-ipv6', 'q=ipp://p/ipp/print?page-geometry=detect'])
+    queue = ippfix.parse_queue('q=ipp://p/ipp/print?page-geometry=detect')
+    cfg = ippfix.Config(args, [queue])
+    doc = make(**REAL)
+    msg = ticket()
+    msg.data = doc
+    out, note = ippfix.place_pages(cfg, queue, msg, doc, 'application/pdf')
+    assert out is doc, 'detect changed the document'
+    assert note is None, f'detect reported a change: {note}'
+    said = captured.getvalue()
+    assert 'would be repaired' in said, said
+    # And with the default the document is not even looked at.
+    plain = ippfix.parse_queue('q=ipp://p/ipp/print')
+    out, note = ippfix.place_pages(cfg, plain, msg, doc, 'application/pdf')
+    assert out is doc and note is None
+finally:
+    ippfix.log.removeHandler(handler)
+PY2
+
 python3 - <<'PY2' && ok 'the sheet comes from the ticket, and the repair can be turned off' || bad 'page-geometry option'
 import os, sys
 sys.path.insert(0, os.environ['PLACED'])
@@ -2678,12 +2714,14 @@ assert abs(a4[0] - 595.28) < 0.1 and abs(a4[1] - 841.89) < 0.1, a4
 assert ippfix.ticket_sheet(ticket(None)) is None
 expect('a job whose ticket names no media', make(**REAL), 'repaired',
        msg=ticket(None))
-assert ippfix.Queue('a', 'ipp://p/ipp/print').repair_placement is True
-assert ippfix.Queue(
-    'a', 'ipp://p/ipp/print?page-geometry=repair').repair_placement is True
-assert ippfix.Queue(
-    'a', 'ipp://p/ipp/print?page-geometry=RAW').repair_placement is False
-for typo in ('yes', 'off', ''):
+# Off unless asked for. A proxy that has not been asked does not parse the
+# document at all, so it carries none of this.
+assert ippfix.Queue('a', 'ipp://p/ipp/print').page_geometry == 'raw'
+for value in ('repair', 'detect', 'raw'):
+    assert ippfix.Queue(
+        'a', f'ipp://p/ipp/print?page-geometry={value.upper()}'
+    ).page_geometry == value
+for typo in ('yes', 'off', 'on', ''):
     try:
         ippfix.Queue('a', f'ipp://p/ipp/print?page-geometry={typo}')
     except ValueError:

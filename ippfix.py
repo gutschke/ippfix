@@ -281,14 +281,19 @@ class Queue:
             raise ValueError(f'{name}: supply-levels must be clamped or raw, '
                              f'not {levels!r}')
         self.clamp_supplies = levels == 'clamped'
-        # Whether to put back a page whose sender placed it off the sheet. See
-        # repair_placement(). "raw" sends what arrived, which is what to set
-        # if a repaired sheet ever comes out worse than an unrepaired one.
-        geometry = options.get('page-geometry', ['repair'])[0].lower()
-        if geometry not in ('repair', 'raw'):
-            raise ValueError(f'{name}: page-geometry must be repair or raw, '
-                             f'not {geometry!r}')
-        self.repair_placement = geometry == 'repair'
+        # What to do about a page whose sender placed it off the sheet. See
+        # repair_placement().
+        #
+        # "raw" is the default and does not look: the document is relayed
+        # without being parsed at all, so a proxy that has not been asked for
+        # this carries none of its cost and none of its risk. "detect" looks
+        # and reports and changes nothing, which is how to find out whether a
+        # queue sees the fault before deciding to act on it. "repair" acts.
+        geometry = options.get('page-geometry', ['raw'])[0].lower()
+        if geometry not in ('repair', 'detect', 'raw'):
+            raise ValueError(f'{name}: page-geometry must be repair, detect '
+                             f'or raw, not {geometry!r}')
+        self.page_geometry = geometry
         relay = options.get('snmp-relay', [None])[0]
         if relay is None:
             self.snmp_relay = None
@@ -1812,7 +1817,7 @@ def repair_placement(data, msg, sheets=()):
     return out, note, notes
 
 
-def report_placement(cfg, queue, msg, data, fmt, note, notes):
+def report_placement(cfg, queue, msg, data, fmt, note, notes, would=None):
     """Mail what was found, whether or not anything was changed.
 
     A document that reaches this code at all is one whose producer made two
@@ -1840,6 +1845,12 @@ def report_placement(cfg, queue, msg, data, fmt, note, notes):
                   '  with what the client previewed: they should now agree. If',
                   '  they do not, set page-geometry=raw on the printer URI and',
                   '  keep the attached document.']
+    elif would:
+        lines += ['  WOULD BE REPAIRED', f'    {would}', '',
+                  '  Nothing was changed: this printer is set to',
+                  '  page-geometry=detect, which looks and reports and leaves',
+                  '  the document alone. Set page-geometry=repair to act on',
+                  '  it.']
     else:
         lines += ['  LEFT ALONE',
                   '    The document has the shape a misplaced page has, and',
@@ -1865,7 +1876,7 @@ def report_placement(cfg, queue, msg, data, fmt, note, notes):
     else:
         lines += ['', '  --archive is off, so the document could not be',
                   '  attached. Turning it on keeps the next one.']
-    verdict = 'repaired' if note else 'left alone'
+    verdict = 'repaired' if note else ('detected' if would else 'left alone')
     cfg.alerter.send(f'ippfix: page placement {verdict} on {name}',
                      '\n'.join(lines) + '\n', parts)
 
@@ -1876,7 +1887,7 @@ def place_pages(cfg, queue, msg, data, fmt):
     Returns (document, note). The note is None whenever nothing was changed,
     which is every job but the rare one -- and the rare one is reported.
     """
-    if queue is not None and not queue.repair_placement:
+    if queue is not None and queue.page_geometry == 'raw':
         return data, None
     payload = normalise_pdf(data)
     if payload is None:
@@ -1897,13 +1908,17 @@ def place_pages(cfg, queue, msg, data, fmt):
         return data, None
     if note is None and not notes:
         return data, None
+    watching = queue is not None and queue.page_geometry == 'detect'
     name = queue.name if queue else 'job'
     if note:
-        log.info('%s: %s', name, note)
+        log.info('%s: %s%s', name, 'would be repaired, but page-geometry is '
+                 'detect: ' if watching else '', note)
     for line in notes:
         log.info('%s: page placement left alone: %s', name, line)
-    report_placement(cfg, queue, msg, data, fmt, note, notes)
-    return (out, note) if note else (data, None)
+    report_placement(cfg, queue, msg, data, fmt,
+                     None if watching else note, notes,
+                     would=note if watching else None)
+    return (out, note) if note and not watching else (data, None)
 
 
 def archive_document(cfg, queue, job_name, fmt, data, note):
