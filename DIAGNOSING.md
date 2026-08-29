@@ -554,6 +554,26 @@ and its form `/Matrix` is the identity, so there is no second placement to
 undo. Off-page content is a symptom here, not the fault; the fault is the same
 origin being subtracted twice, and that is what is tested for.
 
+A corpus of thirty-two jobs captured that way, from one client's own printing,
+settles most of what the shape of this can be:
+
+- **Nothing has mixed page sizes on the wire.** IPP carries one `media` per
+  job, so every path normalises every page onto the one sheet the ticket names.
+  A source that mixes sizes or orientations arrives uniform, with the odd page
+  turned into place by the form's `/Matrix` -- in one 17-page job, sixteen
+  identity matrices and one rotation still carrying an A4 height. Look for
+  mixed geometry in the page boxes and there is none to find; it moved.
+- **Three renderers reach the same filter.** PDFium for PDFs, Skia for HTML,
+  and cairo when the job comes from a Linux viewer beside the browser. Only
+  PDFium's path has produced the fault, and only when the source page's box
+  origin is non-zero: every one of the twenty-six untouched jobs has a wrapper
+  `/Matrix` of the identity, or of a rotation.
+- **The cross-reference-stream limit is real, not hypothetical.** One ordinary
+  job -- printed from a Linux viewer -- arrived with no `xref` table and no
+  `trailer` at all. Such a file is refused rather than rewritten, because a
+  byte-addressed edit cannot reach objects inside an object stream. That path
+  has not been seen to produce the fault, so the refusal has cost nothing yet.
+
 Two limits worth knowing, both of which cost a repair rather than risk one:
 
 - The fit rectangle is centred in the **printable area**, not on the sheet, so

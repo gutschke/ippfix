@@ -2557,8 +2557,11 @@ expect('a page with a CropBox of its own',
        make(crop=[10, 10, 500, 600], **REAL), 'declined', 'CropBox of its own')
 expect('a sheet that is not the media asked for', make(**REAL), 'declined',
        'not the media asked for', msg=ticket(b'iso_a4_210x297mm'))
-mixed = make(pages=2, **REAL).replace(b'/Matrix [ 1 0 0 1 -72 -103.5 ]',
-                                      b'/Matrix [ 1 0 0 1 0 0 ]     ', 1)
+# Padded to the same length, or the cross-reference offsets move and the file
+# is refused as damaged rather than judged on its geometry.
+was = b'/Matrix [ 1 0 0 1 -72 -103.5 ]'
+now = b'/Matrix [ 1 0 0 1 0 0 ]'.ljust(len(was))
+mixed = make(pages=2, **REAL).replace(was, now, 1)
 expect('a document whose pages disagree', mixed, 'declined',
        'a mixed document is left alone')
 # Not this shape at all, and silent about it: a page that was never somebody
@@ -2642,6 +2645,20 @@ for typo in ('yes', 'off', ''):
     except ValueError:
         continue
     raise AssertionError(f'accepted page-geometry={typo!r}')
+# A file whose last cross-reference section is a stream, not a table. Its
+# objects may live inside object streams, where a byte-addressed rewrite cannot
+# reach them, so it is refused -- and refused by looking at what startxref
+# points at, rather than by scanning the whole file for "/Type /ObjStm", which
+# turns up inside compressed streams by chance. A print path that reaches this
+# is ordinary, not exotic: one Linux viewer's output arrived in exactly this
+# shape.
+stream_xref = make(**REAL).replace(b'\nxref\n', b'\nXref\n', 1)
+try:
+    ippfix.repair_placement(stream_xref, ticket())
+except ippfix.NotPlaced as exc:
+    assert 'cross-reference stream' in str(exc), exc
+else:
+    raise AssertionError('a cross-reference stream was not refused')
 # Anything it cannot read is refused rather than guessed at.
 for junk in (b'%PDF-1.7\nnothing here\n', b'not a pdf at all'):
     try:

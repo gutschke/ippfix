@@ -1505,11 +1505,18 @@ def plan_placement(data, msg):
     import idiom and was still not repaired -- the near misses are the evidence
     worth having, so they are reported rather than dropped.
     """
-    if re.search(rb'/Type\s*/ObjStm\b', data) or re.search(rb'/Type\s*/XRef\b',
-                                                           data):
-        # Objects inside an object stream are not byte-addressable, so the
-        # rewrite below could not reach them and would silently do nothing.
-        raise NotPlaced('the file uses object or cross-reference streams')
+    # Where the file's last cross-reference section is a stream rather than a
+    # table, the objects it indexes may be inside an object stream, which is
+    # not byte-addressable -- the rewrite could not reach them and would
+    # silently do nothing. Asked precisely, by looking at what `startxref`
+    # points at, rather than by scanning the whole file for the bytes
+    # "/Type /ObjStm": those turn up inside compressed streams by chance, and
+    # declining a file for a coincidence is a repair not made for no reason.
+    last = re.search(rb'startxref\s+(\d+)\s*%%EOF\s*$', data)
+    if not last:
+        raise NotPlaced('no startxref at the end of the file')
+    if data[int(last.group(1)):int(last.group(1)) + 4] != b'xref':
+        raise NotPlaced('the file uses a cross-reference stream')
     index = _object_index(data)
     if not index:
         raise NotPlaced('no objects could be indexed')
