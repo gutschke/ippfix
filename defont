@@ -582,6 +582,16 @@ fi
 # nothing else is quietly degraded on the way through: image downsampling in
 # particular is on by default in Ghostscript's named presets, which would throw
 # away half the usable resolution on a 600 dpi engine.
+#
+# The image filters are named explicitly, and that is not redundant.
+# -dAutoFilterColorImages=false does not mean "leave the encoding alone"; it
+# means "stop choosing, and use ColorImageFilter" -- whose default is
+# /DCTEncode. So switching auto-selection off is what switches JPEG on, and a
+# document whose images arrived losslessly compressed went to the printer
+# re-encoded lossily. Naming /FlateEncode is what actually leaves them alone.
+# -dPassThroughJPEGImages still governs images that were already JPEG: those
+# are copied rather than re-encoded either way, so a scan does not get inflated
+# into a lossless copy of itself.
 "$GS" -q -dNOPAUSE -dBATCH -dSAFER \
       -K400000 \
       -dNoOutputFonts \
@@ -594,6 +604,8 @@ fi
       -dDownsampleMonoImages=false \
       -dAutoFilterColorImages=false \
       -dAutoFilterGrayImages=false \
+      -dColorImageFilter=/FlateEncode \
+      -dGrayImageFilter=/FlateEncode \
       -dPassThroughJPEGImages=true \
       -dColorConversionStrategy=/LeaveColorUnchanged \
       -sOutputFile="$outfile" "$infile" >&2

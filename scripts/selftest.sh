@@ -336,6 +336,51 @@ sys.exit(1)\""
   ./defont < "$work/in.pdf" > "$work/out.pdf" 2>/dev/null
   check 'removes every font program'  "! grep -qa '/FontFile' '$work/out.pdf'"
   check 'output is still a PDF'       "head -c 5 '$work/out.pdf' | grep -qa '%PDF-'"
+  # A lossless image must not come back lossy. -dAutoFilterColorImages=false
+  # does not mean "leave the encoding alone", it means "use ColorImageFilter",
+  # whose default is /DCTEncode -- so switching auto-selection off is what
+  # switches JPEG on, and every Flate image went to the printer re-encoded.
+  python3 - "$work/image.pdf" <<'PY2'
+import sys, zlib
+w = h = 24
+raw = bytearray()
+for y in range(h):                       # a PNG-predictor-free raw RGB image
+    raw.append(0)
+    for x in range(w):
+        raw += bytes((x * 10 % 256, y * 10 % 256, 128))
+img = zlib.compress(bytes(bytearray(b for i, b in enumerate(raw)
+                                    if i % (w * 3 + 1))), 9)
+img = zlib.compress(bytes(raw), 9)
+objs = {
+    1: b'<< /Type /Catalog /Pages 2 0 R >>',
+    2: b'<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>',
+    3: (b'<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 200 ]'
+        b' /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>'),
+}
+stream = b'q 150 0 0 150 25 25 cm /Im0 Do Q\n'
+objs[4] = b'<< /Length %d >>\nstream\n' % len(stream) + stream + b'endstream'
+objs[5] = (b'<< /Type /XObject /Subtype /Image /Width %d /Height %d'
+           b' /ColorSpace /DeviceRGB /BitsPerComponent 8'
+           b' /Filter /FlateDecode /DecodeParms << /Predictor 15 /Colors 3'
+           b' /BitsPerComponent 8 /Columns %d >> /Length %d >>\nstream\n'
+           % (w, h, w, len(img)) + img + b'\nendstream')
+out = bytearray(b'%PDF-1.7\n%\xe2\xe3\xcf\xd3\n')
+offsets = {}
+for num in sorted(objs):
+    offsets[num] = len(out)
+    out += b'%d 0 obj\n' % num + objs[num] + b'\nendobj\n'
+at = len(out)
+out += b'xref\n0 %d\n0000000000 65535 f \n' % (max(objs) + 1)
+for num in range(1, max(objs) + 1):
+    out += b'%010d 00000 n \n' % offsets[num]
+out += (b'trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n'
+        % (max(objs) + 1, at))
+open(sys.argv[1], 'wb').write(bytes(out))
+PY2
+  ./defont < "$work/image.pdf" > "$work/image.out" 2>/dev/null
+  check 'a losslessly compressed image is not re-encoded as JPEG'         "! grep -qa DCTDecode '$work/image.out'"
+  check 'and the image is still there' "grep -qa FlateDecode '$work/image.out'"
+
   printf 'UNIRAST\0not a pdf at all' > "$work/raster.bin"
   ./defont < "$work/raster.bin" > "$work/raster.out" 2>/dev/null
   check 'passes non-PDF through unchanged' "cmp -s '$work/raster.bin' '$work/raster.out'"
