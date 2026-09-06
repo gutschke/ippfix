@@ -625,10 +625,19 @@ arrives.
 .IP
 So the document is converted again and sent as raster, quietly. Whoever printed
 it is not asked anything, because there is nothing they could do; the page
-either arrives or it does not, and a raster of it is a page. It cannot print
-twice: the state it reacts to is terminal and means no sheet was marked. This
-is what RFC 8011 and the IPP maintainers recommend for the case. The retry
-costs nothing when it is not needed, so there is rarely a reason for this flag.
+either arrives or it does not, and a raster of it is a page. This is what RFC
+8011 and the IPP maintainers recommend for the case, and the retry costs
+nothing when it is not needed, so there is rarely a reason for this flag.
+.IP
+It never reprints a page that already came out. Faults of this kind are often
+per page: a printer can render fourteen pages, meet something it cannot read on
+the fifteenth and abandon the job with fourteen sheets already in the tray.
+Before sending anything the proxy establishes that nothing was marked \(em the
+printer's own impression count must be zero, and where the page counter tied to
+the marking engine can be read at both ends of the job, it must not have moved.
+If either says otherwise the document is left alone and, with
+.BR \-\-alert\-mail ,
+reported as part printed, so that whoever wants the rest can ask for it.
 .TP
 .B \-\-no\-convert
 Relay jobs untouched. Intended for comparison against a converting instance,

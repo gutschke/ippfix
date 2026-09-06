@@ -454,6 +454,15 @@ few seconds later the job reaches `job-state 8` with
 rejection of this kind costs no paper**, which is what makes it cheap to
 investigate: only a success uses a sheet.
 
+The proxy sends such a document again as raster -- but only after establishing
+that nothing was marked. These faults are often per page, and a printer that
+renders fourteen pages before meeting one it cannot read has fourteen sheets in
+the tray already; resending the whole document would reprint them. The job that
+was measured failed on its *first* page, which is precisely the case that hides
+that danger, so the guard is on evidence rather than on that one observation:
+`job-impressions-completed` must be zero and, where the page counter can be
+read at both ends, it must not have moved.
+
 It is not the refusal `rasterise_after_refusal()` handles. There the printer
 answers an error, no job exists, and the retry happens inside the client's own
 request. Here a job exists and the client has been told it is on its way, so

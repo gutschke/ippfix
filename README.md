@@ -247,8 +247,12 @@ could not read the document, the document is converted again and sent as
 raster. That failure is invisible from above -- the client has already been
 told the job was accepted, the printer marks nothing, and the page simply never
 arrives -- and there is nothing the person who printed it could have done, so
-nothing is asked of them. It cannot print twice: the state it reacts to is
-terminal and means no sheet was marked. `--no-raster-retry` turns it off.
+nothing is asked of them. It never reprints a page that already came out:
+these faults are often per page, so before sending anything the proxy
+establishes that the printer marked nothing -- by its own impression count and,
+where it can be read, by the page counter tied to the marking engine. If either
+says otherwise the document is left alone and reported as part printed.
+`--no-raster-retry` turns the whole thing off.
 
 This one is **off by default**: `?page-geometry=repair` turns it on, and
 `?page-geometry=detect` looks and reports without touching anything. Left at

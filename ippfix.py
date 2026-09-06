@@ -2984,6 +2984,29 @@ FORMAT_REFUSED = ('document-format-error', 'document-unprintable-error',
                   'unsupported-document-format')
 
 
+def already_marked(impressions, before, after):
+    """What shows the printer already put something in the tray, or None.
+
+    Asked before a document is sent again, because these faults are often per
+    page: a printer can render fourteen pages, meet something it cannot read on
+    the fifteenth, and abandon the job with fourteen sheets already in the
+    tray. Sending the whole document again would reprint those fourteen, and
+    this proxy exists to stop paper being wasted rather than to waste it
+    politely.
+
+    Two witnesses, and either is enough to stop. The printer's own impression
+    count, which can be optimistic but is not going to invent pages it never
+    marked. And the page counter tied to the marking engine, which this file
+    trusts over anything the printer says about itself -- consulted only when
+    it could be read at both ends, since one missing reading proves nothing.
+    """
+    if impressions:
+        return f'it reports {impressions} impression(s) already marked'
+    if before is not None and after is not None and after != before:
+        return f'its page counter moved by {after - before}'
+    return None
+
+
 def resend_as_raster(cfg, queue, fmt, data, sides):
     """Send a document again as raster, after the printer discarded it.
 
@@ -2994,10 +3017,10 @@ def resend_as_raster(cfg, queue, fmt, data, sides):
 
     Returns a note describing what was sent, or None if nothing could be.
 
-    Safe against printing twice, on the evidence rather than on hope: it runs
-    only after the job reached job-state 8 with the printer saying it could not
-    read the document, which is a terminal state and means no sheet was marked.
-    The IPP authors recommend exactly this -- "handle the
+    Whether anything was marked before the job was abandoned is the caller's
+    to establish, and it does -- see watch_job(). This function sends the whole
+    document, so calling it after a partial print would reprint the part that
+    worked. The IPP authors recommend the retry itself: "handle the
     document-unprintable-error case and retry as raster if the PDF fails".
     """
     if not cfg.raster_retry or not cfg.convert or not queue.raster_format:
@@ -3119,13 +3142,32 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
     page_lines, contradicted = queue.pages.assess(before, after, impressions)
 
     # A document the printer could not read is the one failure here that can
-    # still be put right, because the printer said so before marking anything.
-    # Do that first, so what is reported below describes what finally happened
-    # rather than the half of it that went wrong.
+    # still be put right. Do that first, so what is reported below describes
+    # what finally happened rather than the half of it that went wrong.
+    #
+    # But only when nothing was marked, and that has to be established rather
+    # than assumed. These faults are often per page: a printer can render
+    # fourteen pages, meet something it cannot read on the fifteenth, and
+    # abandon the job -- having already put fourteen sheets in the tray.
+    # Sending the whole document again would then reprint those fourteen, and
+    # this proxy exists to stop paper being wasted, not to waste it politely.
+    # The one job seen doing this failed on its first page, which is exactly
+    # the case that makes the danger invisible.
+    #
+    # So: the printer's own impression count must be zero, and where a page
+    # counter can be read -- the number tied to the marking engine, and the
+    # one this file trusts over anything the printer says about itself -- it
+    # must not have moved either.
     recovered = None
     if state == 8 and any(r.strip() in FORMAT_REFUSED
                           for r in reasons.split(',')):
-        recovered = resend_as_raster(cfg, queue, fmt, data, sides)
+        marked = already_marked(impressions, before, after)
+        if marked:
+            log.warning('%s: the printer could not read the document, but %s; '
+                        'not sending it again, because the pages that did '
+                        'print would print a second time', queue.name, marked)
+        else:
+            recovered = resend_as_raster(cfg, queue, fmt, data, sides)
 
     # Judge. Only complain about things that are actually wrong: a job that
     # completed having marked pages is the ordinary case and says nothing --
@@ -3159,6 +3201,15 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
         detail = ('the printer reported the job completed successfully and '
                   'marked no impressions at all. This is the failure this '
                   'proxy exists for, and it means something got through it.')
+    elif state == 8 and already_marked(impressions, before, after):
+        verdict = 'PART PRINTED'
+        detail = (f'the printer could not read the document and abandoned the '
+                  f'job, but not before marking something: it reports '
+                  f'{impressions or 0} impression(s). Faults of this kind are '
+                  f'often per page, so some of the document is in the tray and '
+                  f'the rest is not. It was NOT sent again -- doing so would '
+                  f'reprint the pages that worked. Reprint what is missing by '
+                  f'hand, or send it as an image.')
     elif state == 8 and recovered:
         verdict = 'REPRINTED'
         detail = (f'the printer took the job, could not read the document and '

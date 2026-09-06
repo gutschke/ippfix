@@ -2427,7 +2427,7 @@ fi
 # by then a job exists and the client has been told it was accepted.
 echo 'a document the printer accepts and then cannot read'
 if command -v gs >/dev/null 2>&1; then
-python3 - <<'PY2' && ok 'is sent again as raster, and only when that is possible' || bad 'raster retry'
+python3 - <<'PY2' && ok 'is sent again as raster, but never over pages that already printed' || bad 'raster retry'
 import sys
 import time
 sys.path.insert(0, '.')
@@ -2505,6 +2505,27 @@ with fp.FakePrinter(mode='refuse_format') as printer:
     queue.learn(timeout=5)
     assert ippfix.resend_as_raster(cfg, queue, 'image/urf',
                                    fp.urf_document(pages=1), None) is None
+
+# These faults are often per page. A printer can render fourteen pages, meet
+# something it cannot read on the fifteenth and abandon the job with fourteen
+# sheets already in the tray -- and sending the whole document again would
+# reprint them. The one job seen doing this failed on its first page, which is
+# exactly the case that hides the danger, so the rule is tested rather than
+# reasoned about.
+say = ippfix.already_marked
+assert say(0, 100, 100) is None, 'nothing marked, counter still: send it again'
+assert say(None, None, None) is None, 'no evidence of marking: send it again'
+assert say(0, None, None) is None, 'no counter at all: send it again'
+# One reading missing proves nothing either way, and must not stop a recovery.
+assert say(0, 100, None) is None, 'counter read once: proves nothing'
+assert say(0, None, 100) is None, 'counter read once: proves nothing'
+# Either witness on its own is enough to stop.
+assert 'impression' in (say(3, 100, 100) or ''), 'the printer claimed pages'
+assert 'counter' in (say(0, 100, 102) or ''), 'the counter moved'
+assert 'counter' in (say(None, 100, 102) or ''), 'the counter moved'
+# The counter is trusted over the printer's own account, as everywhere else
+# here: it says pages were marked even when the printer claims none.
+assert say(0, 10, 11) is not None
 
 # The reasons acted on are the ones RFC 8011 defines for this, and not a
 # cancellation or a jam, which must never provoke a second copy.
