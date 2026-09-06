@@ -443,6 +443,33 @@ The proxy therefore reports a level the printer would call empty at the
 printer's own low mark instead, and only while the printer is contradicting
 itself. See `supply-levels=clamped|raw` in **ippfix(8)**.
 
+### A document the printer accepts and then cannot read
+
+The printer answers `IPP 0x0000`, the client is told its job was created, and a
+few seconds later the job reaches `job-state 8` with
+
+    job-state-reasons = ['document-format-error']
+
+`job-impressions-completed` is 0 and the SNMP page counter does not move. **A
+rejection of this kind costs no paper**, which is what makes it cheap to
+investigate: only a success uses a sheet.
+
+It is not the refusal `rasterise_after_refusal()` handles. There the printer
+answers an error, no job exists, and the retry happens inside the client's own
+request. Here a job exists and the client has been told it is on its way, so
+nothing more is sent on its behalf unless the proxy sends it -- which is what
+`resend_as_raster()` does, and what the IPP maintainers recommend for the case.
+
+One document is known to provoke it. It is kept read-only, outside the archive
+so that nothing prunes it, together with the trials that established what did
+and did not matter. Flattening its transparency at
+`-dCompatibilityLevel=1.3` makes it printable; the images, the fonts and the
+page geometry are not involved. What in the transparency is responsible is
+**not established** -- three separate theories were falsified, two of them on
+measurements that looked like structure and were not, and a job carrying
+sixteen function-based shadings with PostScript-calculator functions prints
+perfectly well. Treat any confident story about the trigger with suspicion.
+
 ### Pages placed off the sheet
 
 A job whose sheet has a wide unprinted band along one edge and clipped content

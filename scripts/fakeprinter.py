@@ -278,6 +278,7 @@ class FakePrinter:
     # proves nothing.
     MODES = (None,
              'reject_job',                 # the job is accepted and aborted
+             'refuse_format',              # accepted, then discarded unread
              'hold_job',                   # pending, media-empty, forever
              'silent_loss',                # completes having marked nothing
              'unreachable',                # connections are refused
@@ -651,6 +652,16 @@ class FakePrinter:
                     # taken -- the client is told, unlike a silent loss.
                     job.state = ABORTED
                     job.reasons = ['job-canceled-by-system']
+                elif (self._mode == 'refuse_format'
+                        and (fmt or job.fmt) == 'application/pdf'):
+                    # The same shape with the printer saying why: it took
+                    # the job, answered success, and only then found it could
+                    # not read the document. Measured on an M283fdw, which
+                    # marks nothing when it does this. Only PDF is refused, so
+                    # that a proxy offering raster instead is answered the way
+                    # the real device answers it.
+                    job.state = ABORTED
+                    job.reasons = ['document-format-error']
                 elif self._mode == 'hold_job':
                     job.reasons = ['media-empty']
                 if self._mode == 'accept_then_drop_response':
@@ -684,6 +695,10 @@ class FakePrinter:
                 if self._mode == 'reject_job':
                     job.state = ABORTED
                     job.reasons = ['job-canceled-by-system']
+                elif (self._mode == 'refuse_format'
+                        and (fmt or job.fmt) == 'application/pdf'):
+                    job.state = ABORTED
+                    job.reasons = ['document-format-error']
                 elif self._mode == 'hold_job':
                     job.reasons = ['media-empty']
                 if self._mode == 'accept_then_drop_response':

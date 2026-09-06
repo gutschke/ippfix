@@ -242,7 +242,15 @@ sheet its producer computed the fit for. The repair is an append, so the
 document that arrived is still inside the one that is sent; the visible area is
 compared both ways first and the job goes unrepaired unless the new one
 contains the old; and every page of this shape is logged and mailed whether or
-not it was changed. This one is **off by default**: `?page-geometry=repair` turns it on, and
+not it was changed. When the printer takes a job, answers success and then discards it because it
+could not read the document, the document is converted again and sent as
+raster. That failure is invisible from above -- the client has already been
+told the job was accepted, the printer marks nothing, and the page simply never
+arrives -- and there is nothing the person who printed it could have done, so
+nothing is asked of them. It cannot print twice: the state it reacts to is
+terminal and means no sheet was marked. `--no-raster-retry` turns it off.
+
+This one is **off by default**: `?page-geometry=repair` turns it on, and
 `?page-geometry=detect` looks and reports without touching anything. Left at
 `raw` the document is not parsed at all, so a queue that does not want this
 carries none of it.

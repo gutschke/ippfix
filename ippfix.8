@@ -32,6 +32,7 @@ cache.
 [\fB\-\-key\fR \fIFILE\fR]
 [\fB\-\-no\-advertise\fR]
 [\fB\-\-no\-convert\fR]
+[\fB\-\-no\-raster\-retry\fR]
 [\fB\-p\fR|\fB\-\-port\fR \fIPORT\fR]
 [\fB\-\-timeout\fR \fISECONDS\fR]
 [\fB\-v\fR|\fB\-\-verbose\fR]
@@ -607,6 +608,27 @@ documents are chosen by whoever is printing.
 .B \-\-no\-advertise
 Do not publish the queues over DNS\-SD. Useful when discovery is handled
 elsewhere.
+.TP
+.B \-\-no\-raster\-retry
+Do not send a document again as raster when the printer takes the job, reports
+it accepted, and then discards it for a format it cannot read.
+.IP
+That is a different failure from a refusal at submission time, where the
+printer answers an error, no job exists, and the retry happens inside the
+client's own request. Here the printer answers success, the client is told its
+job is on its way, and only afterwards does the job reach
+.B job\-state 8
+with
+.B document\-format\-error
+\(em having marked nothing. Nobody downstream finds out, and the page never
+arrives.
+.IP
+So the document is converted again and sent as raster, quietly. Whoever printed
+it is not asked anything, because there is nothing they could do; the page
+either arrives or it does not, and a raster of it is a page. It cannot print
+twice: the state it reacts to is terminal and means no sheet was marked. This
+is what RFC 8011 and the IPP maintainers recommend for the case. The retry
+costs nothing when it is not needed, so there is rarely a reason for this flag.
 .TP
 .B \-\-no\-convert
 Relay jobs untouched. Intended for comparison against a converting instance,

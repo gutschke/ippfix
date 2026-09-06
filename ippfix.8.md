@@ -435,6 +435,23 @@ An unrecognised option is an error rather than something ignored.
   Do not publish the queues over DNS-SD. Useful when discovery is handled
   elsewhere.
 
+* `--no-raster-retry`:
+  Do not send a document again as raster when the printer takes the job,
+  reports it accepted, and then discards it for a format it cannot read.
+
+  That is a different failure from a refusal at submission time, where the
+  printer answers an error, no job exists, and the retry happens inside the
+  client's own request. Here the printer answers success, the client is told
+  its job is on its way, and only afterwards does the job reach `job-state 8`
+  with `document-format-error` -- having marked nothing. Nobody downstream
+  finds out, and the page never arrives.
+
+  So the document is converted again and sent as raster, quietly. Whoever
+  printed it is not asked anything, because there is nothing they could do; the
+  page either arrives or it does not, and a raster of it is a page. It cannot
+  print twice: the state it reacts to is terminal and means no sheet was
+  marked. This is what RFC 8011 and the IPP maintainers recommend for the case.
+
 * `--no-convert`:
   Relay jobs untouched. Intended for comparison against a converting instance,
   to confirm that conversion is what makes the difference.

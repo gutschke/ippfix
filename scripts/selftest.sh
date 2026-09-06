@@ -2421,6 +2421,127 @@ else
   bad 'scripts/selftest-pagerange.sh is missing or not executable'
 fi
 
+# The printer can take a job, answer success, and then discard it because it
+# could not read the document -- marking nothing and telling nobody who could
+# act on it. That is not the refusal the synchronous fallback handles, because
+# by then a job exists and the client has been told it was accepted.
+echo 'a document the printer accepts and then cannot read'
+if command -v gs >/dev/null 2>&1; then
+python3 - <<'PY2' && ok 'is sent again as raster, and only when that is possible' || bad 'raster retry'
+import sys
+import time
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+import ippfix
+import fakeprinter as fp
+
+PDF = open('scripts/fixtures/get-printer-attributes.b64', 'rb').read()[:0]
+# A real PDF, built here so the test does not depend on anybody's document.
+doc = (b'%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
+       b'2 0 obj\n<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>\nendobj\n'
+       b'3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 200 ]'
+       b' /Contents 4 0 R >>\nendobj\n'
+       b'4 0 obj\n<< /Length 44 >>\nstream\n'
+       b'1 0 0 rg 20 20 160 160 re f 0 g 30 30 m 170 170 l S\n'
+       b'endstream\nendobj\n')
+offs, out = {}, bytearray(doc[:0])
+# Assemble with a real cross-reference table.
+body = bytearray(b'%PDF-1.4\n')
+objs = {
+    1: b'<< /Type /Catalog /Pages 2 0 R >>',
+    2: b'<< /Type /Pages /Count 1 /Kids [ 3 0 R ] >>',
+    3: b'<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 200 200 ]'
+       b' /Contents 4 0 R >>',
+}
+content = b'1 0 0 rg 20 20 160 160 re f\n'
+objs[4] = b'<< /Length %d >>\nstream\n' % len(content) + content + b'endstream'
+for num in sorted(objs):
+    offs[num] = len(body)
+    body += b'%d 0 obj\n' % num + objs[num] + b'\nendobj\n'
+at = len(body)
+body += b'xref\n0 5\n0000000000 65535 f \n'
+for num in range(1, 5):
+    body += b'%010d 00000 n \n' % offs[num]
+body += b'trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n' % at
+doc = bytes(body)
+
+
+def offered(**over):
+    """What the printer ends up holding, after one refused PDF."""
+    with fp.FakePrinter(mode='refuse_format') as printer:
+        cfg, queue = fp.proxy_for(printer)
+        cfg.convert = True
+        cfg.converter = './defont'
+        for key, value in over.items():
+            setattr(cfg, key, value)
+        queue.learn(timeout=5)
+        note = ippfix.resend_as_raster(cfg, queue, 'application/pdf', doc, None)
+        sent = []
+        for op, raw in printer.requests:
+            if op not in (fp.OP_PRINT_JOB, fp.OP_SEND_DOCUMENT):
+                continue
+            group = ipp.parse(raw).operation()
+            sent.append(group.get_str('document-format') if group else '?')
+        return note, sent
+
+
+note, sent = offered()
+assert note and 'image/urf' in note, (note, sent)
+assert sent == ['image/urf'], sent
+
+# Switched off, nothing is sent at all.
+note, sent = offered(raster_retry=False)
+assert note is None and sent == [], (note, sent)
+note, sent = offered(convert=False)
+assert note is None and sent == [], (note, sent)
+
+# A document that is already raster has nothing better to offer, so offering
+# it again would earn the same answer.
+with fp.FakePrinter(mode='refuse_format') as printer:
+    cfg, queue = fp.proxy_for(printer)
+    cfg.convert = True
+    cfg.converter = './defont'
+    queue.learn(timeout=5)
+    assert ippfix.resend_as_raster(cfg, queue, 'image/urf',
+                                   fp.urf_document(pages=1), None) is None
+
+# The reasons acted on are the ones RFC 8011 defines for this, and not a
+# cancellation or a jam, which must never provoke a second copy.
+assert 'document-format-error' in ippfix.FORMAT_REFUSED
+assert 'document-unprintable-error' in ippfix.FORMAT_REFUSED
+for innocent in ('job-canceled-by-user', 'media-jam', 'media-empty',
+                 'job-completed-successfully'):
+    assert innocent not in ippfix.FORMAT_REFUSED, innocent
+PY2
+
+python3 - <<'PY2' && ok 'and the job is followed even when nobody asked for a report' || bad 'watcher gating'
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippfix
+import fakeprinter as fp
+
+with fp.FakePrinter() as printer:
+    cfg, queue = fp.proxy_for(printer)
+    queue.learn(timeout=5)
+    assert cfg.alerter is None, 'this test needs alerting off to mean anything'
+    cfg.convert = True
+    # Recovery is possible, so the job is worth following even with nobody
+    # listening: the point of following it is to put it right, not to report.
+    cfg.raster_retry = True
+    assert queue.raster_format
+    assert (cfg.raster_retry and cfg.convert and bool(queue.raster_format))
+    # And when there is nothing this proxy could do about it, it does not poll
+    # the printer for every job to no purpose.
+    cfg.raster_retry = False
+    assert not (cfg.raster_retry and cfg.convert and bool(queue.raster_format))
+PY2
+else
+  skip 'a document the printer accepts and then cannot read (needs Ghostscript)'
+  skip 'and the job is followed even when nobody asked for a report'
+fi
+
 # A print path that imports a page and then fits it to the paper can apply
 # both placements at once, leaving the page declaring one size while its
 # content was arranged for another. The documents here are assembled rather

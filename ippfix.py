@@ -534,6 +534,7 @@ class Config:
                                  if args.converter.startswith('unix:') else None)
         self.timeout = args.timeout
         self.archive = args.archive
+        self.raster_retry = not args.no_raster_retry
         # Following jobs to see whether they printed. Off unless an address is
         # given: on a printer that does not report impressions honestly this
         # would report every job as lost.
@@ -2968,9 +2969,93 @@ class PageCounter:
         return [line], contradicted
 
 
+# Reasons a printer gives when it took a job and then threw it away because
+# it could not read the document. RFC 8011 spells the first two; the third is
+# what a device says when it recognised the format and would not take it.
+#
+# This is not the same failure as a refusal at submission time. There the
+# printer answers an error and no job exists, which is what
+# rasterise_after_refusal() handles inside the client's own request. Here the
+# printer answers success, tells the client its job was accepted, and only then
+# discards it -- so by the time anyone finds out, the client has been told the
+# job is on its way and nothing more will be sent on its behalf unless this
+# proxy sends it.
+FORMAT_REFUSED = ('document-format-error', 'document-unprintable-error',
+                  'unsupported-document-format')
+
+
+def resend_as_raster(cfg, queue, fmt, data, sides):
+    """Send a document again as raster, after the printer discarded it.
+
+    The user cannot act on this and should not have to: the page they asked
+    for either arrives or it does not, and a raster of it is a page. So this
+    happens quietly, and what is worth saying about it goes to the log rather
+    than to them.
+
+    Returns a note describing what was sent, or None if nothing could be.
+
+    Safe against printing twice, on the evidence rather than on hope: it runs
+    only after the job reached job-state 8 with the printer saying it could not
+    read the document, which is a terminal state and means no sheet was marked.
+    The IPP authors recommend exactly this -- "handle the
+    document-unprintable-error case and retry as raster if the PDF fails".
+    """
+    if not cfg.raster_retry or not cfg.convert or not queue.raster_format:
+        return None
+    if not looks_like_pdf(data):
+        return None                # already raster: the same bytes, the same answer
+    try:
+        payload, note = convert(cfg, data, fmt, queue, sides=sides,
+                                force_raster=True)
+    except ConversionFailed as exc:
+        log.warning('%s: the printer could not read the document and it could '
+                    'not be rasterised either (%s)', queue.name, exc)
+        return None
+    produced = sniff_format(payload)
+    if payload is data or produced in (None, fmt, 'application/pdf'):
+        log.warning('%s: the printer could not read the document and the '
+                    'converter had no raster to offer instead', queue.name)
+        return None
+
+    request = ipp.new_request(0x0002, 1, queue.upstream_uri())
+    group = request.operation()
+    group.replace('document-format', ipp.TAG_MIMETYPE, [produced.encode()])
+    group.replace('job-name', ipp.TAG_NAME, [b'resent as raster'])
+    request.data = payload
+    serialised = ipp.serialize(request)
+    if not queue.lock.acquire(timeout=cfg.timeout):
+        log.warning('%s: could not resend as raster; the queue stayed busy',
+                    queue.name)
+        return None
+    try:
+        status, raw = upstream_ipp(queue, serialised, cfg.timeout)
+    except UPSTREAM_ERRORS as exc:
+        log.warning('%s: could not resend as raster (%s)', queue.name, exc)
+        return None
+    finally:
+        queue.lock.release()
+    if status != 200:
+        log.warning('%s: the printer refused the raster as well (HTTP %s)',
+                    queue.name, status)
+        return None
+    try:
+        code = ipp.parse(raw).code
+    except Exception:
+        code = None
+    if code is not None and code >= 0x0100:
+        log.warning('%s: the printer refused the raster as well '
+                    '(IPP 0x%04x)', queue.name, code)
+        return None
+    log.info('%s: the printer could not read the document, so it was sent '
+             'again as %s -- the aborted job marked nothing, so this is the '
+             'first sheet and not a second copy (%s)',
+             queue.name, produced, note)
+    return f'resent as {produced}'
+
+
 def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
-              archived=None):
-    """Follow one job to its end and report if the printer marked nothing."""
+              archived=None, sides=None):
+    """Follow one job to its end, put right what can be, and report the rest."""
     # Read the page counter before following the job. This happens just after
     # the client was answered, so the printer may in principle have started
     # marking already -- but the failure this matters most for marks nothing at
@@ -3033,12 +3118,29 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
     after = queue.pages.read()
     page_lines, contradicted = queue.pages.assess(before, after, impressions)
 
+    # A document the printer could not read is the one failure here that can
+    # still be put right, because the printer said so before marking anything.
+    # Do that first, so what is reported below describes what finally happened
+    # rather than the half of it that went wrong.
+    recovered = None
+    if state == 8 and any(r.strip() in FORMAT_REFUSED
+                          for r in reasons.split(',')):
+        recovered = resend_as_raster(cfg, queue, fmt, data, sides)
+
     # Judge. Only complain about things that are actually wrong: a job that
     # completed having marked pages is the ordinary case and says nothing --
     # unless the counter that is tied to the marking engine says otherwise,
     # which is the one case where the job accounting alone would have missed
     # the failure entirely.
     if state == 9 and impressions and not contradicted:
+        return
+    if not cfg.alerter:
+        # Nobody asked to be told. Anything that could be put right already has
+        # been, above, and a line in the journal is what remains.
+        if recovered:
+            return
+        log.warning('%s: job %s ended state=%s impressions=%s reasons=%s',
+                    queue.name, job_id, state, impressions, reasons or 'none')
         return
     if contradicted:
         verdict = 'COUNTED BUT NOT PRINTED'
@@ -3057,6 +3159,14 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
         detail = ('the printer reported the job completed successfully and '
                   'marked no impressions at all. This is the failure this '
                   'proxy exists for, and it means something got through it.')
+    elif state == 8 and recovered:
+        verdict = 'REPRINTED'
+        detail = (f'the printer took the job, could not read the document and '
+                  f'discarded it without marking anything, so it was converted '
+                  f'again and {recovered}. The page should have come out. '
+                  f'Nothing was asked of whoever printed it, because there is '
+                  f'nothing they could have done -- this report exists so that '
+                  f'the document can be looked at, not so that anyone acts.')
     elif state == 8:
         verdict = 'REJECTED'
         detail = ('the printer aborted the job. Unlike a silent loss the '
@@ -3124,8 +3234,17 @@ def watch_job(cfg, queue, job_id, jobname, fmt, data, note,
 
 def maybe_watch(cfg, queue, reply, msg, fmt, data, note,
                 archived=None):
-    """Start following a print job, if alerting is configured."""
-    if not cfg.alerter:
+    """Start following a print job, if there is any reason to.
+
+    Two reasons, and either is enough. Alerting wants to know how the job
+    ended. And a job the printer discards for a document it cannot read can be
+    sent again as raster -- which is worth doing whether or not anybody has
+    asked to be told about it, because the alternative is a page that silently
+    never arrives.
+    """
+    can_recover = (cfg.raster_retry and cfg.convert
+                   and bool(queue.raster_format))
+    if not cfg.alerter and not can_recover:
         return
     job_id = None
     for gr in reply.groups:
@@ -3147,7 +3266,7 @@ def maybe_watch(cfg, queue, reply, msg, fmt, data, note,
     def run():
         try:
             watch_job(cfg, queue, job_id, jobname, fmt, data, note,
-                      archived)
+                      archived, sides=job_sides(msg))
         except Exception as exc:
             log.error('while following job %s: %s', job_id, exc)
         finally:
@@ -4121,8 +4240,11 @@ class Handler(socketserver.BaseRequestHandler):
 
         # The client has its answer; now find out whether the printer really
         # prints it. This happens after responding, so following a job never
-        # delays one.
-        if msg.code in (0x0002, 0x0006) and status == 200 and cfg.alerter:
+        # delays one -- and it is not conditional on anybody wanting a report,
+        # because a job the printer discards for a document it cannot read gets
+        # sent again from in there. maybe_watch() decides whether there is a
+        # reason to follow this one.
+        if msg.code in (0x0002, 0x0006) and status == 200:
             try:
                 maybe_watch(cfg, queue, ipp.parse(raw), msg, fmt,
                             msg.data or b'', note, archived)
@@ -4456,6 +4578,12 @@ def build_parser():
                              'attaches nothing.')
     parser.add_argument('--no-convert', action='store_true',
                         help='relay jobs untouched, for comparison')
+    parser.add_argument('--no-raster-retry', action='store_true',
+                        help='do not send a document again as raster when the '
+                             'printer takes the job, reports it accepted and '
+                             'then discards it for a format it cannot read. '
+                             'The retry is silent and costs nothing when it is '
+                             'not needed, so there is rarely a reason for this')
     parser.add_argument('--archive', metavar='DIR', default=None,
                         help='DIAGNOSTIC ONLY: keep a copy of every job as it '
                              'arrived, before conversion. This stores users\' '
