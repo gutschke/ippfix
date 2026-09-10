@@ -82,6 +82,78 @@ check 'the guard rejects each shape it exists to catch' '[ "$caught" = "$probes"
 printf '192.0.2.10 198.51.100.9 2001:db8::1 ::1 127.0.0.1 a@b.example\n' > "$probe"
 check 'the guard accepts the documentation ranges' './scripts/scrub-check.py "$probe"'
 
+# A reply relayed to a client must never name the upstream printer. Everything
+# this proxy does rests on the client talking to the proxy and nothing else,
+# and a client told the printer's own address will try it and fail.
+echo 'the printer address never reaches a client'
+python3 - <<'PY2' && ok 'a reply that cannot be rewritten is refused, not passed on' || bad 'upstream address leak'
+import io
+import sys
+sys.path.insert(0, '.')
+sys.path.insert(0, 'scripts')
+import ippcodec as ipp
+import ippfix
+import fakeprinter as fp
+
+# The parser counts records on the wire, not attributes, and a collection is
+# flat here: begCollection, a member name and a value per member,
+# endCollection. An M283fdw asked for `all` plus media-col-database answers
+# with what ipptool calls 127 attributes and what this sees as 69238 records,
+# nearly all of them inside that one attribute. The bound used to be 10000, so
+# every such reply was refused and then relayed unparsed -- which is
+# unrewritten, and names the printer.
+big = ipp.Message(code=0x0000, request_id=1)
+group = big.ensure_group(ipp.PRINTER_ATTRS)
+for i in range(20000):
+    group.items.append((ipp.TAG_KEYWORD, b'media-col-database',
+                        b'x' * 8))
+raw = ipp.serialize(big)
+assert sum(len(g.items) for g in ipp.parse(raw).groups) == 20000, 'refused a real reply'
+
+with fp.FakePrinter() as printer:
+    cfg, queue = fp.proxy_for(printer)
+    # A reply that cannot be parsed and does name the printer must not be
+    # handed on, however tempting it is to pass the bytes through.
+    leaky = b'\x02\x00\x00\x00\x00\x00\x00\x01\x01GARBAGE ' \
+            + queue.host.encode() + b' more garbage'
+    def upstream(_queue, _payload, _timeout):
+        return 200, leaky
+    real, ippfix.upstream_ipp = ippfix.upstream_ipp, upstream
+    try:
+        msg = ipp.new_request(0x000B, 1, printer.uri)
+        answer = fp.relay(cfg, msg)
+    finally:
+        ippfix.upstream_ipp = real
+    assert queue.host.encode() not in answer.body, 'the printer\'s address leaked'
+    assert answer.ipp is not None, 'the client got no IPP answer at all'
+    assert answer.ipp.code >= 0x0100, f'expected an error, got 0x{answer.ipp.code:04x}'
+
+with fp.FakePrinter() as printer:
+    cfg, queue = fp.proxy_for(printer)
+    # One that cannot be parsed but names nothing is still relayed, because
+    # refusing it would cost a client an answer for no benefit.
+    #
+    # Read straight off the socket rather than through fp.relay(), whose Answer
+    # parses the body it is handed -- on a deliberately unparseable body that
+    # is the harness failing, not the daemon, and a test that cannot tell those
+    # apart is not a test.
+    harmless = b'\x02\x00\x00\x00\x00\x00\x00\x01\x01not parseable at all'
+    def upstream(_queue, _payload, _timeout):
+        return 200, harmless
+    real, ippfix.upstream_ipp = ippfix.upstream_ipp, upstream
+    handler = ippfix.Handler.__new__(ippfix.Handler)
+    handler.client_address = ('192.0.2.99', 5000)
+    sink = io.BytesIO()
+    try:
+        handler.handle_ipp(cfg, sink, next(iter(cfg.queues)),
+                           ipp.serialize(ipp.new_request(0x000B, 1,
+                                                         printer.uri)))
+    finally:
+        ippfix.upstream_ipp = real
+    body = sink.getvalue().partition(b'\r\n\r\n')[2]
+    assert body == harmless, 'a harmless unparseable reply was withheld'
+PY2
+
 echo 'IPP codec'
 python3 - "$work" <<'PY' && ok 'round-trips messages byte for byte' || bad 'round-trip'
 import sys

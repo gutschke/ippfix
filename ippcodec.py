@@ -18,7 +18,24 @@ import struct
 # byte below 0x10 starts a new group, so an unbroken run of them would otherwise
 # allocate one object per byte.
 MAX_GROUPS = 64
-MAX_ITEMS = 10000
+# Records on the wire, which is not the same as attributes and is much larger.
+# This parser is flat: a collection is not nested here, it arrives as a
+# begCollection record, a memberAttrName and a value for each member, and an
+# endCollection, and every one of those counts.
+#
+# The difference is the whole reason this number had to change. An M283fdw
+# asked for `all` plus `media-col-database` -- which is what macOS asks for
+# when adding a printer -- answers with 948943 bytes that ipptool displays as
+# 127 attributes. On the wire those are 69238 records: 6059 collections, 29923
+# member names and 27197 values, nearly all of them inside the one
+# media-col-database attribute.
+#
+# The old bound of 10000 refused every such reply, and the caller then relayed
+# the bytes unparsed -- which is to say unrewritten, naming the upstream
+# printer's own address to a client that cannot reach it. Measured on that
+# reply, parsing costs 110ms and 8MB, so the bound is set where an honest
+# answer passes and a reply designed to exhaust memory still does not.
+MAX_ITEMS = 200000
 VALID_DELIMITERS = frozenset(range(0x00, 0x08))
 
 # delimiter tags

@@ -4017,7 +4017,13 @@ class Handler(socketserver.BaseRequestHandler):
                 sock = self.server.tls_context.wrap_socket(sock,
                                                            server_side=True)
             except (ssl.SSLError, OSError) as exc:
-                log.debug('TLS handshake failed: %s', exc)
+                # Who, as well as what. A handshake that fails says nothing
+                # useful without the address that attempted it: the common
+                # cause is a certificate that does not name the address the
+                # client was sent to, and knowing which client tried is what
+                # turns that from a guess into a check.
+                log.debug('TLS handshake with %s failed: %s',
+                          self.client_address[0], exc)
                 return
         elif cfg.require_tls:
             log.debug('refused plaintext from %s', self.client_address[0])
@@ -4042,8 +4048,14 @@ class Handler(socketserver.BaseRequestHandler):
                         b'the document is larger than this proxy will relay\n')
             except OSError:
                 pass
-        except (BadRequest, OSError, ssl.SSLError, socket.timeout):
-            pass
+        except (BadRequest, OSError, ssl.SSLError, socket.timeout) as exc:
+            # Not worth a warning -- port scans, health checks and clients that
+            # hang up mid-request all land here, and none of them is a fault.
+            # But saying nothing at all means a client that connects, is
+            # refused, and goes away leaves no trace anywhere in this daemon,
+            # which is a bad way to find out why somebody cannot add a printer.
+            log.debug('%s from %s: %s', type(exc).__name__,
+                      self.client_address[0], exc or '(no detail)')
         finally:
             for handle in (rfile, wfile, sock):
                 try:
@@ -4062,6 +4074,11 @@ class Handler(socketserver.BaseRequestHandler):
         path = parts[1].decode('latin-1')
         version = parts[2].decode('latin-1') if len(parts) > 2 else 'HTTP/1.0'
         headers = read_headers(rfile)
+        # What was actually asked for, before any judgement about whether this
+        # proxy will serve it. A client that is turned away at the next line
+        # otherwise leaves nothing to say what it wanted.
+        log.debug('%s %s %s from %s', method, path, version,
+                  self.client_address[0])
         keep = (version.endswith('1.1') and
                 'close' not in headers.get('connection', '').lower())
 
@@ -4288,9 +4305,24 @@ class Handler(socketserver.BaseRequestHandler):
             rewrite_response(cfg, queue, reply)
             out = ipp.serialize(reply)
         except Exception as exc:
-            log.warning('unparseable reply from %s (%s); relaying verbatim',
-                        queue.host, exc)
+            # A reply that cannot be parsed cannot be rewritten, and relaying
+            # it as it stands hands the client the printer's own address --
+            # printer-uri-supported, printer-icons and printer-more-info all
+            # name it. A client on the far side of this proxy cannot reach
+            # that address; it is the whole reason the proxy exists. So the
+            # bytes go on only when they do not name the upstream at all.
             out = raw
+            if queue.host.encode() in raw:
+                log.error('%s: the reply could not be parsed (%s) and names '
+                          'the printer\'s own address, which this client '
+                          'cannot reach; refusing it rather than sending the '
+                          'client somewhere it cannot go', queue.name, exc)
+                ipp_error(wfile, msg, 0x0500,
+                          b'the printer\'s answer could not be relayed')
+                return
+            log.warning('unparseable reply from %s (%s); relaying verbatim, '
+                        'having checked it does not name the printer',
+                        queue.host, exc)
 
         log.info('%-14s %-22s HTTP %s%s', queue.name, name, status,
                  f'  [{note}]' if note else '')
