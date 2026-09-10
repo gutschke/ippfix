@@ -277,6 +277,23 @@ every URI this proxy hands out is still built from
 .BR \-\-advertise ,
 so the address, not this name, is what a client is told to print to.
 .IP
+If clients print from off the LAN, publish a name they can resolve from both
+sides \-
+.B \-\-advertise\-hostname
+.IR ippfix.example.com ,
+with an A record in whatever DNS the VPN hands out.
+.I printer\-uri\-supported
+names the
+.B \-\-advertise
+address, but a client that adds the queue from discovery never asks for it: it
+builds the URI from the SRV target and the
+.I rp
+key, and keeps that. A
+.I .local
+name is resolved by multicast DNS, which does not cross a VPN or a routed
+subnet, so a queue added that way stops working when the client leaves the
+network. A unicast name satisfies both.
+.IP
 Give a name to publish that instead \- including an address literal, for anyone
 who wants the old behaviour back.
 .B auto

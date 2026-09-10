@@ -195,6 +195,15 @@ An unrecognised option is an error rather than something ignored.
   every URI this proxy hands out is still built from `--advertise`, so the
   address, not this name, is what a client is told to print to.
 
+  If clients print from off the LAN, publish a name they can resolve from both
+  sides -- `--advertise-hostname ippfix.example.com`, with an `A` record in
+  whatever DNS the VPN hands out. `printer-uri-supported` names the
+  `--advertise` address, but a client that adds the queue from discovery never
+  asks for it: it builds the URI from the SRV target and the `rp` key, and
+  keeps that. A `.local` name is resolved by multicast DNS, which does not
+  cross a VPN or a routed subnet, so a queue added that way stops working when
+  the client leaves the network. A unicast name satisfies both.
+
   Give a name to publish that instead -- including an address literal, for
   anyone who wants the old behaviour back. `auto` still means this system's
   `.local` name. An IPv6 literal is a poor choice: clients paste the name

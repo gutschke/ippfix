@@ -182,11 +182,32 @@ Until 1.1.0 the default was the `--advertise` address itself, because a
 literal needs no resolution and so cannot fail on a VPN, a routed subnet, or a
 wireless network with client isolation. It worked only because the address
 record travels in the same packet as the SRV record and clients match the
-literal back by comparison, which nothing obliges them to do. What that
-default was reaching for is unaffected: every URI this proxy hands out is
-still built from `--advertise`, so the address, not this name, is what a
-client is told to print to. Use `--advertise-hostname` to publish something
-else, an address literal included if you want the old behaviour back.
+literal back by comparison, which nothing obliges them to do.
+
+### Printing from somewhere the printer's name does not resolve
+
+The concern behind the old default is real, and worth being precise about.
+`printer-uri-supported` is built from `--advertise`, so a client that *asks*
+this proxy is told an address. But a client that adds the queue from discovery
+— which is what the driverless path does, and what macOS and Android do — does
+not ask: it builds the URI out of the SRV target and the `rp` key. That URI is
+what it keeps. A `.local` name is resolved by multicast DNS, and multicast
+does not cross a VPN or a routed subnet, so a queue added that way stops
+working the moment the client leaves the network.
+
+If you print from off the LAN, publish a name your clients can resolve from
+both sides:
+
+```
+--advertise-hostname ippfix.example.com
+```
+
+with an `A` record in whatever DNS your VPN hands out, pointing at the
+`--advertise` address. That satisfies the SRV record — it is a domain name,
+and it resolves — and it keeps working off-LAN, which neither a `.local` name
+nor an address literal manages on its own. An address literal remains
+available for anyone who wants the pre-1.1.0 behaviour, with the caveat above
+about clients that resolve what the spec tells them to.
 
 If another mDNS responder already holds UDP port 5353 the queues never appear
 at all. With `systemd-resolved` that means setting `MulticastDNS=no` in
