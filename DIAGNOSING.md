@@ -443,6 +443,25 @@ The proxy therefore reports a level the printer would call empty at the
 printer's own low mark instead, and only while the printer is contradicting
 itself. See `supply-levels=clamped|raw` in **ippfix(8)**.
 
+### A client offers a generic driver instead of driverless printing
+
+A host that browses the queue, finds it, and then proposes "Generic PCL
+Printer" -- or any driver from its own list -- has decided this is a legacy
+printer. It decides that from the DNS-SD TXT record, before any IPP exchange
+happens, and the key it reads is `URF`. Without one, macOS picks a generic
+driver, and a generic PCL driver does not know the device has colour even
+though `Color=T` is two keys further down the same record.
+
+The tokens come from the printer's own `urf-supported`, which the proxy already
+asks for. Check what is being advertised:
+
+```
+journalctl -u ippfix | grep advertising
+```
+
+A record with `URF=V1.4,...` is one a client can drive without a driver. A
+record without it is not, however much else it carries.
+
 ### A document the printer accepts and then cannot read
 
 The printer answers `IPP 0x0000`, the client is told its job was created, and a

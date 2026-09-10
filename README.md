@@ -314,6 +314,12 @@ it discards after a month, and sooner if the directory grows past a hundred
 jobs or half a gigabyte -- the age bound being the one that holds when nobody
 is printing and nobody is watching.
 
+Discovery carries what a client needs to print without a driver: the queue is
+advertised with the printer's own `urf-supported` tokens as `URF`, which is
+what macOS and iOS read to decide an IPP queue is driverless. A record without
+that key gets a generic driver chosen for it, and a generic driver does not
+know the device has colour.
+
 ## Requirements
 
 - Python 3.9 or later, with `venv`

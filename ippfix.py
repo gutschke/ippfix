@@ -331,6 +331,7 @@ class Queue:
         # advertised as neither: see discovery_txt().
         self.formats = []              # document-format-supported, verbatim
         self.media = []                # sizes in points, from media-supported
+        self.urf = []                  # urf-supported, verbatim, for discovery
         self.colour = None
         self.duplex = None
         self.learned = False
@@ -415,6 +416,13 @@ class Queue:
 
         urf = [f.decode('utf-8', 'replace')
                for f in (group.get('urf-supported') or [])]
+        # Kept, not just used. These tokens are what a client reads to decide
+        # this is a printer it can drive without a driver -- see
+        # discovery_txt(). Until now they were consumed for the raster
+        # fallback and dropped, so discovery never mentioned them and macOS,
+        # finding no URF key, offered a generic PCL driver for a colour
+        # laser.
+        self.urf = urf
         colour = group.get('color-supported')
         has_colour = bool(colour and colour[0] not in (b'\x00', b''))
         # Kept apart from has_colour on purpose. Deciding a colour space needs
@@ -4430,6 +4438,26 @@ def discovery_txt(cfg, queue, scheme):
         kept.append(fmt)
     if kept:
         props['pdl'] = ','.join(kept)
+
+    # What makes a client offer driverless printing rather than reach for a
+    # driver. A macOS host that finds no URF key treats an IPP queue as a
+    # legacy printer and picks a generic PCL driver from its own list, which
+    # then does not know the device has colour -- the capability is right there
+    # in the printer's answer and was simply never passed on. Bounded like pdl,
+    # for the same reason.
+    urf = []
+    for token in queue.urf:
+        if len('URF=' + ','.join(urf + [token])) > 255:
+            log.info('%s: not advertising URF %s over DNS-SD; the TXT entry '
+                     'is full', queue.name, ', '.join(queue.urf[len(urf):]))
+            break
+        urf.append(token)
+    if urf:
+        props['URF'] = ','.join(urf)
+        # Said only alongside URF, because it answers a question only a client
+        # reading that key asks: what authentication this queue wants. It wants
+        # none. This is the proxy describing itself, not the printer.
+        props['air'] = 'none'
     ptype = PRINTER_TYPE_BASE
     if queue.colour is not None:
         props['Color'] = 'T' if queue.colour else 'F'
@@ -4472,7 +4500,7 @@ def advertise(cfg):
             registered.append(info)
             log.info('advertising %s as %s (%s)', queue.name, service,
                      ', '.join(f'{k}={v}' for k, v in sorted(props.items())
-                               if k in ('pdl', 'Color', 'Duplex'))
+                               if k in ('pdl', 'Color', 'Duplex', 'URF'))
                      or 'no capabilities: the printer has not answered yet, '
                         'so none are claimed')
 

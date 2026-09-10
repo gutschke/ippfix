@@ -232,7 +232,7 @@ with FakePrinter() as printer:
     # that would have to be guessed is left out: an absent key makes the client
     # ask, a plausible one makes it believe.
     cold = ippfix.discovery_txt(cfg, queue, 'ipp')
-    for key in ('pdl', 'Color', 'Duplex'):
+    for key in ('pdl', 'Color', 'Duplex', 'URF', 'air'):
         assert key not in cold, cold
     assert int(cold['printer-type'], 16) & 0x18 == 0, cold['printer-type']
     assert cold['rp'] == 'ipp/office' and cold['ty'] == 'office', cold
@@ -250,6 +250,33 @@ with FakePrinter() as printer:
     assert 'application/postscript' not in formats, hot['pdl']
     # Colour and duplex, in the bitfield as well as in the words.
     assert int(hot['printer-type'], 16) & 0x18 == 0x18, hot['printer-type']
+
+    # What tells a client it can drive this without a driver. A host that
+    # finds no URF key treats the queue as a legacy printer and reaches for a
+    # generic driver of its own -- which then does not know the device has
+    # colour, though the printer said so and it is two keys further down this
+    # very record. The tokens are the printer's own, not invented here.
+    assert 'URF' in hot, hot
+    tokens = hot['URF'].split(',')
+    for expected in ('V1.4', 'SRGB24', 'RS600', 'W8', 'DM1'):
+        assert expected in tokens, hot['URF']
+    # Said only alongside URF, because it answers a question only a client
+    # reading that key asks, and it describes this proxy rather than the device.
+    assert hot['air'] == 'none', hot
+
+    # A printer that never mentioned URF is not given one, and then there is no
+    # authentication claim either.
+    queue.urf = []
+    silent = ippfix.discovery_txt(cfg, queue, 'ipp')
+    assert 'URF' not in silent and 'air' not in silent, silent
+    queue.urf = ['V1.4', 'SRGB24', 'RS600', 'W8', 'DM1']
+
+    # Bounded like pdl: one entry holds 255 bytes including its key, and a
+    # record that overflows takes the whole queue out of discovery.
+    queue.urf = ['V1.4'] + ['MT1-2-3-5-12'] * 60
+    long_urf = ippfix.discovery_txt(cfg, queue, 'ipp')
+    assert len('URF=' + long_urf['URF']) <= 255, long_urf['URF']
+    assert long_urf['URF'].startswith('V1.4,'), long_urf['URF']
 
     # A monochrome, simplex device has to be advertised as one. This is what
     # the hardcoded record got wrong: it said colour and duplex to everybody,
