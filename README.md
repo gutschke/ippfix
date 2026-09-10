@@ -235,11 +235,27 @@ default route like any other traffic.
 
 The catch is that saved printers are re-validated behind a Wi-Fi check.
 `ManualDiscovery` calls `allPrintersLost()` whenever the deprecated
-`getNetworkInfo(TYPE_WIFI)` says Wi-Fi is not connected, so on cellular the
-saved entry is dropped without ever being probed, however reachable it is. On
-any Wi-Fi -- including someone else's, with a full-tunnel VPN -- the check
-passes and the queue works. Re-adding the printer manually bypasses the check
-outright, which is why that is the folklore remedy.
+`getNetworkInfo(TYPE_WIFI)` reports no Wi-Fi, so on cellular the saved entry is
+dropped without ever being probed, however reachable it is.
+
+The check asks only whether a Wi-Fi association exists. It does not ask what
+that network is, whether it routes anywhere, or whether the job will go over it
+-- and it is answered before anything is probed. Associating with a device's
+own configuration access point, one with no route to anything at all, satisfies
+it; the queue then reappears and prints happily over a full-tunnel VPN carried
+on the cellular interface. The Wi-Fi is a gate, not a path.
+
+Nothing is lost when the check fails, only hidden. Once it passes,
+`ManualDiscovery` re-probes every saved printer and restores the ones that
+answer, so a queue added at home comes back by itself; it does not have to be
+added a second time. Adding one by hand skips the check altogether, which is
+why that is the folklore remedy, but it is a way to force a probe rather than
+something the saved entry needs.
+
+So printing from Android away from home takes three things at once: the printer
+added by address or by a name in ordinary DNS, a VPN that reaches it, and an
+association with some Wi-Fi network -- any Wi-Fi network -- to satisfy a check
+that has nothing to do with either.
 
 If another mDNS responder already holds UDP port 5353 the queues never appear
 at all. With `systemd-resolved` that means setting `MulticastDNS=no` in
