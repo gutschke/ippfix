@@ -462,6 +462,27 @@ journalctl -u ippfix | grep advertising
 A record with `URF=V1.4,...` is one a client can drive without a driver. A
 record without it is not, however much else it carries.
 
+If the record looks right and a client still refuses -- macOS says *Unable to
+connect to `NAME._ipps._tcp.local.`* and then offers a driver anyway -- the
+next thing to check is the certificate, because a client that cannot complete
+the TLS handshake never reads any of those keys. Both services are advertised,
+`_ipp` and `_ipps`, and a client that sees both prefers `_ipps`.
+
+The trap is that the SRV record points at an **address**, deliberately (see
+`Config.dnssd_hostname()`), so the client is validating the certificate against
+an IP literal. A certificate naming only hostnames is not valid for one:
+
+```
+sudo openssl x509 -in /etc/ippfix/ippfix.crt -noout -subject -ext subjectAltName
+```
+
+The `subjectAltName` must carry `IP Address:` entries for whatever `--advertise`
+hands out, not just `DNS:` names. `install.sh` puts them there; a certificate
+generated before it did, or one carried over from a machine that has since been
+renamed, will not have them, and `--advertise-hostname` will not save it unless
+the name it publishes is one the certificate covers. Delete the pair and
+re-run the installer to have them made afresh.
+
 ### A document the printer accepts and then cannot read
 
 The printer answers `IPP 0x0000`, the client is told its job was created, and a

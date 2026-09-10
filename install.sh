@@ -162,15 +162,31 @@ echo ' done.'
 
 # TLS credentials. Printers ship self-signed certificates of their own, so
 # clients already treat these no differently.
+#
+# The addresses matter as much as the names, and used not to be here. This
+# daemon advertises an IP address as the DNS-SD SRV target on purpose -- see
+# Config.dnssd_hostname(), which explains why a .local name is the fragile
+# choice -- so a client that finds the queue connects to a literal address.
+# A certificate naming only hostnames cannot be valid for that, and a client
+# that checks, as macOS does when adding a printer, fails to connect at all and
+# falls back to picking a driver of its own. The names alone made the ipps
+# service unusable by anything strict.
 echo -n 'Generating TLS credentials...'
 if [ -s "${conf_dir}/ippfix.key" ] && [ -s "${conf_dir}/ippfix.crt" ]; then
   echo ' kept existing.'
 else
   host="$(hostname -f 2>/dev/null || hostname)"
+  san="DNS:${host},DNS:${host%%.*}.local"
+  # Every global address this host currently answers on. Link-local is left
+  # out: it needs a scope identifier that no client puts in a URI.
+  for addr in $(ip -o addr show scope global 2>/dev/null \
+                | awk '{print $4}' | cut -d/ -f1 | sort -u); do
+    san="${san},IP:${addr}"
+  done
   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -keyout "${conf_dir}/ippfix.key" -out "${conf_dir}/ippfix.crt" \
     -subj "/CN=${host}" \
-    -addext "subjectAltName=DNS:${host},DNS:${host%%.*}.local" \
+    -addext "subjectAltName=${san}" \
     -addext 'extendedKeyUsage=serverAuth' >&/dev/null
   chown 'ippfix:ippfix' "${conf_dir}/ippfix.key" "${conf_dir}/ippfix.crt"
   chmod 640 "${conf_dir}/ippfix.key"
