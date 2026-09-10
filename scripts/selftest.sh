@@ -263,17 +263,27 @@ c3 = ippfix.Config(a, qs)
 assert c3.our_uri(qs[0]) == 'ipp://[2001:db8::1]/ipp/office', c3.our_uri(qs[0])
 assert c3.base_http() == 'http://[2001:db8::1]:631'
 
-# What clients build their remembered URI from. An address literal by default,
-# because a .local name has to be resolved by multicast DNS on every print and
-# multicast does not survive a VPN or a routed subnet.
-assert c.dnssd_hostname() == '192.0.2.10.', c.dnssd_hostname()
+# The SRV target is a domain name, and a client is expected to resolve it. An
+# address literal is not a name: .local goes to multicast DNS and everything
+# else to the unicast resolver, where "192.0.2.10." does not exist. It used to
+# be the default and worked only because the address record rides along in the
+# same packet and clients match the literal back by comparison.
+assert c.dnssd_hostname().endswith('.local.'), c.dnssd_hostname()
+assert c.dnssd_hostname() != '192.0.2.10.', 'an address literal is not a name'
 # An IPv6 literal must never be handed over: clients paste it into
 # ipp://HOST:PORT/ without the brackets a bare v6 address needs.
 assert c3.dnssd_hostname().endswith('.local.'), c3.dnssd_hostname()
+# "auto" was how the .local name used to be asked for, and still works.
 c5, _ = cfg(extra=('--advertise-hostname', 'auto'))
-assert c5.dnssd_hostname().endswith('.local.'), c5.dnssd_hostname()
+assert c5.dnssd_hostname() == c.dnssd_hostname(), c5.dnssd_hostname()
 c6, _ = cfg(extra=('--advertise-hostname', 'printer.example.com'))
 assert c6.dnssd_hostname() == 'printer.example.com.', c6.dnssd_hostname()
+# The old behaviour stays available to anyone who wants it back.
+c7, _ = cfg(extra=('--advertise-hostname', '192.0.2.10'))
+assert c7.dnssd_hostname() == '192.0.2.10.', c7.dnssd_hostname()
+# What a client is told to print to is still built from --advertise, so the
+# durability the old default reached for is not lost, only moved.
+assert c.our_uri(qs[0]) == 'ipp://192.0.2.10/ipp/office', c.our_uri(qs[0])
 
 # Addresses get typed from memory, so resolution is deliberately lax.
 c4, qs4 = cfg(queues=('office=ipp://p/ipp/print', 'studio=ipp://q/ipp/print'))

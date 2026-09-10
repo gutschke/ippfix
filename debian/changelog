@@ -9,6 +9,16 @@ ippfix (1.1.0) unstable; urgency=medium
     connect at all; and the SRV target is a name the client can resolve. Any
     one of them missing is enough for the queue to arrive as a generic
     printer with no colour and no duplex, which the user cannot override.
+  * --advertise-hostname now defaults to this system's .local name rather than
+    the advertised address. An SRV target is a domain name and the client is
+    expected to resolve it; an address literal is not one, and resolving it
+    returns nothing. The old default worked only because the address record
+    travels in the same packet and clients match the literal back by
+    comparison, which nothing obliges them to do -- and it matters more now
+    that macOS takes the driverless path, where that name is resolved and the
+    queue built from it. Every URI this proxy hands out is still built from
+    --advertise, so nothing durable is lost. Pass --advertise-hostname with an
+    address to keep the previous behaviour.
   * A reply too large to parse is no longer relayed with the printer's own
     address in it. The proxy exists so that clients never learn where the
     printer is, and the one path that gave up parsing gave that away.

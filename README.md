@@ -172,14 +172,21 @@ Leave `_uscan` and `_uscans` alone, or scanning breaks.
 **[DEPLOYMENT.md](DEPLOYMENT.md)** walks through the ways to do it, from one
 setting on the printer to full network isolation, and how to verify the result.
 
-Clients build the URI they remember out of the DNS-SD SRV record, and by
-default that is the `--advertise` address rather than a `.local` name. The
-distinction shows up after discovery, not during it: a `.local` name has to be
-resolved by multicast DNS on *every* print, and multicast does not cross a VPN,
-a routed subnet, or a wireless network with client isolation — so the printer
-is found once and then quietly stops working from anywhere else. Use
-`--advertise-hostname` to publish a name instead, or `auto` for this system's
-`.local` name.
+Clients build the URI they remember out of the DNS-SD SRV record, and that
+record names this system's `.local` name. An SRV target is a domain name and
+the client is expected to resolve it — names under `.local` by multicast DNS,
+everything else through the unicast resolver — and an address literal is
+neither, so nothing answers for it.
+
+Until 1.1.0 the default was the `--advertise` address itself, because a
+literal needs no resolution and so cannot fail on a VPN, a routed subnet, or a
+wireless network with client isolation. It worked only because the address
+record travels in the same packet as the SRV record and clients match the
+literal back by comparison, which nothing obliges them to do. What that
+default was reaching for is unaffected: every URI this proxy hands out is
+still built from `--advertise`, so the address, not this name, is what a
+client is told to print to. Use `--advertise-hostname` to publish something
+else, an address literal included if you want the old behaviour back.
 
 If another mDNS responder already holds UDP port 5353 the queues never appear
 at all. With `systemd-resolved` that means setting `MulticastDNS=no` in
@@ -326,10 +333,9 @@ future release of the `zeroconf` package stops building that record the way
 this depends on, the proxy says so in the log and carries on serving the
 queues without it, rather than refusing to print over a lost colour profile.
 
-It does raise the stakes on `--advertise-hostname`. A client that takes the
-driverless path resolves the SRV target and builds its queue from it, so that
-name has to be one the client can actually resolve. See that option below
-before relying on the default.
+It also raised the stakes on the SRV target, which is why 1.1.0 changed what
+goes in it: a client taking the driverless path resolves that name and builds
+its queue from it, so it has to be a name the client can actually resolve.
 
 ## Requirements
 

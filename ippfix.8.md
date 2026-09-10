@@ -179,21 +179,28 @@ An unrecognised option is an error rather than something ignored.
   remember out of this name, so it is used every time they print, not only
   while they are discovering the printer.
 
-  The default is the `--advertise` address itself rather than a `.local` name.
-  A `.local` name has to be resolved by multicast DNS on every print, and
-  multicast does not cross a VPN, a routed subnet, or a wireless network with
-  client isolation: the printer is found once and then quietly stops working
-  from anywhere else. An address literal needs no resolution at all. The cost
-  is that the address becomes part of what clients remember, so it should be
-  reserved or static -- which is already true of `--advertise`, since every URI
-  this proxy hands out is built from it.
+  The default is this system's `.local` name. An SRV target is a domain name,
+  and the client is expected to resolve it: names under `.local` go to
+  multicast DNS and everything else to the unicast resolver. An address
+  literal is neither, so asking a resolver for `192.0.2.10.` returns nothing.
 
-  Give a name to publish one instead, or `auto` for this system's `.local`
-  name. An IPv6 literal is never used by default: clients paste the name
+  Until 1.1.0 the default was the `--advertise` address itself, on the
+  argument that a literal needs no resolution and so cannot fail on a VPN, a
+  routed subnet, or a wireless network with client isolation. That worked only
+  because the address record travels as an additional in the same packet as
+  the SRV record, so clients cache it under the literal and match it back by
+  comparison. Nothing obliges them to, and it matters more now that macOS
+  takes the driverless path, where the SRV target is resolved and the queue
+  built from it. The durability the old default reached for is unaffected:
+  every URI this proxy hands out is still built from `--advertise`, so the
+  address, not this name, is what a client is told to print to.
+
+  Give a name to publish that instead -- including an address literal, for
+  anyone who wants the old behaviour back. `auto` still means this system's
+  `.local` name. An IPv6 literal is a poor choice: clients paste the name
   straight into `ipp://HOST:PORT/...`, where a bare IPv6 address needs square
-  brackets they do not add, so a v6-only `--advertise` falls back to the system
-  name. AAAA records are published either way; this setting only decides which
-  name clients are handed.
+  brackets they do not add. AAAA records are published either way; this
+  setting only decides which name clients are handed.
 
 * `--also-advertise` *ADDRESS*:
   Additional address to publish in the DNS-SD records; may be repeated. By

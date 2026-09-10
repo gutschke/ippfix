@@ -594,32 +594,38 @@ class Config:
     def dnssd_hostname(self):
         """The name to put in the SRV record clients build their URI from.
 
-        By default this is the advertised IPv4 address, not a .local name. The
-        distinction matters after discovery, not during it: a client stores the
-        URI it was given and uses it every time it prints from then on. A
-        .local name has to be resolved by multicast DNS on each of those
-        occasions, and multicast does not cross a VPN, a routed subnet, or a
-        wireless network with client isolation -- so the printer is found once
-        and then quietly stops working from anywhere else. An address literal
-        needs no resolution at all, which is one fewer thing to be somewhere
-        it does not work.
+        This system's .local name. An SRV target is a domain name (RFC 2782),
+        and a client is expected to resolve it; RFC 6762 3 sends anything
+        under .local to multicast DNS and everything else to the unicast
+        resolver. An address literal is neither -- ask a resolver for
+        "192.0.2.10." and nothing comes back, because no such name exists.
 
-        The cost is that the address becomes part of what clients remember, so
-        it should be a reserved or static one. That is already true of
-        --advertise, which every URI this proxy hands out is built from.
+        This used to default to the --advertise address, on the argument that
+        a literal needs no resolution and so cannot fail on a VPN, a routed
+        subnet, or a wireless network with client isolation. The reasoning was
+        sound; the mechanism was not. It worked only because the address
+        record travels as an additional in the same packet as the SRV
+        (RFC 6763 12.2), so clients cache it under that literal string and
+        match it back by comparison. Nothing obliges them to, and a client
+        that does what the spec says instead gets a name that does not
+        resolve. Publishing something that works only because implementations
+        paper over it is not a durability argument, it is a bet.
 
-        An IPv6 literal is deliberately not used: clients paste the SRV target
-        straight into ipp://HOST:PORT/..., where a bare v6 address needs square
-        brackets that they do not add. So a v6-only --advertise falls back to
-        the system name, which resolves to both families. AAAA records are
-        published either way; this only decides which name clients are handed.
+        The durability the old default reached for is real, and it is already
+        served where it belongs: every URI this proxy hands out is built from
+        --advertise, so the address, not this name, is what a client is told
+        to print to.
+
+        --advertise-hostname overrides it, an address literal included, for
+        anyone who wants the old behaviour. An IPv6 literal remains a poor
+        choice: clients paste the SRV target straight into
+        ipp://HOST:PORT/..., where a bare v6 address needs square brackets
+        they do not add. AAAA records are published either way; this only
+        decides which name clients are handed.
         """
         name = self.advertise_hostname
-        if not name:
-            name = (self.advertise if '.' in self.advertise
-                    else f'{socket.gethostname()}.local')
-        elif name == 'auto':
-            name = f'{socket.gethostname()}.local'
+        if not name or name == 'auto':
+            name = socket.gethostname() + '.local'
         return name if name.endswith('.') else name + '.'
 
     def published_addresses(self):
@@ -4762,11 +4768,10 @@ def build_parser():
     parser.add_argument('--advertise-hostname', default=None, metavar='NAME',
                         help='the host name to publish in the DNS-SD SRV '
                              'record, which is what clients build the URI they '
-                             'remember out of. Defaults to the --advertise '
-                             'address itself, so that printing does not depend '
-                             'on multicast DNS still reaching this host. Pass a '
-                             'name to use one instead, or "auto" for this '
-                             'system\'s .local name')
+                             'remember out of. Defaults to this system\'s '
+                             '.local name, because an SRV target is a domain '
+                             'name and an address literal is not one. Pass a '
+                             'name to use that instead')
     parser.add_argument('--also-advertise', action='append', metavar='ADDRESS',
                         help='additional address to publish in the DNS-SD '
                              'records, repeatable. Defaults to the stable '
