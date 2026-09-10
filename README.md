@@ -211,46 +211,64 @@ about clients that resolve what the spec tells them to.
 
 ### Android
 
-Android's built-in print service is worth knowing about in detail, because
-three of its behaviours look like faults in the printer and are not.
+Android's built-in print service behaves in several ways that look like faults
+in the printer and are not. All of this was read from AOSP, and most of it
+changed between releases, so the version matters.
 
-It discards any discovered printer whose resolved address is not IPv4:
-`MdnsDiscovery.toNetworkPrinter()` checks `instanceof Inet4Address` and returns
-nothing otherwise. Older releases resolve a service to one address without
-regard to family, so a queue published with both A and AAAA records can be
-found or dropped depending on which Android happened to get -- a printer that
-is known but shows as offline. `--no-ipv6` removes the ambiguity.
+**Discovery is IPv4-only.** `MdnsDiscovery.toNetworkPrinter()` discards any
+service that does not resolve to an `Inet4Address`, and has done since Android
+13. On Android 14 and later that only drops IPv6-only services, because
+`NsdService` returns IPv4 addresses ahead of IPv6, so a queue published with
+both is never the one discarded. On Android 13 and earlier the legacy resolver
+took whichever family answered first, and a dual-stack queue could be found or
+dropped at random -- a printer that is known but shows as offline. `--no-ipv6`
+is the cure there and buys nothing on Android 14 and later. The restriction is
+discovery only: a printer added by hand resolves with `AF_UNSPEC` and is
+perfectly happy over IPv6.
 
-Discovery cannot work over a VPN, on any client. Android excludes VPN, cellular
-and point-to-point interfaces from mDNS outright, and a `VpnService` tunnel is
-point-to-point by construction. Resolution of `.local` names is excluded from
-those networks too, which Google does document: *"VPN and mobile data
-connections are excluded from .local resolution."*
+**Discovery does not work over a VPN, though not because Android forbids it.**
+Cellular is excluded from mDNS outright. VPN interfaces never were, as a
+category: they were caught incidentally on Android 14 and 15 because Android's
+tunnels are point-to-point, and that exclusion was removed in Android 16, so a
+tunnel can now be given an mDNS socket. It still does not help, because a
+typical VPN does not carry `224.0.0.251`. That is a property of the tunnel
+rather than of Android, and a VPN that forwarded multicast would change the
+answer.
 
-What does work off-LAN is adding the printer by hand, under **Add printer →
-Hostname or IP address**, using an address or a name in ordinary DNS -- never a
-`.local` name, for the reason above. Printing itself honours the VPN: nothing
-in the print service binds a socket to a particular network, so jobs follow the
-default route like any other traffic.
+**`.local` names do not resolve over a VPN or on cellular.** Android's resolver
+vetoes `.local` on any network whose transports include VPN or cellular, which
+Google documents. They resolve normally on Wi-Fi and Ethernet. So a printer
+added by hand under a `.local` name works at home and fails away from it, while
+an address or a name in ordinary DNS works in both places. This is the resolver
+-- a different implementation from service discovery, and it says nothing about
+what discovery will do.
 
-The catch is that saved printers are re-validated behind a Wi-Fi check.
-`ManualDiscovery` calls `allPrintersLost()` whenever the deprecated
-`getNetworkInfo(TYPE_WIFI)` reports no Wi-Fi, so on cellular the saved entry is
-dropped without ever being probed, however reachable it is.
+**Printing itself honours the VPN.** Nothing in the print service binds a
+socket to a particular network, and jobs go out through libcups with
+`AF_UNSPEC`, so they follow the default route like any other traffic.
 
-The check asks only whether a Wi-Fi association exists. It does not ask what
-that network is, whether it routes anywhere, or whether the job will go over it
--- and it is answered before anything is probed. Associating with a device's
-own configuration access point, one with no route to anything at all, satisfies
-it; the queue then reappears and prints happily over a full-tunnel VPN carried
-on the cellular interface. The Wi-Fi is a gate, not a path.
+**Saved printers are gated on the transport, not on reachability.** This is the
+one that strands a reachable printer, and the mechanism has been rewritten
+twice. Android 13 and 14 asked for the default network, so cellular counted and
+the problem did not arise. Android 15 and 16 ask specifically about Wi-Fi.
+Android 17 registers a network callback for Wi-Fi and Ethernet, and calls
+`allPrintersLost()` when it has neither -- without probing the printer at all,
+however reachable it is.
 
-Nothing is lost when the check fails, only hidden. Once it passes,
-`ManualDiscovery` re-probes every saved printer and restores the ones that
-answer, so a queue added at home comes back by itself; it does not have to be
-added a second time. Adding one by hand skips the check altogether, which is
-why that is the folklore remedy, but it is a way to force a probe rather than
-something the saved entry needs.
+On Android 17 that callback's request asks for neither internet access nor
+validation, so *any* association satisfies it. Associating with a device's own
+configuration access point -- a network with no route to anything -- is enough
+to bring a saved printer back, after which it prints over a full-tunnel VPN
+carried on the cellular interface. The Wi-Fi that opens the gate cannot carry a
+single packet of the job. It is a gate, not a path.
+
+Nothing is lost when the gate is shut, only hidden: once it opens, every saved
+printer is probed again and the ones that answer come back, so a queue added at
+home returns by itself and does not need adding twice. (On Android 15 and 16
+there is a further wrinkle -- a static flag means the print service's second
+network monitor never registers, so a manually added printer is reported in the
+session where it was added and not afterwards.) Adding a printer by hand skips
+the gate entirely, which is why that circulates as the remedy.
 
 So printing from Android away from home takes three things at once: the printer
 added by address or by a name in ordinary DNS, a VPN that reaches it, and an

@@ -43,7 +43,13 @@ ALLOWED_ADDRESSES = {
     # looking for -- comes back clean and nobody investigates it twice.
     '10.0.0.5',
 }
-ALLOWED_ADDRESSES |= {'::', '::1', '::ffff:0:0', '2001:db8::1', 'fe80::1'}
+# The mDNS group. It is a fixed constant assigned by IANA (RFC 6762), the same
+# on every network there has ever been, so it reveals nothing about this one --
+# and documentation about multicast DNS that cannot name it is not much use.
+ALLOWED_ADDRESSES |= {'224.0.0.251'}
+
+ALLOWED_ADDRESSES |= {'::', '::1', '::ffff:0:0', '2001:db8::1', 'fe80::1',
+                      'ff02::fb'}
 
 # The maintainer address the packaging carries. GitHub issues this in place of
 # a real mailbox, which is why it is the only literal one permitted; anything

@@ -228,14 +228,16 @@ An unrecognised option is an error rather than something ignored.
   Publish only the IPv4 address, for networks where IPv6 exists but is not
   routable.
 
-  Also worth reaching for when Android clients see the queue intermittently.
-  Android's built-in print service discards any discovered printer whose
-  resolved address is not IPv4 -- `MdnsDiscovery.toNetworkPrinter()` in
-  `com.android.bips` checks `instanceof Inet4Address` and returns nothing
-  otherwise -- and older releases resolve a service to a single address
-  without regard to family. A queue published with both A and AAAA records can
-  therefore be discovered or discarded depending on which one Android happened
-  to resolve, which looks like a printer that is known but offline.
+  Also worth reaching for when an Android 13 or older client sees the queue
+  intermittently. Android's built-in print service discards any discovered
+  printer that does not resolve to an IPv4 address --
+  `MdnsDiscovery.toNetworkPrinter()` in `com.android.bips` checks
+  `instanceof Inet4Address` -- and the legacy resolver on those releases took
+  whichever family answered first, so a queue published with both A and AAAA
+  records could be discovered or discarded at random, which looks like a
+  printer that is known but offline. Android 14 and later order IPv4 ahead of
+  IPv6 when resolving a service, so a dual-stack queue is no longer at risk and
+  this option buys nothing for them.
 
 * `--alert-mail` *ADDRESS*:
   Send mail to *ADDRESS* when a job does not print. Off unless set.
