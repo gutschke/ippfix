@@ -322,6 +322,19 @@ because they need a scope identifier a DNS\-SD record cannot carry.
 .B \-\-no\-ipv6
 Publish only the IPv4 address, for networks where IPv6 exists but is not
 routable.
+.IP
+Also worth reaching for when Android clients see the queue intermittently.
+Android's built\-in print service discards any discovered printer whose
+resolved address is not IPv4 \-
+.I MdnsDiscovery.toNetworkPrinter()
+in
+.I com.android.bips
+checks
+.I instanceof Inet4Address
+and returns nothing otherwise \- and older releases resolve a service to a
+single address without regard to family. A queue published with both A and AAAA
+records can therefore be discovered or discarded depending on which one Android
+happened to resolve, which looks like a printer that is known but offline.
 .TP
 .B \-\-alert\-mail " \fIADDRESS\fR"
 Send mail to

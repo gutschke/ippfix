@@ -209,6 +209,38 @@ nor an address literal manages on its own. An address literal remains
 available for anyone who wants the pre-1.1.0 behaviour, with the caveat above
 about clients that resolve what the spec tells them to.
 
+### Android
+
+Android's built-in print service is worth knowing about in detail, because
+three of its behaviours look like faults in the printer and are not.
+
+It discards any discovered printer whose resolved address is not IPv4:
+`MdnsDiscovery.toNetworkPrinter()` checks `instanceof Inet4Address` and returns
+nothing otherwise. Older releases resolve a service to one address without
+regard to family, so a queue published with both A and AAAA records can be
+found or dropped depending on which Android happened to get -- a printer that
+is known but shows as offline. `--no-ipv6` removes the ambiguity.
+
+Discovery cannot work over a VPN, on any client. Android excludes VPN, cellular
+and point-to-point interfaces from mDNS outright, and a `VpnService` tunnel is
+point-to-point by construction. Resolution of `.local` names is excluded from
+those networks too, which Google does document: *"VPN and mobile data
+connections are excluded from .local resolution."*
+
+What does work off-LAN is adding the printer by hand, under **Add printer →
+Hostname or IP address**, using an address or a name in ordinary DNS -- never a
+`.local` name, for the reason above. Printing itself honours the VPN: nothing
+in the print service binds a socket to a particular network, so jobs follow the
+default route like any other traffic.
+
+The catch is that saved printers are re-validated behind a Wi-Fi check.
+`ManualDiscovery` calls `allPrintersLost()` whenever the deprecated
+`getNetworkInfo(TYPE_WIFI)` says Wi-Fi is not connected, so on cellular the
+saved entry is dropped without ever being probed, however reachable it is. On
+any Wi-Fi -- including someone else's, with a full-tunnel VPN -- the check
+passes and the queue works. Re-adding the printer manually bypasses the check
+outright, which is why that is the folklore remedy.
+
 If another mDNS responder already holds UDP port 5353 the queues never appear
 at all. With `systemd-resolved` that means setting `MulticastDNS=no` in
 `/etc/systemd/resolved.conf` and restarting it.
