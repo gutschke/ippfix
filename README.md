@@ -314,11 +314,22 @@ it discards after a month, and sooner if the directory grows past a hundred
 jobs or half a gigabyte -- the age bound being the one that holds when nobody
 is printing and nobody is watching.
 
-Discovery carries what a client needs to print without a driver: the queue is
-advertised with the printer's own `urf-supported` tokens as `URF`, which is
-what macOS and iOS read to decide an IPP queue is driverless. A record without
-that key gets a generic driver chosen for it, and a generic driver does not
-know the device has colour.
+Discovery carries what a client needs to print without a driver. The queue is
+advertised with the printer's own `urf-supported` tokens as `URF`, and under
+the DNS-SD subtype `_universal._sub._ipp._tcp`, which is one extra pointer
+record saying "this queue speaks AirPrint". macOS reads both, and either one
+missing is enough for it to choose a generic driver instead -- which does not
+know the device has colour, and which the user cannot override.
+
+The subtype is published alongside each queue and needs no configuration. If a
+future release of the `zeroconf` package stops building that record the way
+this depends on, the proxy says so in the log and carries on serving the
+queues without it, rather than refusing to print over a lost colour profile.
+
+It does raise the stakes on `--advertise-hostname`. A client that takes the
+driverless path resolves the SRV target and builds its queue from it, so that
+name has to be one the client can actually resolve. See that option below
+before relying on the default.
 
 ## Requirements
 

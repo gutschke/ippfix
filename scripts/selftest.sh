@@ -368,6 +368,138 @@ with FakePrinter() as printer:
     assert trimmed['pdl'].startswith('application/pdf,'), trimmed['pdl']
 PY2
 
+echo 'airprint subtype'
+python3 - <<'PY2' && ok 'the subtype is one bare pointer at the queue itself' || bad 'subtype pointer shape'
+import logging, sys
+sys.path.insert(0, '.')
+logging.disable(logging.CRITICAL)
+import ippfix
+try:
+    from zeroconf import ServiceInfo
+    from zeroconf._services.registry import ServiceRegistry
+except ImportError:
+    sys.exit(0)                      # no zeroconf, nothing to advertise with
+
+assert ippfix.subtype_pointer_is_sound(), 'this zeroconf cannot do the trick'
+
+def queue_info(name, type_='_ipp._tcp.local.'):
+    return ServiceInfo(type_, f'{name}.{type_}', port=6310,
+                       properties={'rp': f'ipp/{name}'},
+                       server='192.0.2.10.', parsed_addresses=['192.0.2.10'])
+
+subtype = ippfix.AIRPRINT_SUBTYPE_PREFIX + '_ipp._tcp.local.'
+base = queue_info('office')
+ptr = ippfix.subtype_pointer(subtype, base)
+
+# A subtype is a pointer and nothing else: named for the subtype, aimed at an
+# instance that already exists. RFC 6763 7.1.
+record = ptr.dns_pointer()
+assert record.name == subtype, record.name
+assert record.alias == base.name, record.alias
+assert subtype == '_universal._sub._ipp._tcp.local.', subtype
+
+# Neither registry index may see the pointer as a peer of its own target. The
+# name collision would decide which of the two gets published and silently
+# drop the other; the hostname collision would make unregistering either omit
+# the address goodbyes for the other.
+assert ptr.key != base.key, ptr.key
+assert ptr.server_key != base.server_key, ptr.server_key
+
+# ... which is what a real registry has to agree with. The queue is the only
+# thing under its hostname, and the subtype resolves to the queue.
+reg = ServiceRegistry()
+reg.async_add(base)
+reg.async_add(ptr)
+assert reg.async_get_info_name(base.key) is base
+assert reg.async_get_info_name(ptr.key) is ptr
+under_host = reg.async_get_infos_server(base.server_key)
+assert under_host == [base], [i.name for i in under_host]
+answers = reg.async_get_infos_type(subtype)
+assert [i.name for i in answers] == [base.name], [i.name for i in answers]
+# And the base type still answers with the queue alone -- no junk instance
+# whose own name contains '._sub.', which is what registering a subtype as an
+# ordinary service would have produced.
+plain = reg.async_get_infos_type('_ipp._tcp.local.')
+assert [i.name for i in plain] == [base.name], [i.name for i in plain]
+
+# Several queues share a hostname and a port, so the pointers must stay
+# distinct from each other as well as from the queues.
+reg2 = ServiceRegistry()
+names = []
+for q in ('office', 'lab'):
+    for type_ in ('_ipp._tcp.local.', '_ipps._tcp.local.'):
+        info = queue_info(q, type_)
+        reg2.async_add(info)
+        sub = ippfix.AIRPRINT_SUBTYPE_PREFIX + type_
+        reg2.async_add(ippfix.subtype_pointer(sub, info))
+        names.append(info.name)
+got = sorted(i.name for i in reg2.async_get_infos_type(subtype))
+assert got == sorted(n for n in names if n.endswith('_ipp._tcp.local.')), got
+assert len(reg2.async_get_infos_server('192.0.2.10.')) == 4, 'queues only'
+PY2
+
+python3 - <<'PY2' && ok 'withdrawing the subtype leaves the queue itself alone' || bad 'subtype withdrawal'
+import logging, sys
+sys.path.insert(0, '.')
+logging.disable(logging.CRITICAL)
+import ippfix
+try:
+    from zeroconf import ServiceInfo
+    from zeroconf._services.registry import ServiceRegistry
+except ImportError:
+    sys.exit(0)
+
+subtype = ippfix.AIRPRINT_SUBTYPE_PREFIX + '_ipp._tcp.local.'
+base = ServiceInfo('_ipp._tcp.local.', 'office._ipp._tcp.local.', port=6310,
+                   properties={'rp': 'ipp/office'}, server='192.0.2.10.',
+                   parsed_addresses=['192.0.2.10', '2001:db8::10'])
+ptr = ippfix.subtype_pointer(subtype, base)
+
+# The pointer answers with the queue's addresses, both families. Built from
+# .addresses instead of .parsed_addresses() it would quietly serve IPv4 only.
+assert ptr.parsed_addresses() == base.parsed_addresses(), ptr.parsed_addresses()
+
+# Retracting a subtype must put exactly one kind of record on the wire. The
+# forbidden path -- unregister_service, or leaving the pointer in the registry
+# for close() to sweep up -- also emits zero-TTL SRV, TXT and address records
+# named after a queue that is still being served.
+retraction = ptr.dns_pointer(override_ttl=0)
+assert retraction.ttl == 0 and retraction.name == subtype, retraction
+assert retraction.alias == base.name, retraction
+
+# ... so the pointer has to be gone from the registry before close() runs.
+reg = ServiceRegistry()
+reg.async_add(base)
+reg.async_add(ptr)
+reg.async_remove(ptr)
+left = reg.async_get_service_infos()
+assert left == [base], [i.name for i in left]
+assert reg.async_get_infos_type(subtype) == [], 'pointer still answering'
+assert reg.async_get_infos_type('_ipp._tcp.local.') == [base]
+PY2
+
+python3 - <<'PY2' && ok 'a zeroconf that breaks the trick disables only the subtype' || bad 'subtype fallback'
+import logging, sys
+sys.path.insert(0, '.')
+logging.disable(logging.CRITICAL)
+import ippfix
+try:
+    import zeroconf                                              # noqa: F401
+except ImportError:
+    sys.exit(0)
+
+# The shape rests on an implementation detail no API promises. If an upgrade
+# ever changes it, the proxy must say so and carry on printing rather than
+# refuse to serve a queue over a lost colour profile.
+real = ippfix.subtype_pointer
+ippfix.subtype_pointer = lambda *a, **k: (_ for _ in ()).throw(TypeError('x'))
+try:
+    assert ippfix.subtype_pointer_is_sound() is False
+finally:
+    ippfix.subtype_pointer = real
+assert ippfix.subtype_pointer_is_sound() is True
+PY2
+
 echo 'address selection'
 python3 - <<'PY' && ok 'excludes unusable IPv6 addresses' || bad 'address selection'
 import sys, socket

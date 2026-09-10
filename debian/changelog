@@ -1,3 +1,48 @@
+ippfix (1.1.0) unstable; urgency=medium
+
+  * macOS now builds a driverless queue instead of picking a generic driver.
+    Four separate things had to be true for that and none of them were. The
+    queue is advertised with the printer's own urf-supported tokens as URF;
+    it is published under the DNS-SD subtype _universal._sub._ipp._tcp, which
+    is the record macOS reads to decide a queue speaks AirPrint; the
+    certificate names the advertised addresses, so a client that checks can
+    connect at all; and the SRV target is a name the client can resolve. Any
+    one of them missing is enough for the queue to arrive as a generic
+    printer with no colour and no duplex, which the user cannot override.
+  * A reply too large to parse is no longer relayed with the printer's own
+    address in it. The proxy exists so that clients never learn where the
+    printer is, and the one path that gave up parsing gave that away.
+  * A page placed off the sheet by its producer is put back. Some senders
+    write a page whose content sits outside the sheet the job asks for, and
+    it prints shifted and clipped. The repair triggers only on a shape that
+    can be recognised with confidence, verifies it has not made the job
+    worse, prints the original if it has, and reports every job it seriously
+    considered. It is off unless --repair-placement asks for it.
+  * A document the printer accepts and then cannot read is sent again as
+    raster. Some printers take a job, report it accepted, and discard it for
+    a format they will not admit to refusing. The retry never covers pages
+    that already came out: a failure part way through a job is not a reason
+    to print its first pages twice. --no-raster-retry declines it.
+  * Lossless images are no longer re-encoded as JPEG on the way through the
+    converter, which was quietly costing quality on every converted job.
+  * The archive empties itself on a clock. Jobs are kept for a month, and
+    sooner if the directory passes a hundred jobs or half a gigabyte. The age
+    bound is the one that holds when nobody is printing and nobody is
+    watching.
+  * Job splitting is gone. It worked around a size limit that printers
+    declare and do not enforce, and measuring one showed it never applied.
+    The converter is asked for a page range and a page count instead.
+  * The raster path is told which side of the paper it is imaging, so duplex
+    output is no longer imaged as if every sheet were the first.
+  * A printer no longer reports a cartridge as empty and low at the same
+    time, and supply levels are reported as what they are rather than as if
+    they settled anything.
+  * Attribute replies far larger than anything expected are parsed rather
+    than refused: the limit counted wire records, not attributes, and a
+    single ordinary reply from a multifunction device could exceed it.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Thu, 10 Sep 2026 02:11:57 -0700
+
 ippfix (1.0.2) unstable; urgency=medium
 
   * Reports now cross-check the printer's job accounting against its own RFC

@@ -218,6 +218,13 @@ FONT_BYTE_UNIT = 4096
 MAX_HEADERS = 100
 MAX_KEEPALIVE = 100
 
+# The DNS-SD subtype that means "this queue speaks AirPrint". macOS decides
+# from this one extra pointer record whether to build a driverless queue or
+# fall back to a generic driver, which loses colour and duplex and cannot be
+# overridden by the user. Prefixed onto a service type: the subtype of
+# _ipp._tcp.local. is _universal._sub._ipp._tcp.local.
+AIRPRINT_SUBTYPE_PREFIX = '_universal._sub.'
+
 
 # ---------------------------------------------------------------------------
 # configuration
@@ -4501,6 +4508,81 @@ def discovery_txt(cfg, queue, scheme):
     return {k: v for k, v in props.items() if v != ''}
 
 
+def subtype_pointer(subtype, published):
+    """One extra PTR marking an advertised queue as belonging to a subtype.
+
+    RFC 6763 7.1 makes a subtype exactly that: a pointer whose name is the
+    subtype and whose target is an instance that already exists, with no SRV,
+    TXT or address records of its own. macOS reads AIRPRINT_SUBTYPE_PREFIX to
+    decide whether a queue is driverless, and without it builds a generic
+    driver instead -- no colour, no duplex, and nothing the user can do about
+    it.
+
+    zeroconf has no API for publishing one, and registering the subtype as an
+    ordinary service produces a whole second instance with "._sub." buried in
+    its name, which clients then list as a junk second printer. But a PTR
+    answer is named after the ServiceInfo's type and points at its name, so an
+    info carrying the subtype as its type and the queue as its name emits
+    precisely the right record. It belongs in the registry directly;
+    register_service() would probe and announce it as a service in its own
+    right.
+
+    The registry indexes by instance name and by hostname, and this pointer
+    shares both with the queue it describes. Left alone, the name collision
+    decides which of the two gets published and which is silently dropped, and
+    the hostname collision makes unregistering either one omit the address
+    goodbyes for the other. Both keys get a prefix that cannot occur in a real
+    name, so neither index sees the pointer as a peer of its own target.
+    """
+    from zeroconf import ServiceInfo
+    ptr = ServiceInfo(
+        subtype,
+        published.name,
+        port=published.port,
+        properties=published.properties,
+        server=published.server,
+        # parsed_addresses, not addresses: the latter is IPv4-only for
+        # backward compatibility, and a pointer built from it would answer
+        # with a queue that has no IPv6 address while the queue itself has
+        # one.
+        parsed_addresses=published.parsed_addresses(),
+    )
+    ptr.key = f'{subtype}|{published.key}'
+    if published.server_key:
+        ptr.server_key = f'{subtype}|{published.server_key}'
+    return ptr
+
+
+def subtype_pointer_is_sound():
+    """Whether this zeroconf still builds the record the trick needs.
+
+    The shape above rests on an implementation detail that no API promises, so
+    an upgrade could quietly turn every subtype into nothing at all, and the
+    only symptom would be macOS going back to generic drivers months later.
+    Checking makes that loud instead. It deliberately does not stop the proxy:
+    printing works without the marker, and refusing to serve a queue over a
+    lost colour profile would be the worse failure by far.
+    """
+    from zeroconf import ServiceInfo
+    subtype = AIRPRINT_SUBTYPE_PREFIX + '_ipp._tcp.local.'
+    probe = ServiceInfo('_ipp._tcp.local.', 'Probe._ipp._tcp.local.',
+                        port=631, server='probe.local.',
+                        parsed_addresses=['127.0.0.1'])
+    try:
+        record = subtype_pointer(subtype, probe).dns_pointer()
+        if record.name == subtype and record.alias == probe.name:
+            return True
+        detail = repr(record)
+    except Exception as e:
+        detail = repr(e)
+    import zeroconf
+    log.warning('this zeroconf (%s) no longer builds subtype pointers the way '
+                'we need (%s); queues will still work, but macOS will treat '
+                'them as generic printers',
+                getattr(zeroconf, '__version__', 'unknown'), detail)
+    return False
+
+
 def advertise(cfg):
     """Publish each queue over DNS-SD, on IPv4 and IPv6.
 
@@ -4508,13 +4590,54 @@ def advertise(cfg):
     zeroconf module is unavailable.
     """
     try:
-        from zeroconf import IPVersion, ServiceInfo, Zeroconf
+        from zeroconf import DNSOutgoing, IPVersion, ServiceInfo, Zeroconf
+        from zeroconf.const import _FLAGS_AA, _FLAGS_QR_RESPONSE
     except ImportError:
         log.warning('zeroconf not installed; queues will not be discoverable')
         return None
 
     zc = Zeroconf(ip_version=IPVersion.All)
     registered = []
+    pointers = []
+    subtypes_ok = subtype_pointer_is_sound()
+
+    def broadcast(ptrs, ttl=None, gap=0.225):
+        """Put the pointers on the wire unprompted; ttl=0 retracts them.
+
+        Hand-built because unregister_service() reads the queue's own name,
+        port and server off a pointer, and would send zero-TTL SRV and TXT
+        records for a queue that is still being served.
+
+        Sent three times, like register_service() and unregister_service()
+        send theirs (RFC 6762 8.3 and 10.1), because one multicast can be
+        lost. A subtype that went out once would be measurably less reliable
+        than the queue it describes, and a lost packet would look exactly
+        like the record never having worked at all.
+        """
+        if not ptrs:
+            return
+        for attempt in range(3):
+            if attempt:
+                time.sleep(gap)
+            try:
+                out = DNSOutgoing(_FLAGS_QR_RESPONSE | _FLAGS_AA,
+                                  multicast=True)
+                for ptr in ptrs:
+                    out.add_answer_at_time(ptr.dns_pointer(override_ttl=ttl), 0)
+                zc.send(out)
+            except Exception as e:
+                log.debug('subtype announce failed: %s', e)
+                return
+
+    def in_registry(method, ptr):
+        """Mutate the registry from the event loop, the only place its own
+        documentation allows it to be touched."""
+        loop = getattr(zc, 'loop', None)
+        if loop is None or loop.is_closed():
+            return False
+        loop.call_soon_threadsafe(method, ptr)
+        return True
+
     for queue in cfg.queues.values():
         for service, scheme in (('_ipp._tcp.local.', 'ipp'),
                                 ('_ipps._tcp.local.', 'ipps')):
@@ -4535,8 +4658,34 @@ def advertise(cfg):
                                if k in ('pdl', 'Color', 'Duplex', 'URF'))
                      or 'no capabilities: the printer has not answered yet, '
                         'so none are claimed')
+            if not subtypes_ok:
+                continue
+            subtype = AIRPRINT_SUBTYPE_PREFIX + service
+            try:
+                ptr = subtype_pointer(subtype, info)
+            except Exception as e:
+                # A queue is worth serving without its marker; it is not worth
+                # failing to serve over one.
+                log.warning('no %s pointer for %s: %s', subtype, queue.name, e)
+                continue
+            if in_registry(zc.registry.async_add, ptr):
+                pointers.append(ptr)
+                log.info('advertising %s as %s', queue.name, subtype)
+    broadcast(pointers)
 
     def withdraw():
+        # Pointers first, and by hand: each one names a queue, so letting
+        # unregister_service() near it would retract that queue's own SRV and
+        # TXT records while it is still being served.
+        #
+        # Taking them out of the registry is not tidiness, it is the thing
+        # that makes that true: zc.close() below unregisters whatever is still
+        # registered, pointers included, and would emit exactly those records.
+        # The removals land before it because both are queued on the same
+        # event loop, in order -- so these two loops must stay in this order.
+        broadcast(pointers, ttl=0, gap=0.125)
+        for ptr in pointers:
+            in_registry(zc.registry.async_remove, ptr)
         for info in registered:
             try:
                 zc.unregister_service(info)

@@ -431,9 +431,19 @@ An unrecognised option is an error rather than something ignored.
   of very large jobs, a clock that jumped. A count alone is not a bound when
   the documents are chosen by whoever is printing.
 
+Each queue is also published under the DNS-SD subtype
+`_universal._sub._ipp._tcp` (and `_universal._sub._ipps._tcp`), a single extra
+pointer record whose target is the queue itself. macOS reads it, together with
+the `URF` key in the TXT record, to decide that a queue can be printed to
+without a driver; without it the queue is given a generic driver that does not
+know the device has colour or duplex, and that the user cannot override. It
+needs no configuration. Should a future release of the `zeroconf` package stop
+building that record as this depends on, the fact is logged and the queues are
+published without it rather than not at all.
+
 * `--no-advertise`:
   Do not publish the queues over DNS-SD. Useful when discovery is handled
-  elsewhere.
+  elsewhere. This also suppresses the AirPrint subtype described below.
 
 * `--no-raster-retry`:
   Do not send a document again as raster when the printer takes the job,
