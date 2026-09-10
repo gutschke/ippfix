@@ -38,6 +38,16 @@ They usually look nearly identical in the picker, so users choose at random,
 and half their jobs still vanish. Worse, a client that already knows the
 printer keeps using its cached entry and never sees the proxy at all.
 
+Since 1.1.0 they look identical on macOS too. The proxy now publishes the
+`_universal` subtype, so the Add Printer dialog offers it as a driverless
+AirPrint queue rather than picking a generic driver for it. That is the point
+-- a generic driver loses colour and duplex -- but it removes the one
+accidental way the two could be told apart on a Mac, and it makes the sections
+below more useful rather than less. Nothing else changes when both are on one
+network: a subtype pointer is a shared record that no responder owns, so the
+printer's and the proxy's simply coexist, exactly as their `_ipp._tcp` records
+already did.
+
 **Deploying `ippfix` without addressing this is the single most common way to
 conclude it "doesn't work".** Everything in Step 2 exists to solve it.
 
