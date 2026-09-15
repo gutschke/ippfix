@@ -255,7 +255,7 @@ class Queue:
     # silently ignored is how a printer ends up not doing what its
     # configuration says it does.
     URI_OPTIONS = ('page-counter', 'community', 'snmp-relay',
-                   'supply-levels', 'page-geometry')
+                   'supply-levels', 'page-geometry', 'page-forms')
 
     def __init__(self, name, uri):
         parts = urllib.parse.urlsplit(uri)
@@ -301,6 +301,19 @@ class Queue:
             raise ValueError(f'{name}: page-geometry must be repair, detect '
                              f'or raw, not {geometry!r}')
         self.page_geometry = geometry
+        # What to do about a page drawn entirely through one form XObject. See
+        # unwrap_page_forms().
+        #
+        # "unwrap" is the default, unlike page-geometry above, because this
+        # moves operators rather than rewriting them: the same drawing, in the
+        # same order, against the same resources, with a wrapper removed. The
+        # failure it avoids is a printer that marks a sheet, garbles most of
+        # it, and reports success, which nothing else here can see.
+        forms = options.get('page-forms', ['unwrap'])[0].lower()
+        if forms not in ('unwrap', 'keep'):
+            raise ValueError(f'{name}: page-forms must be unwrap or keep, '
+                             f'not {forms!r}')
+        self.page_forms = forms
         relay = options.get('snmp-relay', [None])[0]
         if relay is None:
             self.snmp_relay = None
@@ -1942,6 +1955,183 @@ def place_pages(cfg, queue, msg, data, fmt):
                      None if watching else note, notes,
                      would=note if watching else None)
     return (out, note) if note and not watching else (data, None)
+
+
+# ---------------------------------------------------------------------------
+# Page forms
+#
+# A browser that prints through Skia wraps a whole page in one form XObject
+# and draws it through a scaling matrix -- typically /BBox [0 0 6120 7920]
+# invoked as "q 0.1 0 0 0.1 0 0 cm /R12 Do Q", so the content is authored at
+# ten times the sheet and shrunk on the way out. It is legal, it renders
+# correctly everywhere that matters, and at least one printer cannot do it.
+#
+# Measured on a Color LaserJet Pro MFP M283fdw: such a page is accepted, a
+# sheet is marked, job-state comes back completed, and what comes out is
+# correct for the first third and then falls apart -- text truncated
+# mid-string, content drawn in the wrong place, a stray vector across the
+# sheet, the remainder blank, and the damage in a colour the document never
+# mentions. The same bytes produced black damage on one run and blue on
+# another, so the colour is uninitialised state rather than a misparse.
+#
+# It is not volume: a job from the same source with 1.5 MB content streams per
+# page, half again as many fills and three times the curves, prints perfectly.
+# It is not the transparency group the form carries, and it is not the
+# even-odd fills: removing each in turn changed nothing. Unwrapping the form
+# fixes it completely, which is also the shape of every page from that source
+# that printed.
+#
+# So this undoes the wrapper. It is not a rewrite of anybody's content: the
+# operators are the same operators in the same order, moved from a form into
+# the page that invoked it once and did nothing else, and evaluated against
+# the same resources they were written against. Nothing in the existing
+# defences catches the failure it avoids -- the size guard is off unless a
+# device is measured to enforce a limit, the raster retry waits for a rejection
+# that never comes, and the page-counter check asks whether a sheet was marked,
+# which it was.
+
+
+def _form_stream(data, index, ref):
+    """The decoded bytes of the stream object `ref` names, or None."""
+    m = re.match(rb'\s*(\d+)\s+\d+\s+R\b', ref or b'')
+    if not m:
+        return None, None
+    num = int(m.group(1))
+    start = index.get(num)
+    if start is None:
+        return None, None
+    head_end = data.find(b'stream', start)
+    obj_end = data.find(b'endobj', start)
+    if head_end < 0 or (0 <= obj_end < head_end):
+        return None, num
+    head = data[start:head_end]
+    body = head_end + len(b'stream')
+    while data[body:body + 1] in (b'\r', b'\n'):
+        body += 1
+    raw = data[body:data.find(b'endstream', body)]
+    try:
+        return (_inflate(raw) if b'/FlateDecode' in head else raw), num
+    except Exception:
+        return None, num
+
+
+# A page whose entire content is one scaled form invocation, and nothing else.
+_ONLY_A_FORM = re.compile(
+    rb'\A\s*(?:q\s+)?'
+    rb'(?:(?P<cm>[-\d.]+(?:\s+[-\d.]+){5})\s+cm\s+)?'
+    rb'/(?P<name>[A-Za-z0-9#_.\-]+)\s+Do\s*'
+    rb'(?:Q\s*)?\Z')
+
+
+def unwrap_page_forms(data):
+    """Draw each page's content directly rather than through a form XObject.
+
+    Returns (document, note). The note is None when nothing was changed, which
+    is almost every document.
+    """
+    index = _object_index(data)
+    if not index:
+        raise NotPlaced('no plain objects to index')
+    replacements = {}
+    unwrapped = 0
+    for num, body, inherited in _pages(data, index):
+        content, content_num = _form_stream(
+            data, index, _raw_value(body, b'Contents'))
+        if content is None or content_num is None:
+            continue
+        shape = _ONLY_A_FORM.match(content)
+        if not shape:
+            continue
+        resources = _raw_value(body, b'Resources') or inherited.get(b'Resources')
+        if resources is None:
+            continue
+        resources = _resolve(data, index, resources)
+        xobjects = _raw_value(resources, b'XObject')
+        if xobjects is None:
+            continue
+        xobjects = _resolve(data, index, xobjects)
+        want = b'/' + shape.group('name')
+        m = re.search(re.escape(want) + rb'(?![A-Za-z0-9])\s*(\d+\s+\d+\s+R)',
+                      xobjects)
+        if not m:
+            continue
+        form_ref = m.group(1)
+        form_num = int(form_ref.split()[0])
+        start = index.get(form_num)
+        if start is None:
+            continue
+        head = data[start:data.find(b'stream', start)]
+        if not re.search(rb'/Subtype\s*/Form\b', head):
+            continue
+        # One page, one use. A form drawn more than once is shared, and
+        # inlining it would duplicate it rather than simplify it.
+        if len(re.findall(rb'(?<![\d])' + str(form_num).encode() + rb'\s+0\s+R\b',
+                          data)) != 1:
+            continue
+        form_content, _ = _form_stream(data, index, form_ref)
+        if form_content is None:
+            continue
+        # The content is evaluated against the form's own resources, because
+        # that is what it was written against. The page's resources described
+        # nothing but the form itself.
+        form_resources = _raw_value(head, b'Resources')
+        if form_resources is None:
+            form_resources = _raw_value(resources, b'XObject') and None
+        if form_resources is None:
+            continue
+        matrix = _raw_value(head, b'Matrix')
+        if matrix is not None and not re.fullmatch(
+                rb'\[\s*1\s+0\s+0\s+1\s+0\s+0\s*\]', matrix.strip()):
+            continue                     # a form matrix we would have to fold in
+        cm = shape.group('cm')
+        inlined = b'q\n'
+        if cm:
+            inlined += cm + b' cm\n'
+        inlined += form_content
+        if not inlined.endswith(b'\n'):
+            inlined += b'\n'
+        inlined += b'Q\n'
+        packed = zlib.compress(inlined, 9)
+        replacements[content_num] = (
+            b'<</Filter/FlateDecode/Length %d>>\nstream\n' % len(packed)
+            + packed + b'\nendstream')
+        page = re.sub(rb'/Resources\s*' + re.escape(resources),
+                      b'/Resources ' + form_resources, body, count=1)
+        if page == body:
+            page = re.sub(rb'/Resources\s*\d+\s+\d+\s+R',
+                          b'/Resources ' + form_resources, body, count=1)
+        if page == body:
+            continue
+        replacements[num] = page
+        unwrapped += 1
+    if not unwrapped:
+        return data, None
+    sheets = 'page' if unwrapped == 1 else 'pages'
+    return (_incremental_update(data, replacements),
+            f'{unwrapped} {sheets} drawn directly instead of through a '
+            f'full-page form XObject, which this printer renders only partly')
+
+
+def flatten_page_forms(cfg, queue, data):
+    """Unwrap page forms, or hand the document on untouched."""
+    if queue is not None and queue.page_forms == 'keep':
+        return data, None
+    payload = normalise_pdf(data)
+    if payload is None:
+        return data, None
+    try:
+        out, note = unwrap_page_forms(payload)
+    except NotPlaced:
+        return data, None
+    except Exception:
+        # The document came from somebody else. A bug in reading it must cost
+        # the job nothing.
+        log.exception('page forms could not be checked; job relayed as is')
+        return data, None
+    if note is None:
+        return data, None
+    log.info('%s: %s', queue.name if queue else 'job', note)
+    return out, note
 
 
 def archive_document(cfg, queue, job_name, fmt, data, note):
@@ -4250,6 +4440,12 @@ class Handler(socketserver.BaseRequestHandler):
                 # Conversion may legitimately change the format: a document
                 # the converter would not hand over whole comes back as raster
                 # instead. Say so, rather than mislabelling it.
+                # After conversion, not before: the wrapper survives
+                # outlining, and what the printer chokes on is what we are
+                # about to send rather than what arrived.
+                msg.data, unwrapped = flatten_page_forms(cfg, queue, msg.data)
+                if unwrapped:
+                    note = f'{note}; {unwrapped}'
                 if msg.data is not submitted:
                     produced = sniff_format(msg.data)
                     if produced and produced != fmt and group is not None:

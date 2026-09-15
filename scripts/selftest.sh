@@ -378,6 +378,110 @@ with FakePrinter() as printer:
     assert trimmed['pdl'].startswith('application/pdf,'), trimmed['pdl']
 PY2
 
+echo 'page forms'
+python3 - <<'PY2' && ok 'a page drawn through one form is drawn directly instead' || bad 'page form unwrap'
+import logging, re, sys
+sys.path.insert(0, '.')
+logging.disable(logging.CRITICAL)
+import ippfix
+
+def build(page_content, uses=1):
+    # A page that draws through a form XObject, as a browser's output does.
+    drawing = b'0 0 1 rg 100 100 400 400 re f'
+    objs = {
+        1: b'<</Type/Catalog/Pages 2 0 R>>',
+        2: b'<</Type/Pages/Kids[3 0 R]/Count 1>>',
+        3: (b'<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]'
+            b'/Resources<</XObject<</F1 5 0 R>>>>/Contents 4 0 R>>'),
+        4: b'<</Length %d>>\nstream\n%s\nendstream' % (len(page_content), page_content),
+        5: (b'<</Type/XObject/Subtype/Form/FormType 1/BBox[0 0 6120 7920]'
+            b'/Matrix[1 0 0 1 0 0]/Resources<</ProcSet[/PDF]>>/Length %d>>'
+            b'\nstream\n%s\nendstream' % (len(drawing), drawing)),
+    }
+    out = bytearray(b'%PDF-1.4\n'); off = {}
+    for n in sorted(objs):
+        off[n] = len(out); out += b'%d 0 obj\n' % n + objs[n] + b'\nendobj\n'
+    x = len(out)
+    out += b'xref\n0 %d\n0000000000 65535 f \n' % (len(objs)+1)
+    for n in sorted(objs): out += b'%010d 00000 n \n' % off[n]
+    out += (b'trailer\n<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n'
+            % (len(objs)+1, x))
+    return bytes(out)
+
+def page_stream(doc):
+    index = ippfix._object_index(doc)
+    for num, body, inh in ippfix._pages(doc, index):
+        data, _ = ippfix._form_stream(doc, index, ippfix._raw_value(body, b'Contents'))
+        return data
+    return b''
+
+# The shape this exists for: the page does nothing but invoke the form.
+doc = build(b'q 0.1 0 0 0.1 0 0 cm /F1 Do Q')
+out, note = ippfix.unwrap_page_forms(doc)
+assert note and 'form XObject' in note, note
+after = page_stream(out)
+assert b'/F1 Do' not in after, after[:120]
+# The same operators, in the same order, with the scale still applied.
+assert b'0.1 0 0 0.1 0 0 cm' in after, after[:120]
+assert b'100 100 400 400 re' in after, after[:200]
+# Every original byte survives: an incremental update appends, never rewrites.
+assert out.startswith(doc), 'the original bytes were not preserved'
+# The page now resolves names against the form's own resources, which is the
+# environment the inlined operators were written against.
+index = ippfix._object_index(out)
+for num, body, inh in ippfix._pages(out, index):
+    assert b'/XObject' not in ippfix._raw_value(body, b'Resources'), body[:200]
+
+# A page that draws anything of its own is left alone: inlining would have to
+# decide what the form's resources mean for content written against the page's.
+doc = build(b'q 0.1 0 0 0.1 0 0 cm /F1 Do Q 0 0 0 rg 10 10 20 20 re f')
+out, note = ippfix.unwrap_page_forms(doc)
+assert note is None, note
+
+# A form drawn twice is shared; inlining it would duplicate it, not simplify it.
+doc = build(b'q /F1 Do Q q 0.1 0 0 0.1 0 0 cm /F1 Do Q')
+out, note = ippfix.unwrap_page_forms(doc)
+assert note is None, note
+
+# Nothing to do, and nothing done.
+doc = build(b'0 0 0 rg 10 10 20 20 re f')
+out, note = ippfix.unwrap_page_forms(doc)
+assert note is None, note
+PY2
+
+python3 - <<'PY2' && ok 'page-forms says whether to unwrap, and defaults to doing it' || bad 'page-forms option'
+import logging, sys
+sys.path.insert(0, '.')
+logging.disable(logging.CRITICAL)
+import ippfix
+
+a = ippfix.build_parser().parse_args(
+    ['--advertise', '192.0.2.10', '--no-ipv6',
+     'office=ipp://printer.example/ipp/print'])
+q = ippfix.parse_queue('office=ipp://printer.example/ipp/print')
+cfg = ippfix.Config(a, [q])
+# On by default, unlike page-geometry: this moves operators without rewriting
+# them, and the failure it avoids reports success.
+assert q.page_forms == 'unwrap', q.page_forms
+
+kept = ippfix.parse_queue('office=ipp://printer.example/ipp/print?page-forms=keep')
+assert kept.page_forms == 'keep'
+try:
+    ippfix.parse_queue('office=ipp://printer.example/ipp/print?page-forms=maybe')
+except ValueError:
+    pass
+else:
+    raise AssertionError('page-forms should refuse a value it does not know')
+
+# Not a PDF at all: relayed without being parsed.
+out, note = ippfix.flatten_page_forms(cfg, q, b'not a pdf at all')
+assert note is None and out == b'not a pdf at all'
+
+# A queue told to keep them does not even look.
+out, note = ippfix.flatten_page_forms(cfg, kept, b'%PDF-1.4 whatever')
+assert note is None
+PY2
+
 echo 'airprint subtype'
 python3 - <<'PY2' && ok 'the subtype is one bare pointer at the queue itself' || bad 'subtype pointer shape'
 import logging, sys

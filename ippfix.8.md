@@ -468,6 +468,13 @@ needs no configuration. Should a future release of the `zeroconf` package stop
 building that record as this depends on, the fact is logged and the queues are
 published without it rather than not at all.
 
+Each queue may also carry `?page-forms=`*unwrap*|*keep*. A page whose entire
+content is one invocation of a form XObject used exactly once is, by default,
+drawn directly instead: the same operators in the same order, against the same
+resources, with the wrapper removed. Some printers render such a page correctly
+for a third of a sheet and then corrupt the rest while reporting success. Set
+`keep` to leave the document alone.
+
 * `--no-advertise`:
   Do not publish the queues over DNS-SD. Useful when discovery is handled
   elsewhere. This also suppresses the AirPrint subtype described below.

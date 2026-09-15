@@ -1,3 +1,30 @@
+ippfix (1.2.0) unstable; urgency=medium
+
+  * A page whose entire content is one invocation of a form XObject, used
+    exactly once, is now drawn directly on the page instead. Browsers printing
+    through Skia wrap a sheet this way and draw it through a scaling matrix;
+    it is legal and renders correctly nearly everywhere, and at least one
+    printer accepts such a page, marks a sheet, reports the job completed, and
+    produces a page that is correct for the first third and then falls apart.
+    Nothing else here can see that: the size guard is off unless a device is
+    measured to enforce a limit, the raster retry waits for a rejection that
+    never comes, and the page-counter check asks whether a sheet was marked,
+    which it was. The rewrite moves operators rather than changing them -- the
+    same drawing in the same order, against the resources it was written
+    against -- and it refuses anything it cannot show to be equivalent: a page
+    that draws anything of its own, a form used more than once, a form with a
+    matrix of its own, a form with no resources. ?page-forms=keep declines it.
+  * What triggers the underlying fault is not known, and the manual says so.
+    The transparency group, the even-odd fills, the oversized bounding box,
+    the size of the document, every cumulative measure of work, and the length
+    of a graphics-state span were each ruled out by printing them. A synthetic
+    page matching the real one's operator counts, volume, structure and
+    coordinate precision prints perfectly. What is established is that the
+    same content fails inside a form and succeeds drawn directly, which is
+    narrow, verified on paper, and enough to act on.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Mon, 14 Sep 2026 20:45:39 -0700
+
 ippfix (1.1.0) unstable; urgency=medium
 
   * macOS now builds a driverless queue instead of picking a generic driver.

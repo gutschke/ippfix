@@ -353,6 +353,36 @@ This one is **off by default**: `?page-geometry=repair` turns it on, and
 `raw` the document is not parsed at all, so a queue that does not want this
 carries none of it.
 
+### A page drawn through a form XObject
+
+Browsers that print through Skia wrap a whole page in one form XObject and draw
+it through a scaling matrix, so the content is authored at ten times the sheet
+and shrunk on the way out. It is legal, it renders correctly everywhere that
+matters, and at least one printer cannot do it.
+
+Measured on a Color LaserJet Pro MFP M283fdw: such a page is accepted, a sheet
+is marked, the job reports `completed`, and what comes out is correct for the
+first third and then falls apart -- text truncated mid-word, a step drawn in
+the wrong place, a stray vector across the sheet, the rest blank, and the
+damage in a colour the document never mentions. Nothing above can see it: the
+client was told the job succeeded, and a sheet really was marked.
+
+So a page whose entire content is one invocation of a form used exactly once is
+drawn directly instead. That is not a rewrite of anybody's drawing -- the same
+operators in the same order, evaluated against the same resources they were
+written against, with a wrapper removed -- and it is what pages from the same
+source that print correctly already look like. `?page-forms=keep` turns it off.
+
+It is on by default, unlike the repair above, because it moves operators rather
+than changing them and because the failure it avoids reports success. What
+triggers that failure is still not understood: the transparency group, the
+even-odd fills, the oversized bounding box, the sheer size, every cumulative
+measure of work, and the length of a graphics-state span were each ruled out by
+experiment. A synthetic page matching the real one's operator counts, volume,
+structure and coordinate precision prints perfectly. What is established is
+narrower and enough to act on: the same content fails inside a form and
+succeeds drawn directly on the page.
+
 That also means a report can carry something somebody printed. Send it
 somewhere that reflects how sensitive the printing is, and see
 `--alert-max-attachment` for the size bound.
