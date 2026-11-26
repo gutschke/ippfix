@@ -378,6 +378,51 @@ with FakePrinter() as printer:
     assert trimmed['pdl'].startswith('application/pdf,'), trimmed['pdl']
 PY2
 
+echo 'always raster'
+python3 - <<'PY2' && ok 'raster=only asks the converter for raster, and nothing else does' || bad 'raster queue option'
+import logging, sys
+sys.path.insert(0, '.')
+logging.disable(logging.CRITICAL)
+import ippfix
+
+SPEC = 'office=ipp://printer.example/ipp/print'
+a = ippfix.build_parser().parse_args(
+    ['--advertise', '192.0.2.10', '--no-ipv6', SPEC])
+
+plain = ippfix.parse_queue(SPEC)
+only = ippfix.parse_queue(SPEC + '?raster=only')
+auto = ippfix.parse_queue(SPEC + '?raster=auto')
+assert plain.always_raster is False, 'the default must not change what is sent'
+assert auto.always_raster is False
+assert only.always_raster is True
+try:
+    ippfix.parse_queue(SPEC + '?raster=maybe')
+except ValueError:
+    pass
+else:
+    raise AssertionError('raster should refuse a value it does not know')
+
+# The setting reaches the converter as the field the converter understands,
+# and only then: a header that said raster=only by accident would rasterise
+# every queue on the host. learned is set by hand so that building a header
+# does not go asking a printer that is not there.
+cfg = ippfix.Config(a, [only])
+only.learned = True
+only.raster_format = 'image/urf'
+only.raster_device = 'appleraster'
+only.raster_colorspace = 19
+only.raster_dpi = 600
+assert b'raster=only' in ippfix.converter_header(only, cfg, force_raster=True)
+assert b'raster=only' not in ippfix.converter_header(only, cfg)
+
+# A printer that takes no raster format cannot be sent one, whatever the queue
+# says: the converter is never handed a contradiction.
+plain.learned = True
+plain.raster_format = None
+head = ippfix.converter_header(plain, ippfix.Config(a, [plain]), force_raster=True)
+assert b'raster=none' in head and b'raster=only' not in head, head
+PY2
+
 echo 'page forms'
 python3 - <<'PY2' && ok 'a page drawn through one form is drawn directly instead' || bad 'page form unwrap'
 import logging, re, sys

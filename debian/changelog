@@ -1,3 +1,31 @@
+ippfix (1.3.0) unstable; urgency=medium
+
+  * New queue option ?raster=only, which rasterises every job instead of
+    outlining it, so that the printer's PDF interpreter never runs. The
+    default is unchanged: a document is still offered whole and rasterised
+    only if the printer refuses it.
+  * It exists because the repairs this proxy has accumulated each address one
+    fault found by printing, and a device that keeps producing new ones is
+    better taken off that path than followed. A job lost on 2026-11-25 was
+    traced to a trivial form XObject -- a clip and a white fill, invisible on
+    paper -- drawn once near the end of a heavy page: the printer reported the
+    job completed, its own page counter did not move, and no existing repair
+    covered the shape. The same document prints as raster.
+  * What that costs was measured rather than assumed. On that document, 472 KB
+    outlined against 1.8 MB as raster, about 3.9 times, which is transfer and
+    spool rather than anything a reader sees. The raster is contone at the
+    device's own resolution, so the printer still does its halftoning and edge
+    processing and only geometry precision is given up. Rasterising also skips
+    outlining, which is the pass that can lose content and the reason three
+    fail-safes exist.
+  * Two properties of the raster path remain unmeasured and are documented as
+    such: how a document of mixed page sizes behaves against a job-level
+    media, where the printer can only scale, clip or reject; and whether this
+    device streams raster or spools it, which decides how a very long job
+    behaves.
+
+ -- gutschke <gutschke@users.noreply.github.com>  Wed, 25 Nov 2026 18:14:44 -0800
+
 ippfix (1.2.0) unstable; urgency=medium
 
   * A page whose entire content is one invocation of a form XObject, used

@@ -255,7 +255,7 @@ class Queue:
     # silently ignored is how a printer ends up not doing what its
     # configuration says it does.
     URI_OPTIONS = ('page-counter', 'community', 'snmp-relay',
-                   'supply-levels', 'page-geometry', 'page-forms')
+                   'supply-levels', 'page-geometry', 'page-forms', 'raster')
 
     def __init__(self, name, uri):
         parts = urllib.parse.urlsplit(uri)
@@ -314,6 +314,22 @@ class Queue:
             raise ValueError(f'{name}: page-forms must be unwrap or keep, '
                              f'not {forms!r}')
         self.page_forms = forms
+        # Whether to send this printer raster instead of an outlined PDF.
+        #
+        # "auto" is the default and the behaviour this proxy was built on: the
+        # document is outlined and offered whole, and raster is reached for
+        # only when the printer refuses it. "only" rasterises every job up
+        # front, for a device whose PDF interpreter has proved unreliable
+        # enough that not exercising it at all is worth the transfer size.
+        #
+        # It is a queue setting rather than a global one because it describes
+        # a printer, not a policy: the faults that motivate it are specific to
+        # a model and a firmware.
+        raster = options.get('raster', ['auto'])[0].lower()
+        if raster not in ('auto', 'only'):
+            raise ValueError(f'{name}: raster must be auto or only, '
+                             f'not {raster!r}')
+        self.always_raster = raster == 'only'
         relay = options.get('snmp-relay', [None])[0]
         if relay is None:
             self.snmp_relay = None
@@ -4434,7 +4450,9 @@ class Handler(socketserver.BaseRequestHandler):
             msg.data, placed = place_pages(cfg, queue, msg, msg.data, fmt)
             submitted = msg.data
             try:
-                msg.data, note = convert(cfg, msg.data, fmt, queue, sides=sides)
+                msg.data, note = convert(cfg, msg.data, fmt, queue,
+                                         sides=sides,
+                                         force_raster=queue.always_raster)
                 if placed:
                     note = f'{placed}; {note}'
                 # Conversion may legitimately change the format: a document

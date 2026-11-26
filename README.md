@@ -353,6 +353,44 @@ This one is **off by default**: `?page-geometry=repair` turns it on, and
 `raw` the document is not parsed at all, so a queue that does not want this
 carries none of it.
 
+### Sending raster instead, for a printer that keeps getting PDF wrong
+
+Everything above repairs one fault at a time: a page placed off the sheet, a
+page drawn through a form XObject, a document the printer accepts and cannot
+read. Each was found by printing, and each took days. A device whose PDF
+interpreter keeps producing new ones can be taken off that path entirely:
+
+```
+'Printer=ipp://printer.example/ipp/print?raster=only'
+```
+
+Every job is then rasterised rather than outlined, and the printer's PDF
+interpreter never runs. This is not the blunt instrument it sounds like. The
+raster is contone at the device's own resolution and the printer still does
+its own halftoning and edge processing, so only geometry precision is given up
+-- edges land on the device grid rather than wherever the interpreter would
+have placed them, and antialiasing recovers most of that. It is a different
+thing from a browser's "print as image", which is blurry because the browser
+JPEG-encodes the page at a fixed low quality.
+
+It also skips outlining, which is the pass that can lose content and the
+reason three fail-safes exist; the raster is built from the original input, so
+there is nothing there for them to guard.
+
+What it costs is size. Measured on one two-page document: 472 KB outlined
+against 1.8 MB as raster, about 3.9 times, which is transfer and printer spool
+rather than anything the reader sees. Conversion time moves with the content:
+rasterising is cheaper than outlining dense body copy and dearer than
+outlining a page that was mostly images.
+
+Two things about the raster path are not measured, and are worth knowing
+before turning this on for a queue that matters. A document whose pages are
+not all the same size produces a stream of differently-sized raster pages, and
+where the PDF path would let the printer interpret a disagreement with the
+job's `media`, the raster path leaves it able only to scale, clip or reject.
+And whether this device streams raster or spools it is unknown, which decides
+how a very long job behaves. Neither has bitten yet; neither has been tried.
+
 ### A page drawn through a form XObject
 
 Browsers that print through Skia wrap a whole page in one form XObject and draw

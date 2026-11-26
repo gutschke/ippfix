@@ -475,6 +475,15 @@ resources, with the wrapper removed. Some printers render such a page correctly
 for a third of a sheet and then corrupt the rest while reporting success. Set
 `keep` to leave the document alone.
 
+Each queue may also carry `?raster=`*auto*|*only*. The default, *auto*, offers
+the printer an outlined PDF and falls back to raster only if the printer
+refuses it. *only* rasterises every job up front, so the printer's PDF
+interpreter never runs -- for a device whose interpreter has proved unreliable
+enough that not exercising it is worth the transfer size, which runs about four
+times that of outlined output. The raster is contone at the device's own
+resolution, so the printer still performs its own halftoning and edge
+processing; only geometry precision is given up.
+
 * `--no-advertise`:
   Do not publish the queues over DNS-SD. Useful when discovery is handled
   elsewhere. This also suppresses the AirPrint subtype described below.
